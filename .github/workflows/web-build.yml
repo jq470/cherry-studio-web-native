@@ -73,8 +73,8 @@ jobs:
         run: |
           mkdir -p /tmp/driver
           cd /tmp/driver
-          npm init -y > /dev/null
-          npm i --no-audit --no-fund puppeteer-core@24
+          pnpm init
+          pnpm add puppeteer-core@24
           cd "$GITHUB_WORKSPACE"
           cp -a /tmp/driver/node_modules/. node_modules/
 
