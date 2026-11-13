@@ -13,8 +13,24 @@ const Reanimated = require('react-native-reanimated');
 
 const wrap = (tag) =>
   function KeyboardWrapper(props) {
-    return React.createElement(tag, { style: props && props.style }, props && props.children);
+    return React.createElement(
+      tag,
+      {
+        style: {
+          display: 'flex',
+          flexDirection: 'column',
+          flex: 1,
+          minHeight: 0,
+          ...((props && props.style) || {}),
+        },
+      },
+      props && props.children,
+    );
   };
+
+// The provider is a layout passthrough on web. A bare <div> here collapsed the
+// whole app to zero height (the list rendered rows but nothing was visible).
+const KeyboardProvider = (props) => (props && props.children) || null;
 
 // @legendapp/list/keyboard renders its rows through this scroll host; without it
 // the whole transcript subtree was dropped and the chat looked empty.
@@ -62,7 +78,7 @@ const KeyboardEvents = {
 };
 
 const exports_ = {
-  KeyboardProvider: wrap('div'),
+  KeyboardProvider,
   KeyboardAwareScrollView: wrap('div'),
   KeyboardChatScrollView,
   KeyboardStickyView: wrap('div'),
