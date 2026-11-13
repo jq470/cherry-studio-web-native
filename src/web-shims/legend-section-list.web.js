@@ -5,7 +5,7 @@
 // with the same public contract, so alias the package to it here.
 'use strict';
 
-const { SectionList } = require('react-native');
+const { SectionList } = require('react-native-web');
 
 module.exports = { SectionList };
 module.exports.default = SectionList;
