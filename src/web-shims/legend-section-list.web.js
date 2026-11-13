@@ -1,13 +1,20 @@
 // `@legendapp/list/section-list` on web.
 //
-// The Legend list is driven by native-friendly virtualization and renders no
-// rows under react-native-web. This shim provides the small SectionList
-// contract the app uses, backed by react-native-web's ScrollView, so rows
-// actually mount on the page.
+// The Legend list is driven by native-friendly virtualization and mounts no
+// rows under react-native-web. This shim implements the small SectionList
+// contract the app uses with a plain scroll container, so rows actually render.
 'use strict';
 
 const React = require('react');
-const { ScrollView, View } = require('react-native-web');
+
+const containerStyle = {
+  display: 'flex',
+  flexDirection: 'column',
+  flex: 1,
+  minHeight: 0,
+  overflowY: 'auto',
+  overflowX: 'hidden',
+};
 
 function WebSectionList(props) {
   const {
@@ -27,8 +34,8 @@ function WebSectionList(props) {
     if (renderSectionHeader) {
       children.push(
         React.createElement(
-          View,
-          { key: `section-${sectionIndex}`, collapsable: false },
+          'div',
+          { key: `section-${sectionIndex}` },
           renderSectionHeader({ section }),
         ),
       );
@@ -37,8 +44,8 @@ function WebSectionList(props) {
       const key = keyExtractor ? keyExtractor(item, itemIndex) : item.id ?? itemIndex;
       children.push(
         React.createElement(
-          View,
-          { key: `row-${sectionIndex}-${key}`, collapsable: false },
+          'div',
+          { key: `row-${sectionIndex}-${key}` },
           renderItem({ item, index: itemIndex, section }),
         ),
       );
@@ -46,19 +53,17 @@ function WebSectionList(props) {
   });
 
   if (children.length === 0 && ListEmptyComponent) {
-    children.push(React.createElement(View, { key: 'empty' }, ListEmptyComponent));
+    children.push(React.createElement('div', { key: 'empty' }, ListEmptyComponent));
   }
   if (ListFooterComponent) {
-    children.push(React.createElement(View, { key: 'footer' }, ListFooterComponent));
+    children.push(React.createElement('div', { key: 'footer' }, ListFooterComponent));
   }
 
   return React.createElement(
-    ScrollView,
+    'div',
     {
-      testID,
-      style,
-      contentContainerStyle,
-      showsVerticalScrollIndicator: false,
+      'data-testid': testID,
+      style: { ...containerStyle, ...(style || {}), ...(contentContainerStyle || {}) },
     },
     children,
   );
