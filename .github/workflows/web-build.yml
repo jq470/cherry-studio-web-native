@@ -70,7 +70,13 @@ jobs:
           test -s dist-web/sqlite3/index.mjs
 
       - name: Install browser
-        run: npm i --no-save --no-audit --no-fund --legacy-peer-deps puppeteer-core@24
+        run: |
+          mkdir -p /tmp/driver
+          cd /tmp/driver
+          npm init -y > /dev/null
+          npm i --no-audit --no-fund puppeteer-core@24
+          cd "$GITHUB_WORKSPACE"
+          cp -a /tmp/driver/node_modules/. node_modules/
 
       - name: Runtime smoke
         env:
