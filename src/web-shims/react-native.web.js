@@ -10,7 +10,7 @@
 'use strict';
 
 const React = require('react');
-const ReactNativeWeb = require('react-native-web');
+const ReactNativeWeb = require('react-native-web/dist/cjs/index');
 
 const shim = {};
 for (const key of Object.keys(ReactNativeWeb)) shim[key] = ReactNativeWeb[key];

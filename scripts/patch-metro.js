@@ -6,8 +6,8 @@
  *   L1  react-native/Libraries/** and react-native/src/** -> native-stub.js
  *       (the native RN core drags TurboModuleRegistry onto the web bundle)
  *   L2  behavioural shims for the modules the app actually calls
- *   L2b `react-native` itself -> react-native.web.js, a passthrough to
- *       react-native-web that adds exports RNW omits (codegenNativeComponent).
+ *   L2b `react-native` and `react-native-web` -> react-native.web.js, a
+ *       passthrough that adds exports RNW omits (codegenNativeComponent).
  *
  * Idempotent: a second run detects the marker and exits 0.
  */
@@ -33,6 +33,7 @@ if (!src.includes(ANCHOR)) {
 const SHIMS = {
   // --- behavioural (L2): the app actually consumes these return values ---
   'react-native': 'react-native.web.js',
+  'react-native-web': 'react-native.web.js',
   'expo-sqlite': 'expo-sqlite.web.js',
   'expo-file-system': 'expo-file-system.web.js',
   'expo-file-system/legacy': 'expo-file-system.web.js',
