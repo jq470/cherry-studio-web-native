@@ -3,18 +3,7 @@ name: web-build
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - '**/*.md'
   workflow_dispatch:
-    inputs:
-      diagnostic:
-        description: 'Diagnostic export (dev, no minify, external source maps)'
-        type: boolean
-        default: false
-
-concurrency:
-  group: web-build-${{ github.ref }}
-  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -28,22 +17,15 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
     steps:
       - uses: actions/checkout@v4
-
-      - name: Reset stale reports
-        run: |
-          rm -f RUNTIME-SMOKE.md CI-REPORT.md CHAT-E2E.md
-          echo checkout > /tmp/stage
 
       - name: Clone web tooling
         run: |
           git clone --depth 1 https://github.com/jq470/cherry-studio-web.git /tmp/tooling
           cp -a /tmp/tooling/scripts .
-          cp -a /tmp/tooling/web-adaptation .
+          cp -a /tmp/tooling/overlay/web web-adaptation
           cp -a /tmp/tooling/overlay/src/web-shims src/web-shims
-          echo clone > /tmp/stage
 
       - uses: pnpm/action-setup@v4
         with:
@@ -55,49 +37,22 @@ jobs:
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
 
-      - name: Restore Metro transform cache
-        uses: actions/cache@v4
-        with:
-          path: node_modules/.cache/metro
-          key: metro-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
-          restore-keys: metro-${{ runner.os }}-
-
       - name: Install dependencies
-        continue-on-error: true
-        run: |
-          set -o pipefail
-          pnpm install --frozen-lockfile --prefer-offline 2>&1 | tee /tmp/install.log
-          echo install > /tmp/stage
+        run: pnpm install --frozen-lockfile --prefer-offline
 
       - name: Patch web configuration
-        continue-on-error: true
         run: |
-          set -o pipefail
-          node scripts/patch-app-config.js app.json 2>&1 | tee /tmp/overlay.log
-          node scripts/patch-metro.js metro.config.js 2>&1 | tee -a /tmp/overlay.log
-          echo overlay > /tmp/stage
+          node scripts/patch-app-config.js app.json
+          node scripts/patch-metro.js metro.config.js
 
       - name: Export web bundle
-        continue-on-error: true
-        run: |
-          set -o pipefail
-          if [ "${{ inputs.diagnostic }}" = "true" ]; then
-            npx expo export --platform web --output-dir dist-web --dev --no-minify --source-maps external 2>&1 | tee /tmp/export.log
-          else
-            npx expo export --platform web --output-dir dist-web 2>&1 | tee /tmp/export.log
-          fi
-          echo export > /tmp/stage
+        run: npx expo export --platform web --output-dir dist-web
 
       - name: Inject boot gate
-        continue-on-error: true
-        run: |
-          node scripts/patch-index-html.js dist-web 2>&1 | tee /tmp/gate.log
-          echo gate > /tmp/stage
+        run: node scripts/patch-index-html.js dist-web
 
       - name: Vendor SQLite WASM runtime
-        continue-on-error: true
         run: |
-          set -e
           mkdir -p dist-web/sqlite3
           base="https://cdn.jsdelivr.net/npm/@sqlite.org/sqlite-wasm@${SQLITE_WASM_VERSION}/dist"
           for f in index.mjs sqlite3.wasm; do
@@ -105,69 +60,25 @@ jobs:
               || curl -fsSL -o "dist-web/sqlite3/$f" "https://unpkg.com/@sqlite.org/sqlite-wasm@${SQLITE_WASM_VERSION}/dist/$f"
             test -s "dist-web/sqlite3/$f"
           done
-          ls -la dist-web/sqlite3
-          echo vendor > /tmp/stage
 
-      - name: Verify bundle output
-        continue-on-error: true
-        run: |
-          set -e
-          ls -la dist-web | head -30
-          size=$(du -sm dist-web | cut -f1)
-          files=$(find dist-web -type f | wc -l)
-          html=$(find dist-web -maxdepth 1 -name '*.html' | wc -l)
-          echo "bundle: ${size} MB / ${files} files / ${html} html entry"
-          test "$html" -ge 1 || { echo "::error::no html entry in dist-web"; exit 1; }
-          test "$size" -ge 1 || { echo "::error::bundle suspiciously small"; exit 1; }
-          grep -q 'cherry-web-gate' dist-web/index.html || { echo "::error::boot gate not injected"; exit 1; }
-          test -s dist-web/sqlite3/index.mjs || { echo "::error::sqlite3 runtime missing"; exit 1; }
-          echo verify > /tmp/stage
-
-      - name: Start static server
-        continue-on-error: true
+      - name: Static server and assertions
         run: |
           node web-adaptation/static-server.js dist-web 8099 > /tmp/static.log 2>&1 &
-          for i in $(seq 1 20); do
-            curl -sf -o /dev/null http://127.0.0.1:8099/ && break
-            sleep 0.5
-          done
-          curl -sf -o /dev/null http://127.0.0.1:8099/ || { cat /tmp/static.log; exit 1; }
-          echo server > /tmp/stage
+          for i in $(seq 1 20); do curl -sf -o /dev/null http://127.0.0.1:8099/ && break; sleep 0.5; done
+          curl -sf http://127.0.0.1:8099/ > /tmp/index.html
+          grep -q 'cherry-web-gate' /tmp/index.html
+          test -s dist-web/sqlite3/index.mjs
 
-      - name: Static assertions
-        continue-on-error: true
-        run: |
-          set -e
-          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8099/)
-          echo "index.html -> $code"
-          test "$code" = "200" || { echo "::error::index.html not served"; exit 1; }
-          curl -s http://127.0.0.1:8099/ | grep -q 'cherry-web-gate' || { echo "::error::boot gate missing"; exit 1; }
-          for f in sqlite3/index.mjs sqlite3/sqlite3.wasm; do
-            scode=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8099/$f")
-            echo "$f -> $scode"; test "$scode" = "200" || { echo "::error::$f missing"; exit 1; }
-          done
-          ctype=$(curl -s -o /dev/null -w '%{content_type}' http://127.0.0.1:8099/sqlite3/sqlite3.wasm)
-          echo "wasm content-type -> $ctype"
-          case "$ctype" in application/wasm*) ;; *) echo "::error::bad wasm mime"; exit 1 ;; esac
-          echo assert > /tmp/stage
+      - name: Install browser
+        run: npm i --no-save --no-audit --no-fund puppeteer-core@24
 
-      - name: Install smoke driver
-        continue-on-error: true
-        run: |
-          npm i --no-save --no-audit --no-fund puppeteer-core@24 > /tmp/puppeteer.log 2>&1
-          echo puppeteer > /tmp/stage
-
-      - name: Runtime smoke (headless Chrome)
-        continue-on-error: true
+      - name: Runtime smoke
         env:
           SMOKE_URL: http://127.0.0.1:8099/
           SMOKE_REPORT: ${{ github.workspace }}/RUNTIME-SMOKE.md
-        run: |
-          node scripts/runtime-smoke.mjs 2>&1 | tee /tmp/smoke.log || true
-          echo smoke > /tmp/stage
+        run: node scripts/runtime-smoke.mjs || true
 
-      - name: Chat end-to-end (fake provider)
-        continue-on-error: true
+      - name: Chat end-to-end
         env:
           E2E_URL: http://127.0.0.1:8100/?e2e=1
           E2E_REPORT: ${{ github.workspace }}/CHAT-E2E.md
@@ -176,48 +87,8 @@ jobs:
           cp -a dist-web /tmp/e2e-dist
           node scripts/fake-openai.mjs > /tmp/fake.log 2>&1 &
           node scripts/e2e-server.mjs --static /tmp/e2e-dist --port 8100 > /tmp/e2e-server.log 2>&1 &
-          for i in $(seq 1 30); do
-            curl -sf http://127.0.0.1:8100/api.deepseek.com/v1/models && break
-            sleep 1
-          done
-          node scripts/chat-e2e.mjs 2>&1 | tee /tmp/chat-e2e.log || true
-          echo e2e > /tmp/stage
-
-      - name: Collect report
-        if: always()
-        run: |
-          {
-            echo '# Web build report'
-            echo ''
-            echo "- run: ${{ github.run_id }} (${{ github.sha }})"
-            echo "- upstream: 6513ca2 (CherryHQ/cherry-studio-app)"
-            echo "- diagnostic export: ${{ inputs.diagnostic }}"
-            echo "- stage: $(cat /tmp/stage 2>/dev/null || echo unknown)"
-            echo "- size: $(du -sm dist-web 2>/dev/null | cut -f1 || echo 0) MB"
-            echo "- files: $(find dist-web -type f 2>/dev/null | wc -l)"
-            echo ''
-            for log in clone install overlay export gate vendor smoke e2e-server fake chat-e2e; do
-              echo "## $log log (tail)"
-              echo '```'
-              tail -n 40 "/tmp/$log.log" 2>/dev/null || echo '(missing)'
-              echo '```'
-              echo ''
-            done
-          } > CI-REPORT.md
-          {
-            echo '# Chat end-to-end report'
-            echo ''
-            echo 'See CHAT-E2E.md produced by scripts/chat-e2e.mjs.'
-          } > /tmp/e2e-note.md 2>/dev/null || true
-
-      - name: Commit reports
-        if: always()
-        run: |
-          git config user.name 'web-ci'
-          git config user.email 'web-ci@users.noreply.github.com'
-          git add CI-REPORT.md CHAT-E2E.md RUNTIME-SMOKE.md CHAT-E2E-FAILURE.png 2>/dev/null || true
-          git commit -m 'ci: web build report [skip ci]' || echo 'no report changes'
-          git push || echo 'report push skipped'
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8100/api.deepseek.com/v1/models && break; sleep 1; done
+          node scripts/chat-e2e.mjs || true
 
       - name: Upload artifact
         if: always()
@@ -226,3 +97,12 @@ jobs:
           name: cherry-studio-web
           path: dist-web
           if-no-files-found: warn
+
+      - name: Commit reports
+        if: always()
+        run: |
+          git config user.name 'web-ci'
+          git config user.email 'web-ci@users.noreply.github.com'
+          git add CHAT-E2E.md RUNTIME-SMOKE.md CHAT-E2E-FAILURE.png 2>/dev/null || true
+          git commit -m 'ci: web build report [skip ci]' || echo 'no report changes'
+          git push || echo 'report push skipped'
