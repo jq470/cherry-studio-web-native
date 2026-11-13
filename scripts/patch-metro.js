@@ -45,6 +45,7 @@ const SHIMS = {
   'expo-paste-input': 'expo-paste-input.web.js',
   'react-native-enriched-markdown': 'react-native-enriched-markdown.web.js',
   'react-native-streamdown': 'react-native-streamdown.web.js',
+  '@legendapp/list/section-list': 'legend-section-list.web.js',
 
   // --- generic stub (L1): native-only, never exercised on the web path,
   //     but Metro still bundles the static require edge ---
