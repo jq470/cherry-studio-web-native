@@ -1,0 +1,35 @@
+name: import-web-tooling
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Copy the proven web tooling from the shim prototype
+        run: |
+          set -e
+          mkdir -p scripts web-adaptation src/web-shims
+          base=https://raw.githubusercontent.com/jq470/cherry-studio-web/main
+          for f in patch-app-config.js patch-metro.js patch-index-html.js prepare-upstream.sh apply-overlay.sh fake-openai.mjs e2e-server.mjs chat-e2e.mjs runtime-smoke.mjs; do
+            curl -fsSL "$base/scripts/$f" -o "scripts/$f"
+          done
+          for f in static-server.js; do
+            curl -fsSL "$base/web-adaptation/$f" -o "web-adaptation/$f"
+          done
+          for f in native-stub.js react-native.web.js expo-sqlite.web.js expo-file-system.web.js react-native-mmkv.web.js react-native-keyboard-controller.web.js sentry-react-native.web.js expo-image-picker.web.js react-native-webview.web.js expo-paste-input.web.js react-native-enriched-markdown.web.js react-native-streamdown.web.js legend-list-react-native.web.js rnw-input-accessory-view.web.js; do
+            curl -fsSL "$base/overlay/src/web-shims/$f" -o "src/web-shims/$f"
+          done
+          ls -la scripts web-adaptation src/web-shims
+          git add -A
+          git -c user.name='web-import' -c user.email='web-import@users.noreply.github.com' \
+            commit -m "chore: import web build tooling" || echo 'no changes'
+          git push
