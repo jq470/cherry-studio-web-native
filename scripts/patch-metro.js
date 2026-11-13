@@ -47,6 +47,7 @@ const SHIMS = {
   'react-native-enriched-markdown': 'react-native-enriched-markdown.web.js',
   'react-native-streamdown': 'react-native-streamdown.web.js',
   '@legendapp/list/section-list': 'legend-section-list.web.js',
+  '@swmansion/react-native-bottom-sheet': 'swmansion-bottom-sheet.web.js',
 
   // --- generic stub (L1): native-only, never exercised on the web path,
   //     but Metro still bundles the static require edge ---
