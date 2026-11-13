@@ -72,11 +72,10 @@ jobs:
       - name: Install browser
         run: |
           mkdir -p /tmp/driver
+          printf '{"name":"driver","private":true}\n' > /tmp/driver/package.json
           cd /tmp/driver
-          pnpm init
           pnpm add puppeteer-core@24
-          cd "$GITHUB_WORKSPACE"
-          cp -a /tmp/driver/node_modules/. node_modules/
+          ln -sfn /tmp/driver/node_modules/puppeteer-core "$GITHUB_WORKSPACE/node_modules/puppeteer-core"
 
       - name: Runtime smoke
         env:
