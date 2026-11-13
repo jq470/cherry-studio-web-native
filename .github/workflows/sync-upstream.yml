@@ -1,0 +1,35 @@
+name: sync-upstream
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clone latest upstream
+        run: |
+          git clone --depth 1 https://github.com/CherryHQ/cherry-studio-app.git /tmp/upstream
+          cd /tmp/upstream
+          echo "upstream $(git rev-parse HEAD)"
+
+      - name: Replace tree with upstream source
+        run: |
+          rsync -a --delete \
+            --exclude '.git' \
+            --exclude '.github' \
+            --exclude 'node_modules' \
+            /tmp/upstream/ ./
+          git add -A
+          git -c user.name='web-sync' -c user.email='web-sync@users.noreply.github.com' \
+            commit -m "sync: upstream $(cd /tmp/upstream && git rev-parse --short HEAD)" || echo 'no changes'
+          git push
