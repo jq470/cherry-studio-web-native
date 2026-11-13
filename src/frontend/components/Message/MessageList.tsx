@@ -1,9 +1,13 @@
 import { ScrollInteractionBoundary, ScrollToBottomButton } from '@cherrystudio/ui/components';
 import { KeyboardAwareLegendList } from '@legendapp/list/keyboard';
-import { type LegendListRef, type LegendListRenderItemProps } from '@legendapp/list/react-native';
+import {
+  LegendList,
+  type LegendListRef,
+  type LegendListRenderItemProps,
+} from '@legendapp/list/react-native';
 import { useCallback, useImperativeHandle, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { type LayoutChangeEvent, View } from 'react-native';
+import { type LayoutChangeEvent, Platform, View } from 'react-native';
 import { useReanimatedKeyboardAnimation } from 'react-native-keyboard-controller';
 import {
   runOnJS,
@@ -28,6 +32,8 @@ import type { MessageListItem, MessageListProps } from './types';
 
 const SCROLL_BUTTON_GAP_ABOVE_ACCESSORY = 5;
 const FULL_WIDTH = { width: '100%' } as const;
+// The keyboard-aware wrapper mounts no rows on web; the plain JS list does.
+const MessageListComponent = Platform.OS === 'web' ? LegendList : KeyboardAwareLegendList;
 
 export function MessageList({
   bottomAccessoryHeight,
@@ -246,7 +252,7 @@ export function MessageList({
             onTouchStart={handleTouchStart}
           >
             {(scrollHandlers) => (
-              <KeyboardAwareLegendList
+              <MessageListComponent
                 // Give each window its own list: LegendList calls set$('readyToRender') during render on dataKey changes,
                 // triggering React's "Cannot update a component while rendering a different component" warning.
                 key={dataKey ?? 'live'}

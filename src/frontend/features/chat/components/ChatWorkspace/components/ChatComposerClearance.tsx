@@ -2,6 +2,7 @@ import { getComposerKeyboardStickyOffset, useComposerExpansion } from '@cherryst
 import type { PropsWithChildren } from 'react';
 import { useReanimatedKeyboardAnimation } from 'react-native-keyboard-controller';
 import Animated, { useAnimatedStyle } from 'react-native-reanimated';
+import { Platform, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 type ChatComposerClearanceProps = PropsWithChildren<{
@@ -16,6 +17,14 @@ export function ChatComposerClearance({
   className,
   contentBottomInset = 0,
 }: ChatComposerClearanceProps) {
+  // Reanimated worklets need native shared values; web renders a static inset.
+  if (Platform.OS === 'web') {
+    return (
+      <View className={className} style={{ paddingBottom: contentBottomInset }}>
+        {children}
+      </View>
+    );
+  }
   const composerInset = useComposerExpansion()?.meta.contentInset;
   const { height: keyboardHeight, progress: keyboardProgress } = useReanimatedKeyboardAnimation();
   const keyboardOffset = getComposerKeyboardStickyOffset(useSafeAreaInsets().bottom);
