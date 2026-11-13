@@ -1,6 +1,6 @@
 import { TextInputWrapper } from 'expo-paste-input';
 import { useCallback, useLayoutEffect, useMemo, useRef } from 'react';
-import { Platform, StyleSheet } from 'react-native';
+import { Platform, StyleSheet, View } from 'react-native';
 import { type ContextMenuItem, EnrichedMarkdownTextInput } from 'react-native-enriched-markdown';
 import { useCSSVariable, useResolveClassNames } from 'uniwind';
 
@@ -10,6 +10,7 @@ import { pasteWrapperStyle, textInputBoxStyle } from '../utils/composer-layout';
 import { composerTextStyle } from '../utils/composer-text-style/composer-text-style';
 import { useComposerEditorInput } from './composer-editor';
 
+const InputWrapper = Platform.OS === 'web' ? View : TextInputWrapper;
 const inputStyle = { ...textInputBoxStyle, ...composerTextStyle };
 const fillWrapperStyle = { ...pasteWrapperStyle, height: '100%' } as const;
 const fillInputStyle = { height: '100%', maxHeight: '100%' } as const;
@@ -144,7 +145,7 @@ export function ComposerInput({
     // and the alternative — wrapping only when the prop is present — would make
     // the field's own view hierarchy depend on a callback, so a caller adding
     // paste support later would be debugging a layout change they didn't make.
-    <TextInputWrapper
+    <InputWrapper
       onPaste={onPaste}
       style={inputLayout === 'fill' ? fillWrapperStyle : pasteWrapperStyle}
     >
@@ -179,7 +180,7 @@ export function ComposerInput({
         style={resolvedStyle ?? undefined}
         testID={testID}
       />
-    </TextInputWrapper>
+    </InputWrapper>
   );
 }
 
