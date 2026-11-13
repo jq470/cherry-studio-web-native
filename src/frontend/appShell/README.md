@@ -1,0 +1,33 @@
+# App Shell
+
+This directory owns frontend infrastructure that applies across the application rather than one
+page.
+
+- `appUpdate/` owns the package-update dialog, cold-start offer and entry state across channels.
+- `fileExport/` owns watermark preparation, system file sharing and photo saving.
+- `documentExport/` owns the source-neutral document export navigation handoff.
+- `header/` owns the app-wide main and route header adapters.
+- `navigation/` owns Expo Router and React Navigation integration shared by routes and pages.
+- [`conversation/`](./conversation/README.md) owns the shared conversation read model and catalog
+  sources used by the drawer, Agent picker and chat. Its `remote/` boundary owns desktop Session
+  observation and history; local chat observation belongs to `features/chat/runtime`.
+- `sidebar/` owns the drawer's navigation surface and the shared grouped destination list.
+- `systemEntry/` retains incoming shares while the destination page chooses an Agent or conversation.
+- `pane/` owns the file pane beside chat in wide windows.
+- `search/` owns the cross-page request session that opens the transient search page.
+- [`ssh/`](./ssh/README.md) presents authentication questions directly to the user, outside Agent
+  inputs and transcript state; the SSH runtime owns the queue and cancellation.
+- `backgroundActivity/` owns platform Live Activity factories registered during bootstrap.
+- `startup/` owns the frontend startup cover, readiness reporting, and handoff lifecycle.
+- `recovery/` owns the full-screen surfaces shown when the app fails to start or to render:
+  `StartupFailureScreen` for the bootstrap gate and `AppErrorBoundary` around the navigation tree.
+  Both offer a retry; startup copy falls back to English when translations could not initialize.
+- `observability/` owns EAS Observe, the entry-screen interactive marker, and Sentry consent,
+  JavaScript event filtering, and the connection to the native crash-reporting module.
+- `privacy/` owns the blocking data-collection disclosure. It is app-wide rather than part of
+  onboarding because an install that has already finished onboarding still has to answer a new
+  policy version. Both answers record the version, so whether collection runs is carried by the
+  settings switch alone; the analytics service reads the resulting consent predicate.
+
+App Shell modules expose deliberate public roots and may depend on shared frontend components,
+data, hooks, and utilities. They must not import page-private code.

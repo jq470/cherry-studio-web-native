@@ -1,0 +1,39 @@
+import type { Provider } from '@cherrystudio/universal/data/types/provider';
+
+export type { ProviderBaseUrlIssue } from '@cherrystudio/universal/utils/url';
+export {
+  formatApiHost,
+  formatOllamaApiHost,
+  getBaseUrl,
+  getProviderBaseUrlIssue,
+  isWithTrailingSharp,
+  routeToEndpoint,
+  shouldAppendProviderApiVersion,
+  withoutTrailingApiVersion,
+} from '@cherrystudio/universal/utils/url';
+
+export function getExtraHeaders(provider: Provider): Record<string, string> {
+  const headers = { ...provider.settings?.extraHeaders };
+  if (provider.id !== 'radeon-cloud' && provider.presetProviderId !== 'radeon-cloud') {
+    return headers;
+  }
+
+  for (const name of Object.keys(headers)) {
+    if (name.toLowerCase() === 'x-source') {
+      delete headers[name];
+    }
+  }
+  return { ...headers, 'X-Source': 'cherry-studio' };
+}
+
+export function defaultHeaders(
+  provider: Provider,
+  apiKey = '',
+  appHeaders: Readonly<Record<string, string>> = {},
+): Record<string, string> {
+  return {
+    ...appHeaders,
+    ...(apiKey ? { Authorization: `Bearer ${apiKey}`, 'X-Api-Key': apiKey } : {}),
+    ...getExtraHeaders(provider),
+  };
+}

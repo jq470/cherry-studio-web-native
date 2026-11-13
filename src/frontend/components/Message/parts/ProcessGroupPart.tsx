@@ -1,0 +1,125 @@
+import { MessagePart } from '@cherrystudio/ui/components';
+import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { View } from 'react-native';
+
+import { usePreference } from '@/frontend/data/hooks';
+import type { ResolvedCitationText } from '@/frontend/utils/messageCitations';
+import { getMessageProcessDurationMs } from '@/frontend/utils/messageProcessDuration';
+import type { CherryMessagePart } from '@/shared/data/types/message';
+import { readCherryMeta } from '@/shared/data/types/uiParts';
+
+import { useMessageListDisclosureToggle } from '../list/MessageListDisclosureContext';
+import type { MessageListItem } from '../types';
+import { MessagePartRenderer } from './MessagePartRenderer';
+import type { MessagePartRenderMode } from './MessageParts';
+import {
+  findLatestActivityPart,
+  groupMessageProcessItems,
+  type MessageProcessItem,
+} from './partitionMessageParts';
+import { ToolGroupPart } from './tools/ToolGroupPart';
+
+type ProcessGroupItem = MessageProcessItem & { key: string };
+
+type ProcessGroupPartProps = {
+  citationText: ReadonlyMap<number, ResolvedCitationText>;
+  items: readonly ProcessGroupItem[];
+  message: MessageListItem;
+  messageParts: readonly CherryMessagePart[];
+  renderMode: MessagePartRenderMode;
+};
+
+/** The process disclosure's title: its persisted duration, or a plain label before one exists. */
+export function useMessageProcessTitle(
+  stats: MessageListItem['stats'],
+  parts: readonly CherryMessagePart[],
+) {
+  const { t } = useTranslation();
+  const reasoningDurations = parts.flatMap((part) => {
+    if (part.type !== 'reasoning') return [];
+    const thinkingMs = readCherryMeta(part)?.thinkingMs;
+    return thinkingMs === undefined ? [] : [thinkingMs];
+  });
+  const durationMs = getMessageProcessDurationMs(stats, reasoningDurations);
+  return durationMs === undefined
+    ? t('chat.process.title')
+    : t('chat.process.duration', { seconds: Math.max(1, Math.round(durationMs / 1000)) });
+}
+
+export function ProcessGroupPart({
+  citationText,
+  items,
+  message,
+  messageParts,
+  renderMode,
+}: ProcessGroupPartProps) {
+  const [isAutoCollapseEnabled] = usePreference('chat.process.auto_collapse');
+  const handleDisclosureToggle = useMessageListDisclosureToggle();
+  const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
+  const isStreaming = message.status === 'pending';
+  const groups = groupMessageProcessItems(items);
+  const latestActivityPart = findLatestActivityPart(messageParts);
+  const title = useMessageProcessTitle(
+    message.stats,
+    items.map(({ part }) => part),
+  );
+
+  const renderItem = ({ index, key, part }: ProcessGroupItem) => (
+    <MessagePartRenderer
+      isStreaming={isStreaming && (part.type !== 'reasoning' || part === latestActivityPart)}
+      key={key}
+      messageId={message.id}
+      sessionId={message.agentSessionId}
+      partId={key}
+      messageParts={messageParts}
+      part={part}
+      renderMode={renderMode}
+      resolvedText={citationText.get(index)}
+    />
+  );
+  const content = groups.map((group) => {
+    if (group.kind === 'part') return renderItem(group.item);
+    const key = group.items[0].key;
+    const lastPart = group.items.at(-1)?.part;
+    const isThinking =
+      lastPart === latestActivityPart &&
+      lastPart?.type === 'reasoning' &&
+      lastPart.state === 'streaming';
+    return (
+      <ToolGroupPart
+        key={key}
+        expanded={expandedGroups[key] ?? false}
+        isStreaming={isStreaming}
+        isThinking={isThinking}
+        startedAt={
+          message.stats?.runtimeTiming?.startedAt ??
+          (message.createdAt ? Date.parse(message.createdAt) : undefined)
+        }
+        onExpandedChange={(expanded) =>
+          setExpandedGroups((current) => ({ ...current, [key]: expanded }))
+        }
+        tools={group.tools}
+      >
+        {group.items.map(renderItem)}
+      </ToolGroupPart>
+    );
+  });
+
+  if (isStreaming) return <View className="gap-1">{content}</View>;
+
+  return (
+    <MessagePart.Process
+      defaultExpanded={
+        message.status === 'success'
+          ? !isAutoCollapseEnabled
+          : Object.values(expandedGroups).some(Boolean)
+      }
+      onDisclosureToggle={handleDisclosureToggle}
+      state="complete"
+      title={title}
+    >
+      {content}
+    </MessagePart.Process>
+  );
+}

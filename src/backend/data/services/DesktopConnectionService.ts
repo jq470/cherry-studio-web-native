@@ -1,0 +1,714 @@
+import { inferAdapterFamily } from '@cherrystudio/provider-registry';
+import {
+  configuredEndpointsSchema,
+  directEndpointSchema,
+  directEndpointUrl,
+  type DirectEndpoint,
+} from '@cherrystudio/remote-protocol';
+import { loggerService } from '@logger';
+import { and, asc, eq } from 'drizzle-orm';
+import { randomUUID } from 'expo-crypto';
+
+import { application } from '@/backend/core/application/Application';
+import { publishDataApiChanges } from '@/backend/data/dataApiChanges';
+import type { DbService } from '@/backend/data/db/DbService';
+import {
+  desktopConnectionTable,
+  type DesktopConnectionRow,
+  type InsertUserProviderRow,
+  userModelTable,
+  userProviderTable,
+} from '@/backend/data/db/schemas';
+import type {
+  ProviderAccountCapabilities,
+  ProviderAccountIdentity,
+} from '@/shared/contracts/providerAccounts';
+import { DataApiError, DataApiErrorFactory, ErrorCode } from '@/shared/data/api/errors';
+import {
+  type DesktopImportPreview,
+  type DesktopImportResult,
+  type DesktopImportSelectionsDto,
+  type DesktopImportUnavailableReason,
+  DesktopImportSelectionsSchema,
+  type DesktopProviderModel,
+  type DesktopProviderSnapshot,
+  type DesktopProvidersSnapshot,
+  parseSupportedAuthConfig,
+  UpdateDesktopConnectionSchema,
+  type UpdateDesktopConnectionDto,
+} from '@/shared/data/api/schemas/desktopConnections';
+import type { DesktopConnection } from '@/shared/data/types/desktopConnection';
+import { createUniqueModelId, ENDPOINT_TYPE, type EndpointType } from '@/shared/data/types/model';
+import type { EndpointConfig, EndpointConfigs } from '@/shared/data/types/provider';
+import { resolveAuthOptional } from '@/shared/utils/providerAuth';
+import { isChatEndpointType } from '@/shared/utils/providerEndpoints';
+
+import { desktopConnectionName } from './desktopConnectionName';
+import { buildModelInsertValues, type CreateModelInput } from './ModelService';
+import {
+  assertCustomProviderEndpointConfiguration,
+  assertCustomProviderModelEndpointTypes,
+  hasConfiguredChatEndpoint,
+} from './providerModelEndpointIntegrity';
+import { providerRegistryService } from './ProviderRegistryService';
+import { insertManyWithOrderKey, insertWithOrderKey } from './utils/orderKey';
+
+const logger = loggerService.withContext('DesktopConnectionService');
+
+function desktopError(reason: string, message: string): DataApiError {
+  return new DataApiError(ErrorCode.INVALID_OPERATION, message, { reason });
+}
+
+function rowToConnection(row: DesktopConnectionRow): DesktopConnection {
+  const defaultName = desktopConnectionName({ alias: null, name: row.name });
+  return {
+    alias: row.alias,
+    configuredEndpoints: row.configuredEndpoints,
+    capabilities: row.grants.map((grant) => grant.domain),
+    defaultName,
+    id: row.id,
+    lastFetchedAt: row.lastFetchedAt,
+    name: row.alias ?? defaultName,
+    status: row.status,
+  };
+}
+
+function endpointFromProviderType(type: string | undefined): EndpointType {
+  switch (type) {
+    case 'anthropic':
+      return ENDPOINT_TYPE.ANTHROPIC_MESSAGES;
+    case 'gemini':
+    case 'vertexai':
+      return ENDPOINT_TYPE.GOOGLE_GENERATE_CONTENT;
+    case 'ollama':
+      return ENDPOINT_TYPE.OLLAMA_CHAT;
+    case 'openai-response':
+      return ENDPOINT_TYPE.OPENAI_RESPONSES;
+    default:
+      return ENDPOINT_TYPE.OPENAI_CHAT_COMPLETIONS;
+  }
+}
+
+function mapEndpointConfigs(provider: DesktopProviderSnapshot): EndpointConfigs | null {
+  const sourceConfigs = provider.endpointConfigs;
+  if (sourceConfigs && Object.keys(sourceConfigs).length > 0) {
+    const mapped: EndpointConfigs = {};
+    for (const [key, config] of Object.entries(sourceConfigs)) {
+      const endpointType = key as EndpointType;
+      mapped[endpointType] = {
+        ...config,
+        adapterFamily: config.adapterFamily ?? inferAdapterFamily(endpointType, config),
+      };
+    }
+    return mapped;
+  }
+
+  if (!provider.apiHost) {
+    return null;
+  }
+  const endpointType = provider.defaultChatEndpoint ?? endpointFromProviderType(provider.type);
+  const config: EndpointConfig = { baseUrl: provider.apiHost };
+  return {
+    [endpointType]: {
+      ...config,
+      adapterFamily: inferAdapterFamily(endpointType, config),
+    },
+  };
+}
+
+function mapApiFeatures(provider: DesktopProviderSnapshot): InsertUserProviderRow['apiFeatures'] {
+  const apiFeatures = {
+    ...provider.apiFeatures,
+    ...(provider.reportsActualCost !== undefined
+      ? { reportsActualCost: provider.reportsActualCost }
+      : {}),
+  };
+  return Object.keys(apiFeatures).length > 0 ? apiFeatures : null;
+}
+
+function resolvePresetProviderId(provider: DesktopProviderSnapshot): string | null {
+  for (const providerId of [provider.presetProviderId, provider.id]) {
+    if (
+      providerId &&
+      providerRegistryService.isRegistryProvider(providerId) &&
+      !providerRegistryService.isProviderExcluded(providerId)
+    ) {
+      return providerId;
+    }
+  }
+  return null;
+}
+
+/** Payload-only rejections; the import transaction re-validates whatever needs the database. */
+function getProviderImportRejection(
+  provider: DesktopProviderSnapshot,
+  account?: ProviderAccountCapabilities,
+): DesktopImportUnavailableReason | undefined {
+  if (provider.unreadable) return 'unreadable';
+  // An absent `authMethods` predates the field rather than denying API keys.
+  const acceptsApiKey = provider.authMethods?.includes('api-key') ?? true;
+  const hasUsableKey = provider.apiKeys.some((entry) => entry.isEnabled && entry.key.trim());
+  if (provider.authType === 'oauth') {
+    return account?.apiKeys && hasUsableKey ? undefined : 'unsupported-auth';
+  }
+  if (!acceptsApiKey) return 'unsupported-auth';
+  const authConfig = parseSupportedAuthConfig(provider.authConfig);
+  const authOptional =
+    provider.authOptional ??
+    resolveAuthOptional(
+      authConfig,
+      providerRegistryService.getProviderDisplayMetadata(provider.id, provider.presetProviderId)
+        .authOptional,
+    );
+  return authOptional || hasUsableKey ? undefined : 'missing-api-key';
+}
+
+/**
+ * The PC lists every endpoint a model supports, but Mobile routes on the first entry. Lead with the
+ * first one this provider can serve, and leave behind a model it cannot serve at all.
+ */
+function routeCustomProviderModels(
+  models: DesktopProviderModel[],
+  endpointConfigs: EndpointConfigs | null | undefined,
+): DesktopProviderModel[] {
+  return models.flatMap((model) => {
+    const endpointTypes = model.endpointTypes ?? [];
+    if (endpointTypes.length === 0) return [model];
+    const routed = endpointTypes.find(
+      (endpointType) =>
+        !isChatEndpointType(endpointType) ||
+        hasConfiguredChatEndpoint(endpointConfigs, endpointType),
+    );
+    if (!routed) return [];
+    return [
+      { ...model, endpointTypes: [routed, ...endpointTypes.filter((type) => type !== routed)] },
+    ];
+  });
+}
+
+/** Run the real mapping up front so a provider that cannot be written is disabled, not attempted. */
+function planProviderImport(
+  provider: DesktopProviderSnapshot,
+  existingEndpointConfigs: EndpointConfigs | null | undefined,
+  account?: ProviderAccountCapabilities,
+): { models: DesktopProviderModel[]; unavailableReason?: DesktopImportUnavailableReason } {
+  const rejection = getProviderImportRejection(provider, account);
+  if (rejection) return { models: provider.models, unavailableReason: rejection };
+  let configuration: ReturnType<typeof mapProvider>;
+  try {
+    configuration = mapProvider(provider, account);
+  } catch {
+    return { models: provider.models, unavailableReason: 'unreadable' };
+  }
+  if (configuration.presetProviderId) return { models: provider.models };
+  const endpointConfigs = { ...existingEndpointConfigs, ...configuration.endpointConfigs };
+  if (!hasConfiguredChatEndpoint(endpointConfigs, configuration.defaultChatEndpoint)) {
+    logger.warn('Desktop provider has no address for its chat endpoint', {
+      defaultChatEndpoint: configuration.defaultChatEndpoint,
+      providerId: provider.id,
+    });
+    return { models: provider.models, unavailableReason: 'unsupported-endpoint' };
+  }
+  const models = routeCustomProviderModels(provider.models, endpointConfigs);
+  if (models.length < provider.models.length) {
+    logger.warn('Desktop models have no endpoint this provider configures', {
+      count: provider.models.length - models.length,
+      providerId: provider.id,
+    });
+  }
+  return { models };
+}
+
+function getEnabledDesktopProviders(snapshot: DesktopProvidersSnapshot) {
+  // Preserve support for version 1 snapshots that omit explicit enabled flags.
+  return snapshot.providers
+    .filter((provider) => provider.isEnabled !== false)
+    .map((provider) => {
+      // Preview and import must validate the same keys that will be written.
+      const seenKeyIds = new Set<string>();
+      const seenKeyValues = new Set<string>();
+      const apiKeys = provider.apiKeys.filter((apiKey) => {
+        if (seenKeyIds.has(apiKey.id) || seenKeyValues.has(apiKey.key)) return false;
+        seenKeyIds.add(apiKey.id);
+        seenKeyValues.add(apiKey.key);
+        return true;
+      });
+      return {
+        ...provider,
+        apiKeys,
+        models: provider.models.filter((model) => model.isEnabled !== false),
+      };
+    });
+}
+
+function mapProvider(
+  provider: DesktopProviderSnapshot,
+  account?: ProviderAccountCapabilities,
+): Omit<InsertUserProviderRow, 'orderKey'> {
+  const presetProviderId = resolvePresetProviderId(provider);
+  const defaultChatEndpoint =
+    provider.defaultChatEndpoint ??
+    (provider.apiHost ? endpointFromProviderType(provider.type) : null);
+  let authConfig =
+    account?.apiKeys && provider.authType === 'oauth'
+      ? { type: 'api-key' as const }
+      : parseSupportedAuthConfig(provider.authConfig);
+  if (provider.authOptional !== undefined && (!authConfig || authConfig.type === 'api-key')) {
+    authConfig = { ...authConfig, required: !provider.authOptional, type: 'api-key' };
+  }
+  return {
+    apiFeatures: mapApiFeatures(provider),
+    apiKeys: provider.apiKeys,
+    authConfig,
+    defaultChatEndpoint,
+    endpointConfigs: mapEndpointConfigs(provider),
+    isEnabled: true,
+    name: provider.name,
+    presetProviderId,
+    providerId: provider.id,
+    providerSettings: provider.providerSettings ?? provider.settings ?? null,
+  };
+}
+
+function mapModel(
+  provider: DesktopProviderSnapshot,
+  model: DesktopProviderModel,
+  configuration: Pick<InsertUserProviderRow, 'defaultChatEndpoint' | 'presetProviderId'>,
+) {
+  const registryProviderId = configuration.presetProviderId ?? provider.id;
+  const registryContext = {
+    defaultChatEndpoint: configuration.defaultChatEndpoint ?? undefined,
+    presetProviderId: configuration.presetProviderId ?? null,
+  };
+  let registryData = providerRegistryService.lookupModel(
+    registryProviderId,
+    model.modelId,
+    registryContext,
+  );
+  if (!registryData.presetModel && model.presetModelId) {
+    registryData = providerRegistryService.lookupModel(
+      registryProviderId,
+      model.presetModelId,
+      registryContext,
+    );
+  }
+
+  const input: CreateModelInput = {
+    capabilities: model.capabilities,
+    contextWindow: model.contextWindow,
+    description: model.description,
+    endpointTypes: model.endpointTypes,
+    group: model.group,
+    inputModalities: model.inputModalities,
+    isDeprecated: model.isDeprecated ?? false,
+    isEnabled: true,
+    isHidden: model.isHidden ?? false,
+    maxInputTokens: model.maxInputTokens,
+    maxOutputTokens: model.maxOutputTokens,
+    modelId: model.modelId,
+    name: model.name,
+    outputModalities: model.outputModalities,
+    parameters: model.parameters,
+    pricing: model.pricing,
+    providerId: provider.id,
+    reasoning: model.reasoning,
+    registryData,
+    supportsStreaming: model.supportsStreaming,
+  };
+  return { ...buildModelInsertValues(input), reasoning: model.reasoning ?? null };
+}
+
+export class DesktopConnectionService {
+  // Workflows bind the originating host's database; API reads use the active host.
+  constructor(
+    private readonly database?: Pick<DbService, 'getDb' | 'withWriteTx'>,
+    private readonly accountCapabilities?: (
+      provider: ProviderAccountIdentity,
+    ) => ProviderAccountCapabilities,
+  ) {}
+
+  private get dbService() {
+    return this.database ?? application.get('DbService');
+  }
+
+  private get db() {
+    return this.dbService.getDb();
+  }
+
+  async list(): Promise<{ items: DesktopConnection[]; total: number }> {
+    const rows = await this.db
+      .select()
+      .from(desktopConnectionTable)
+      .orderBy(asc(desktopConnectionTable.createdAt));
+    return { items: rows.map(rowToConnection), total: rows.length };
+  }
+
+  async getById(id: string): Promise<DesktopConnection> {
+    return rowToConnection(await this.getRow(id));
+  }
+
+  async getRow(id: string): Promise<DesktopConnectionRow> {
+    const [row] = await this.db
+      .select()
+      .from(desktopConnectionTable)
+      .where(eq(desktopConnectionTable.id, id))
+      .limit(1);
+    if (!row) throw DataApiErrorFactory.notFound('DesktopConnection', id);
+    return row;
+  }
+
+  async savePair(
+    input: Pick<DesktopConnectionRow, 'id' | 'desktopIdentity' | 'deviceId' | 'grants' | 'name'>,
+    replace: boolean,
+    signal: AbortSignal,
+  ): Promise<DesktopConnection> {
+    const connection = await this.dbService.withWriteTx(async (tx) => {
+      signal.throwIfAborted();
+      const { id, name, deviceId, desktopIdentity, grants } = input;
+      // Re-pairing refreshes desktop-owned fields while retaining the local alias.
+      const values = {
+        id,
+        name,
+        deviceId,
+        desktopIdentity,
+        grants,
+        learnedEndpoints: [],
+        status: 'paired' as const,
+      };
+      const [row] = await (replace
+        ? tx
+            .update(desktopConnectionTable)
+            .set(values)
+            .where(eq(desktopConnectionTable.id, input.id))
+            .returning()
+        : tx.insert(desktopConnectionTable).values(values).returning());
+      if (!row) throw DataApiErrorFactory.notFound('DesktopConnection', input.id);
+      signal.throwIfAborted();
+      return rowToConnection(row);
+    });
+    publishDataApiChanges(['/desktop-connections', `/desktop-connections/${input.id}`]);
+    return connection;
+  }
+
+  async update(id: string, input: UpdateDesktopConnectionDto): Promise<DesktopConnection> {
+    const values = UpdateDesktopConnectionSchema.parse(input);
+    const connection = await this.dbService.withWriteTx(async (tx) => {
+      const [row] = await tx
+        .update(desktopConnectionTable)
+        .set(values)
+        .where(eq(desktopConnectionTable.id, id))
+        .returning();
+      if (!row) throw DataApiErrorFactory.notFound('DesktopConnection', id);
+      return rowToConnection(row);
+    });
+    publishDataApiChanges(['/desktop-connections', `/desktop-connections/${id}`]);
+    return connection;
+  }
+
+  async updateLearnedEndpoints(
+    id: string,
+    input: DirectEndpoint[],
+    expected: Pick<DesktopConnectionRow, 'deviceId' | 'desktopIdentity' | 'grants'>,
+    signal: AbortSignal,
+  ): Promise<DirectEndpoint[]> {
+    const learnedEndpoints = [
+      ...new Map(
+        input.slice(0, 32).map((value) => {
+          const endpoint = directEndpointSchema.parse(value);
+          return [directEndpointUrl(endpoint), endpoint] as const;
+        }),
+      ).values(),
+    ].filter(
+      (endpoint) => !/^fe[89ab][0-9a-f]:/i.test(endpoint.host) && !endpoint.host.includes('%'),
+    );
+    const changed = await this.dbService.withWriteTx(async (tx) => {
+      signal.throwIfAborted();
+      const [row] = await tx
+        .select()
+        .from(desktopConnectionTable)
+        .where(eq(desktopConnectionTable.id, id))
+        .limit(1);
+      if (
+        !row ||
+        row.status !== 'paired' ||
+        row.deviceId !== expected.deviceId ||
+        row.desktopIdentity !== expected.desktopIdentity ||
+        JSON.stringify(row.grants) !== JSON.stringify(expected.grants)
+      )
+        throw desktopError('auth-revoked', 'Pairing changed while syncing addresses');
+      const changed = JSON.stringify(row.learnedEndpoints) !== JSON.stringify(learnedEndpoints);
+      if (changed)
+        await tx
+          .update(desktopConnectionTable)
+          .set({ learnedEndpoints })
+          .where(eq(desktopConnectionTable.id, id));
+      signal.throwIfAborted();
+      return changed;
+    });
+    if (changed) publishDataApiChanges(['/desktop-connections', `/desktop-connections/${id}`]);
+    return learnedEndpoints;
+  }
+
+  async addEndpoint(
+    id: string,
+    endpoint: DirectEndpoint,
+    expected: Pick<DesktopConnectionRow, 'deviceId' | 'desktopIdentity' | 'grants'>,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const changed = await this.dbService.withWriteTx(async (tx) => {
+      signal.throwIfAborted();
+      const [row] = await tx
+        .select()
+        .from(desktopConnectionTable)
+        .where(eq(desktopConnectionTable.id, id))
+        .limit(1);
+      if (!row) throw DataApiErrorFactory.notFound('DesktopConnection', id);
+      if (
+        row.status !== 'paired' ||
+        row.deviceId !== expected.deviceId ||
+        row.desktopIdentity !== expected.desktopIdentity ||
+        JSON.stringify(row.grants) !== JSON.stringify(expected.grants)
+      )
+        throw desktopError('auth-revoked', 'Pairing changed while verifying the address');
+      if (
+        row.configuredEndpoints.some(
+          (item) => directEndpointUrl(item) === directEndpointUrl(endpoint),
+        )
+      )
+        return false;
+      if (row.configuredEndpoints.length >= 8)
+        throw desktopError('endpoint-limit', 'Remove an address before adding another');
+      const configuredEndpoints = configuredEndpointsSchema.parse([
+        ...row.configuredEndpoints,
+        endpoint,
+      ]);
+      await tx
+        .update(desktopConnectionTable)
+        .set({ configuredEndpoints })
+        .where(eq(desktopConnectionTable.id, id));
+      signal.throwIfAborted();
+      return true;
+    });
+    if (changed) publishDataApiChanges(['/desktop-connections', `/desktop-connections/${id}`]);
+  }
+
+  async remove(id: string): Promise<void> {
+    const removed = await this.dbService.withWriteTx((tx) =>
+      tx
+        .delete(desktopConnectionTable)
+        .where(eq(desktopConnectionTable.id, id))
+        .returning({ id: desktopConnectionTable.id }),
+    );
+    if (removed.length > 0)
+      publishDataApiChanges(['/desktop-connections', `/desktop-connections/${id}`]);
+  }
+
+  async updateStatus(
+    id: string,
+    values: Partial<Pick<DesktopConnectionRow, 'status' | 'grants' | 'lastFetchedAt'>>,
+    signal: AbortSignal,
+    expected?: Pick<DesktopConnectionRow, 'deviceId' | 'desktopIdentity' | 'grants'>,
+  ): Promise<void> {
+    await this.dbService.withWriteTx(async (tx) => {
+      signal.throwIfAborted();
+      const [row] = await tx
+        .update(desktopConnectionTable)
+        .set(values)
+        .where(
+          and(
+            eq(desktopConnectionTable.id, id),
+            expected
+              ? and(
+                  eq(desktopConnectionTable.deviceId, expected.deviceId),
+                  eq(desktopConnectionTable.desktopIdentity, expected.desktopIdentity),
+                  eq(desktopConnectionTable.grants, expected.grants),
+                )
+              : undefined,
+          ),
+        )
+        .returning({ id: desktopConnectionTable.id });
+      if (!row) throw DataApiErrorFactory.notFound('DesktopConnection', id);
+      signal.throwIfAborted();
+    });
+    publishDataApiChanges(['/desktop-connections', `/desktop-connections/${id}`]);
+  }
+
+  async preview(snapshot: DesktopProvidersSnapshot): Promise<DesktopImportPreview> {
+    const [providerRows, modelRows] = await Promise.all([
+      this.db
+        .select({
+          endpointConfigs: userProviderTable.endpointConfigs,
+          id: userProviderTable.providerId,
+        })
+        .from(userProviderTable),
+      this.db.select({ id: userModelTable.id }).from(userModelTable),
+    ]);
+    // Retained mobile endpoints widen what an update accepts, so judge against them.
+    const existingProviders = new Map(providerRows.map((row) => [row.id, row.endpointConfigs]));
+    const existingModels = new Set(modelRows.map((row) => row.id));
+    return {
+      providers: getEnabledDesktopProviders(snapshot).map((provider) => {
+        const account = this.accountCapabilities?.(provider);
+        const { models, unavailableReason } = planProviderImport(
+          provider,
+          existingProviders.get(provider.id),
+          account,
+        );
+        return {
+          action: existingProviders.has(provider.id) ? 'update' : 'add',
+          id: provider.id,
+          models: models.map((model) => ({
+            action: existingModels.has(createUniqueModelId(provider.id, model.modelId))
+              ? 'skip'
+              : 'add',
+            modelId: model.modelId,
+            name: model.name ?? model.modelId,
+          })),
+          name: provider.name,
+          ...(unavailableReason ? { unavailableReason } : {}),
+          ...(!unavailableReason && account?.balance && provider.authType === 'oauth'
+            ? { accountNotice: 'sign-in-for-balance' as const }
+            : {}),
+        };
+      }),
+    };
+  }
+
+  async import(
+    id: string,
+    snapshot: DesktopProvidersSnapshot,
+    input: DesktopImportSelectionsDto,
+    signal: AbortSignal,
+  ): Promise<DesktopImportResult> {
+    const { selections } = DesktopImportSelectionsSchema.parse(input);
+    const selectedModes = new Map(selections.map((item) => [item.providerId, item.mode]));
+    if (selectedModes.size !== selections.length) {
+      throw desktopError('invalid-selection', 'A provider can only be selected once');
+    }
+    const providersById = new Map(
+      getEnabledDesktopProviders(snapshot).map((provider) => [provider.id, provider]),
+    );
+    for (const providerId of selectedModes.keys()) {
+      const provider = providersById.get(providerId);
+      if (!provider) {
+        throw desktopError('invalid-selection', 'A selected provider is no longer available');
+      }
+      const rejection = getProviderImportRejection(provider, this.accountCapabilities?.(provider));
+      if (rejection) {
+        throw desktopError(rejection, `A selected provider was rejected as ${rejection}`);
+      }
+    }
+
+    const result = await this.dbService.withWriteTx(async (tx) => {
+      signal.throwIfAborted();
+      const result: DesktopImportResult = {
+        modelsAdded: 0,
+        modelsSkipped: 0,
+        providersAdded: 0,
+        providersUpdated: 0,
+      };
+      for (const [providerId, mode] of selectedModes) {
+        signal.throwIfAborted();
+        const provider = providersById.get(providerId)!;
+        const [existingProvider] = await tx
+          .select()
+          .from(userProviderTable)
+          .where(eq(userProviderTable.providerId, providerId))
+          .limit(1);
+        const account = this.accountCapabilities?.(provider);
+        const configuration = mapProvider(provider, account);
+        if (existingProvider && account?.apiKeys) {
+          // Local key identities and enabled choices belong to the phone, including account-owned keys.
+          const keys = [...(existingProvider.apiKeys ?? [])];
+          for (const key of provider.apiKeys) {
+            if (keys.some((existing) => existing.key === key.key)) continue;
+            keys.push(
+              keys.some((existing) => existing.id === key.id) ? { ...key, id: randomUUID() } : key,
+            );
+          }
+          configuration.apiKeys = keys;
+        }
+        if (!configuration.presetProviderId) {
+          // Retained mobile models may still use endpoints absent from the PC.
+          configuration.endpointConfigs = {
+            ...existingProvider?.endpointConfigs,
+            ...configuration.endpointConfigs,
+          };
+          assertCustomProviderEndpointConfiguration({
+            defaultChatEndpoint: configuration.defaultChatEndpoint,
+            endpointConfigs: configuration.endpointConfigs,
+          });
+        }
+        if (existingProvider) {
+          await tx
+            .update(userProviderTable)
+            .set(configuration)
+            .where(eq(userProviderTable.providerId, providerId));
+          result.providersUpdated += 1;
+        } else {
+          await insertWithOrderKey(tx, userProviderTable, configuration, {
+            pkColumn: userProviderTable.providerId,
+          });
+          result.providersAdded += 1;
+        }
+        if (mode !== 'provider-models') continue;
+
+        const existingModelIds = new Set(
+          (
+            await tx
+              .select({ id: userModelTable.id })
+              .from(userModelTable)
+              .where(eq(userModelTable.providerId, providerId))
+          ).map((row) => row.id),
+        );
+        const models = configuration.presetProviderId
+          ? provider.models
+          : routeCustomProviderModels(provider.models, configuration.endpointConfigs);
+        const missingModels = models.filter(
+          (model) => !existingModelIds.has(createUniqueModelId(providerId, model.modelId)),
+        );
+        result.modelsSkipped += models.length - missingModels.length;
+        const newModels = missingModels.map((model) => mapModel(provider, model, configuration));
+        for (const model of missingModels) {
+          if (!configuration.presetProviderId) {
+            assertCustomProviderModelEndpointTypes({
+              defaultChatEndpoint: configuration.defaultChatEndpoint,
+              endpointConfigs: configuration.endpointConfigs,
+              endpointTypes: model.endpointTypes ?? [],
+            });
+          }
+        }
+        // Keep each statement within SQLite's conservative variable limit.
+        const batchSize = newModels[0]
+          ? Math.max(1, Math.floor(999 / (Object.keys(newModels[0]).length + 3)))
+          : 1;
+        for (let offset = 0; offset < newModels.length; offset += batchSize) {
+          signal.throwIfAborted();
+          await insertManyWithOrderKey(
+            tx,
+            userModelTable,
+            newModels.slice(offset, offset + batchSize),
+            {
+              pkColumn: userModelTable.id,
+              scope: eq(userModelTable.providerId, providerId),
+            },
+          );
+        }
+        result.modelsAdded += newModels.length;
+      }
+
+      const [connection] = await tx
+        .update(desktopConnectionTable)
+        .set({ lastFetchedAt: Date.now(), status: 'paired' })
+        .where(eq(desktopConnectionTable.id, id))
+        .returning({ id: desktopConnectionTable.id });
+      if (!connection) throw DataApiErrorFactory.notFound('DesktopConnection', id);
+      signal.throwIfAborted();
+      return result;
+    });
+    publishDataApiChanges(['/desktop-connections', `/desktop-connections/${id}`]);
+    return result;
+  }
+}
+
+export const desktopConnectionService = new DesktopConnectionService();

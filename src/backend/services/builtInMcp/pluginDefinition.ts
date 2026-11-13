@@ -1,0 +1,111 @@
+import type {
+  CallToolResult,
+  Implementation,
+  ListToolsRequest,
+  ListToolsResult,
+} from '@modelcontextprotocol/client';
+
+import type {
+  PluginCatalogEntry,
+  PluginCredentialMethod,
+  PluginInteractiveMethod,
+} from '@/shared/data/types/plugin';
+
+import type {
+  PluginAuthorizationRuntime,
+  PluginAuthorizationStore,
+} from './authorization/pluginAuthorization';
+import type { PluginCredential } from './authorization/pluginCredential';
+import type { RecordPluginOperation } from './pluginDiagnostics';
+import type { PluginGuideDefinition } from './pluginGuide';
+
+export type PluginToolPolicy = Readonly<Record<string, 'read' | 'write'>>;
+
+/** The tool-only boundary consumed by plugin setup and the existing MCP runtime. */
+export interface PluginClient {
+  readonly serverInfo: Implementation;
+  /** Safe partial-discovery failures for the current catalog; never raw upstream messages. */
+  readonly discoveryWarnings?: readonly string[];
+  listTools(input?: {
+    params?: ListToolsRequest['params'];
+    options?: { signal?: AbortSignal };
+  }): Promise<ListToolsResult>;
+  close(): Promise<void>;
+  callTool(input: {
+    name: string;
+    args: Record<string, unknown>;
+    options?: { abortSignal?: AbortSignal };
+  }): Promise<CallToolResult>;
+}
+
+/** Credential-free discovery result reusable after the validated grant is committed. */
+export type PluginToolCatalog = {
+  tools: ListToolsResult['tools'];
+  discoveryWarnings: readonly string[];
+  serverInfo: PluginClient['serverInfo'];
+};
+
+export type PluginRequestAuthorization = {
+  apply(
+    credential: PluginCredential,
+    request: { url: URL; headers: Headers; signal?: AbortSignal },
+  ): void | Promise<void>;
+};
+
+export type PluginClientContext = {
+  readonly pluginId: string;
+  readonly tools: PluginToolPolicy;
+  readonly getCredential: (signal?: AbortSignal) => Promise<PluginCredential>;
+  readonly rejectCredential?: (credential: PluginCredential) => Promise<void>;
+  readonly requestAuthorization?: (challenge: PluginCredential) => Promise<void>;
+  readonly assertAuthorized: () => Promise<void>;
+  readonly authorization: PluginRequestAuthorization;
+  readonly signal: AbortSignal;
+};
+
+export type PluginAuthorizationDefinition = (
+  | (PluginCredentialMethod & {
+      encodeCredentials(fields: Record<string, string>): PluginCredential;
+    })
+  | (PluginInteractiveMethod & {
+      createRuntime(
+        store: PluginAuthorizationStore,
+        diagnostics?: RecordPluginOperation,
+      ): PluginAuthorizationRuntime;
+    })
+) & {
+  createRequestAuthorization(tools: PluginToolPolicy): PluginRequestAuthorization;
+};
+
+/** A bundled plugin owns its methods, credential formats, client and read-only setup check. */
+export interface PluginDefinition {
+  readonly catalog: Omit<PluginCatalogEntry, 'authMethods' | 'guide'>;
+  /** Saved MCP server name, independent of the UI's active language. */
+  readonly serverName: string;
+  readonly authMethods: readonly PluginAuthorizationDefinition[];
+  readonly tools: PluginToolPolicy;
+  /** Additional discovered tools require write approval. Clients must bind them to discovery. */
+  readonly acceptsDiscoveredTool?: (name: string) => boolean;
+  readonly guide?: PluginGuideDefinition;
+  createClient(context: PluginClientContext): Promise<PluginClient>;
+  /** Remove device files the plugin's tools saved, after its connection is removed. */
+  clearLocalFiles?(): void;
+  readonly validation: {
+    /** Omit to accept any admitted discovered tool without executing a business operation. */
+    readonly tool?: string;
+    /** Omit to validate discovery only. Never use a write tool for setup. */
+    readonly args?: Record<string, unknown>;
+    accountLabel(output: unknown): string;
+  };
+}
+
+export function getPluginToolEffect(
+  plugin: PluginDefinition,
+  name: string,
+): 'read' | 'write' | undefined {
+  return Object.hasOwn(plugin.tools, name)
+    ? plugin.tools[name]
+    : plugin.acceptsDiscoveredTool?.(name)
+      ? 'write'
+      : undefined;
+}

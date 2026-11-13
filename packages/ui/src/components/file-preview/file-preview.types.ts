@@ -1,0 +1,85 @@
+import type { ComponentType, ReactNode } from 'react';
+
+/**
+ * The kinds CherryUI classifies for callers that want a shared vocabulary. Only
+ * `image` has a built-in renderer; the rest exist so a caller can name a file
+ * precisely today and register a renderer for it later.
+ */
+export type BuiltInFilePreviewKind = 'audio' | 'document' | 'image' | 'pdf' | 'text';
+
+/**
+ * An open set: product code registers renderers for kinds CherryUI has never
+ * heard of. The `string & {}` arm keeps editor completion for the built-ins
+ * while still accepting any other tag.
+ */
+export type FilePreviewKind = BuiltInFilePreviewKind | (string & {});
+
+export type FilePreviewOperation = 'open' | 'thumbnail';
+
+/** Native/content thumbnail, icon tile, compact attachment, or title-first library card. */
+export type FilePreviewVariant = 'thumbnail' | 'icon' | 'attachment' | 'card';
+
+export type FilePreviewFile = {
+  displayName: string;
+  extensionLabel: string;
+  id: string;
+  kind: FilePreviewKind;
+  previewUri?: string;
+  revision: number | string;
+  uri: string;
+};
+
+export type FilePreviewLabels = {
+  openWith: string;
+  unavailable: string;
+};
+
+/**
+ * What every renderer receives, built-in or registered. A renderer draws the
+ * preview only: `FilePreview` owns the press target and delegates opening to
+ * the caller, so a plugin cannot diverge on interaction.
+ */
+export type FilePreviewComponentProps = {
+  file: FilePreviewFile;
+  onError?: (error: Error, operation: FilePreviewOperation) => void;
+  size: number;
+};
+
+export type FilePreviewComponent = ComponentType<FilePreviewComponentProps>;
+
+export type FilePreviewPlugin = {
+  component: FilePreviewComponent;
+  kind: FilePreviewKind;
+};
+
+export type FilePreviewTransfer = {
+  progress?: number;
+  /** `processing` is local work on the file, such as text recognition. */
+  state: 'uploading' | 'processing' | 'failed';
+  label: string;
+};
+
+export type FilePreviewProps = {
+  disabled?: boolean;
+  metadata?: Pick<FilePreviewFile, 'displayName' | 'extensionLabel' | 'kind'>;
+  transfer?: FilePreviewTransfer;
+  badge?: ReactNode;
+  file?: FilePreviewFile | null;
+  labels: FilePreviewLabels;
+  onError?: (error: Error, operation: FilePreviewOperation) => void;
+  onPress: () => void;
+  size?: number;
+  /** Glyph size for the icon variant; defaults to 24 independently of the tile. */
+  iconSize?: number;
+  variant?: FilePreviewVariant;
+};
+
+export type FileAttachmentPreviewProps = Omit<
+  FilePreviewProps,
+  'badge' | 'file' | 'size' | 'iconSize' | 'variant'
+> & {
+  categoryLabel: string;
+  disabled?: boolean;
+  /** The row can display metadata before the caller resolves the file bytes. */
+  file?: Pick<FilePreviewFile, 'displayName' | 'extensionLabel'> | null;
+};

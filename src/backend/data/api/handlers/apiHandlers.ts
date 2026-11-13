@@ -1,0 +1,104 @@
+import type { ApiImplementation } from '@/shared/data/api/types';
+
+import type { AgentGlobalSkillService } from '../../services/AgentGlobalSkillService';
+import type { AgentService } from '../../services/AgentService';
+import type { AgentSessionMessageService } from '../../services/AgentSessionMessageService';
+import type { AgentSessionService } from '../../services/AgentSessionService';
+import type { AgentToolBindingService } from '../../services/AgentToolBindingService';
+import type { AiUsageRecordService } from '../../services/AiUsageRecordService';
+import type { ContentSearchService } from '../../services/ContentSearchService';
+import type { DesktopConnectionService } from '../../services/DesktopConnectionService';
+import type { EntitySearchService } from '../../services/EntitySearchService';
+import type { FileEntryService } from '../../services/FileEntryService';
+import type { JobService } from '../../services/JobService';
+import type { McpServerService } from '../../services/McpServerService';
+import type { PaintingService } from '../../services/PaintingService';
+import type { PluginAuthorizationService } from '../../services/PluginAuthorizationService';
+import type { ProviderService } from '../../services/ProviderService';
+import type { SshProfileService } from '../../services/SshProfileService';
+import type { TrashService } from '../../services/TrashService';
+import { type AgentAvatars, createAgentHandlers } from './agents';
+import { createAgentSessionMessageHandlers } from './agentSessionMessages';
+import { createAgentSessionHandlers, type AgentSessionMutations } from './agentSessions';
+import { createAgentToolBindingHandlers } from './agentToolBindings';
+import { createAiUsageRecordHandlers } from './aiUsageRecords';
+import { createDesktopConnectionHandlers } from './desktopConnections';
+import { createFileHandlers } from './files';
+import { createJobHandlers } from './jobs';
+import { createMcpServerHandlers, type McpServerMutations } from './mcpServers';
+import { createModelHandlers, type SystemModelSupportFilter } from './models';
+import { createPaintingHandlers } from './paintings';
+import { createPluginCatalogHandlers, type PluginCatalogReader } from './pluginCatalog';
+import { createPluginConnectionHandlers } from './pluginConnections';
+import { createProviderHandlers, type ProviderAccountCleanup } from './providers';
+import { createSearchHandlers } from './search';
+import {
+  createSkillHandlers,
+  type SkillAvailabilityReader,
+  type SkillInstructionReader,
+} from './skills';
+import { createSshProfileHandlers } from './sshProfiles';
+import { createTrashHandlers, type TrashMutations } from './trash';
+
+export type DataApiDependencies = {
+  sshProfiles: Pick<SshProfileService, 'list'>;
+  trash: TrashService;
+  trashMutations: TrashMutations;
+  agentAvatars: AgentAvatars;
+  agents: AgentService;
+  agentGlobalSkills: AgentGlobalSkillService;
+  skillAvailability: SkillAvailabilityReader;
+  skillInstructions: SkillInstructionReader;
+  agentToolBindings: AgentToolBindingService;
+  agentSessionMessages: AgentSessionMessageService;
+  agentSessionMutations: AgentSessionMutations;
+  agentSessions: AgentSessionService;
+  aiUsageRecords: AiUsageRecordService;
+  contentSearch: ContentSearchService;
+  desktopConnections: DesktopConnectionService;
+  desktopConnectionEndpointsChanged: (id: string) => Promise<void>;
+  desktopConnectionNameChanged: (id: string) => Promise<void>;
+  entitySearch: EntitySearchService;
+  files: FileEntryService;
+  jobs: JobService;
+  mcpServerMutations: McpServerMutations;
+  mcpServers: McpServerService;
+  models: import('../../services/ModelService').ModelService;
+  systemModelSupport: SystemModelSupportFilter;
+  paintings: PaintingService;
+  pluginCatalog: PluginCatalogReader;
+  pluginConnections: Pick<PluginAuthorizationService, 'listConnections'>;
+  providers: ProviderService;
+  providerAccounts: ProviderAccountCleanup;
+};
+
+export function createDataApiHandlers(dependencies: DataApiDependencies): ApiImplementation {
+  return {
+    ...createSshProfileHandlers(dependencies.sshProfiles),
+    ...createTrashHandlers(dependencies.trash, dependencies.trashMutations),
+    ...createAgentHandlers(dependencies.agents, dependencies.agentAvatars),
+    ...createAgentToolBindingHandlers(dependencies.agentToolBindings),
+    ...createAgentSessionHandlers(dependencies.agentSessions, dependencies.agentSessionMutations),
+    ...createAgentSessionMessageHandlers(dependencies.agentSessionMessages),
+    ...createAiUsageRecordHandlers(dependencies.aiUsageRecords),
+    ...createDesktopConnectionHandlers(
+      dependencies.desktopConnections,
+      dependencies.desktopConnectionEndpointsChanged,
+      dependencies.desktopConnectionNameChanged,
+    ),
+    ...createFileHandlers(dependencies.files, dependencies.trashMutations),
+    ...createJobHandlers(dependencies.jobs),
+    ...createMcpServerHandlers(dependencies.mcpServers, dependencies.mcpServerMutations),
+    ...createModelHandlers(dependencies.models, dependencies.systemModelSupport),
+    ...createPaintingHandlers(dependencies.paintings),
+    ...createPluginCatalogHandlers(dependencies.pluginCatalog),
+    ...createPluginConnectionHandlers(dependencies.pluginConnections),
+    ...createProviderHandlers(dependencies.providers, dependencies.providerAccounts),
+    ...createSearchHandlers(dependencies.contentSearch, dependencies.entitySearch),
+    ...createSkillHandlers(
+      dependencies.agentGlobalSkills,
+      dependencies.skillAvailability,
+      dependencies.skillInstructions,
+    ),
+  };
+}

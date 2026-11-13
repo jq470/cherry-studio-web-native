@@ -1,0 +1,356 @@
+import {
+  buildParamsSchema,
+  type CanonicalParamKey,
+  type ImageGenerationMode,
+  type ImageGenerationSupport,
+  type ImageModeDef,
+  type ParamValues,
+  type SupportSpec,
+} from '@cherrystudio/provider-registry';
+
+export type ImageParamDraft = Record<string, unknown>;
+
+export type ImageParamField = {
+  key: CanonicalParamKey;
+  spec: SupportSpec;
+};
+
+export type ResolvedImageGenerationMode = {
+  definition: ImageModeDef;
+  mode: ImageGenerationMode;
+};
+
+export function resolveImageGenerationMode(
+  support: ImageGenerationSupport | undefined,
+  mode: ImageGenerationMode | undefined,
+): ResolvedImageGenerationMode | undefined {
+  const definition = mode ? support?.modes[mode] : undefined;
+  return mode && definition ? { definition, mode } : undefined;
+}
+
+/**
+ * Shape of the image a request will produce, read back from the params that
+ * asked for it. A placeholder tile has no image to measure, so this is the only
+ * way to size it before the generation lands — and every key here is optional
+ * in the registry, hence the square fallback.
+ */
+export function imageParamsAspectRatio(values: ParamValues | undefined): number {
+  const ratio =
+    parseImageRatio(values?.aspectRatio) ??
+    parseImageRatio(values?.size) ??
+    parseImageRatio(values?.imageResolution);
+  return ratio ? ratio.width / ratio.height : 1;
+}
+
+/** Read registry ratios and pixel sizes without changing their request values. */
+export function parseImageRatio(value: unknown): { width: number; height: number } | undefined {
+  if (typeof value !== 'string') return undefined;
+  const sides = value
+    .trim()
+    .replace(/^ASPECT_/i, '')
+    .split(/[:x×_]/i)
+    .map(Number);
+  if (sides.length !== 2 || !sides.every((side) => Number.isFinite(side) && side > 0))
+    return undefined;
+  return { width: sides[0], height: sides[1] };
+}
+
+export function getImageParamFields(
+  resolvedMode: ResolvedImageGenerationMode | undefined,
+  values: ImageParamDraft = {},
+): ImageParamField[] {
+  if (!resolvedMode) {
+    return [];
+  }
+
+  const outputFormatSpec = resolvedMode.definition.supports.outputFormat;
+  const outputFormat =
+    values.outputFormat ||
+    (outputFormatSpec?.type === 'enum' ? outputFormatSpec.default : undefined);
+  return Object.entries(resolvedMode.definition.supports).flatMap(([key, spec]) => {
+    if (!spec) return [];
+    if (outputFormat === 'gif' && spec.type === 'enum') {
+      if (key === 'size' && spec.options.includes('auto')) {
+        // Still-image dimensions can exceed the default nine-frame GIF pixel budget.
+        spec = { ...spec, options: ['auto'], default: 'auto' };
+      } else if (key === 'background') {
+        spec = {
+          ...spec,
+          options: spec.options.filter((option) => option !== 'transparent'),
+          default: spec.default === 'transparent' ? undefined : spec.default,
+        };
+      }
+    }
+    return [{ key: key as CanonicalParamKey, spec }];
+  });
+}
+
+export function reconcileImageParamDraft(
+  current: ImageParamDraft,
+  resolvedMode: ResolvedImageGenerationMode | undefined,
+): ImageParamDraft {
+  const fields = getImageParamFields(resolvedMode, current);
+  const next: ImageParamDraft = {};
+  const customSizePairs = new Map<
+    string,
+    { key: CanonicalParamKey; spec: SupportSpec & { type: 'size' } }
+  >();
+
+  for (const field of fields) {
+    if (field.spec.type === 'size') {
+      customSizePairs.set(field.spec.pairedEnumKey ?? 'size', {
+        key: field.key,
+        spec: field.spec,
+      });
+    }
+  }
+
+  for (const field of fields) {
+    if (field.spec.type === 'size') {
+      copyCustomSizeDraft(next, current, field.key, field.spec);
+      continue;
+    }
+
+    const currentValue = current[field.key];
+    const validValue = isSupportedValue(currentValue, field.spec, customSizePairs.has(field.key));
+    if (validValue) {
+      next[field.key] = currentValue;
+      continue;
+    }
+
+    const defaultValue = defaultValueFor(field.spec);
+    if (defaultValue !== undefined) {
+      next[field.key] = defaultValue;
+    }
+  }
+
+  // A custom-size spec can appear after its paired enum in Registry order.
+  for (const [pairedKey, customSize] of customSizePairs) {
+    const currentValue = next[pairedKey];
+    if (currentValue === 'custom') {
+      const width = next[`${customSize.key}_width`];
+      const height = next[`${customSize.key}_height`];
+      if (!isValidSide(width, customSize.spec) || !isValidSide(height, customSize.spec)) {
+        delete next[`${customSize.key}_width`];
+        delete next[`${customSize.key}_height`];
+        const pairedField = fields.find((field) => field.key === pairedKey);
+        const pairedDefault = pairedField ? defaultValueFor(pairedField.spec) : undefined;
+        if (pairedDefault === undefined) {
+          delete next[pairedKey];
+        } else {
+          next[pairedKey] = pairedDefault;
+        }
+      }
+    }
+  }
+
+  return next;
+}
+
+/** Apply format-dependent defaults at selection time, preserving unrelated invalid edits. */
+export function updateImageParamDraft(
+  current: ImageParamDraft,
+  key: string,
+  value: unknown,
+  resolvedMode: ResolvedImageGenerationMode | undefined,
+): ImageParamDraft {
+  const next = { ...current, [key]: value };
+  if (key === 'outputFormat' && value === 'gif') {
+    for (const field of getImageParamFields(resolvedMode, next)) {
+      if (
+        (field.key === 'size' || field.key === 'background') &&
+        !isSupportedValue(next[field.key], field.spec, false)
+      ) {
+        const defaultValue = defaultValueFor(field.spec);
+        if (defaultValue === undefined) delete next[field.key];
+        else next[field.key] = defaultValue;
+      }
+    }
+  }
+  return next;
+}
+
+export function prepareImageParamValues(
+  draft: ImageParamDraft,
+  support: ImageGenerationSupport | undefined,
+  resolvedMode: ResolvedImageGenerationMode | undefined,
+): ParamValues {
+  if (!resolvedMode) {
+    return {};
+  }
+
+  const parsed = buildParamsSchema(support, resolvedMode.mode).parse(draft);
+  const values: Record<string, unknown> = {};
+  const fields = getImageParamFields(resolvedMode, draft);
+
+  for (const { key, spec } of fields) {
+    const value =
+      parsed[key] ?? (key === 'outputFormat' && spec.type === 'enum' ? spec.default : undefined);
+    if (value !== undefined && value !== null && value !== '') {
+      values[key] = value;
+    }
+  }
+
+  for (const field of fields) {
+    if (field.spec.type !== 'size') {
+      continue;
+    }
+
+    const pairedKey = field.spec.pairedEnumKey ?? 'size';
+    if (values[pairedKey] !== 'custom') {
+      delete values[field.key];
+      continue;
+    }
+
+    const width = parsed[`${field.key}_width`];
+    const height = parsed[`${field.key}_height`];
+    if (!isValidSide(width, field.spec) || !isValidSide(height, field.spec)) {
+      throw new Error('Invalid custom image size');
+    }
+    values[pairedKey] = `${width}x${height}`;
+    delete values[field.key];
+  }
+
+  return values as ParamValues;
+}
+
+export function isImageParamDraftValid(
+  draft: ImageParamDraft,
+  resolvedMode: ResolvedImageGenerationMode | undefined,
+): boolean {
+  const fields = getImageParamFields(resolvedMode, draft);
+  const supports = new Map(fields.map((field) => [field.key as string, field.spec]));
+  for (const [key, value] of Object.entries(draft)) {
+    const spec = supports.get(key);
+    if (!spec) {
+      if (
+        !fields.some(
+          (field) =>
+            field.spec.type === 'size' &&
+            (key === `${field.key}_width` || key === `${field.key}_height`),
+        )
+      )
+        return false;
+      continue;
+    }
+    if (value === undefined || value === null || value === '') continue;
+    const hasCustomSize = fields.some(
+      (field) => field.spec.type === 'size' && (field.spec.pairedEnumKey ?? 'size') === key,
+    );
+    if (!isSupportedValue(value, spec, hasCustomSize)) return false;
+  }
+  for (const field of fields) {
+    if (field.spec.type !== 'size') {
+      continue;
+    }
+    const pairedKey = field.spec.pairedEnumKey ?? 'size';
+    if (draft[pairedKey] !== 'custom') {
+      continue;
+    }
+    if (
+      !isValidSide(draft[`${field.key}_width`], field.spec) ||
+      !isValidSide(draft[`${field.key}_height`], field.spec)
+    ) {
+      return false;
+    }
+  }
+  if (resolvedMode) {
+    const parsed = buildParamsSchema(
+      { modes: { [resolvedMode.mode]: resolvedMode.definition } },
+      resolvedMode.mode,
+    ).parse(draft);
+    for (const [key, value] of Object.entries(draft)) {
+      if (value !== undefined && value !== null && value !== '' && parsed[key] === undefined)
+        return false;
+    }
+  }
+  return true;
+}
+
+/** Admit only canonical request keys, then validate and normalize without losing invalid values. */
+export function prepareImageParamRequest(
+  values: ParamValues,
+  resolvedMode: ResolvedImageGenerationMode | undefined,
+): ParamValues | undefined {
+  const fields = getImageParamFields(resolvedMode, values);
+  const requestKeys = new Set(
+    fields.filter((field) => field.spec.type !== 'size').map((field) => field.key as string),
+  );
+  if (Object.keys(values).some((key) => !requestKeys.has(key))) return undefined;
+  const draft: ImageParamDraft = { ...values };
+  for (const field of fields) {
+    if (field.spec.type !== 'size') continue;
+    const pairedKey = field.spec.pairedEnumKey ?? 'size';
+    const pairedField = fields.find((item) => item.key === pairedKey);
+    const value = draft[pairedKey];
+    if (pairedField?.spec.type === 'enum' && pairedField.spec.options.includes(String(value)))
+      continue;
+    if (typeof value !== 'string' || !/^\d+x\d+$/.test(value)) continue;
+    const [width, height] = value.split('x').map(Number);
+    draft[pairedKey] = 'custom';
+    draft[`${field.key}_width`] = width;
+    draft[`${field.key}_height`] = height;
+  }
+  if (!isImageParamDraftValid(draft, resolvedMode)) return undefined;
+  return prepareImageParamValues(
+    draft,
+    resolvedMode ? { modes: { [resolvedMode.mode]: resolvedMode.definition } } : undefined,
+    resolvedMode,
+  );
+}
+
+function copyCustomSizeDraft(
+  next: ImageParamDraft,
+  current: ImageParamDraft,
+  key: CanonicalParamKey,
+  spec: SupportSpec & { type: 'size' },
+) {
+  const widthKey = `${key}_width`;
+  const heightKey = `${key}_height`;
+  if (isValidSide(current[widthKey], spec)) {
+    next[widthKey] = current[widthKey];
+  }
+  if (isValidSide(current[heightKey], spec)) {
+    next[heightKey] = current[heightKey];
+  }
+}
+
+function defaultValueFor(spec: SupportSpec): unknown {
+  switch (spec.type) {
+    case 'switch':
+      return spec.default ?? false;
+    case 'range':
+      return spec.default ?? spec.min;
+    case 'enum':
+      return spec.default;
+    case 'size':
+    case 'text':
+      return undefined;
+  }
+}
+
+function isSupportedValue(value: unknown, spec: SupportSpec, supportsCustom: boolean): boolean {
+  if (value === undefined || value === null || value === '') {
+    return false;
+  }
+
+  switch (spec.type) {
+    case 'switch':
+      return typeof value === 'boolean';
+    case 'enum':
+      return spec.options.includes(String(value)) || (supportsCustom && value === 'custom');
+    case 'range': {
+      const numeric = Number(value);
+      return Number.isFinite(numeric) && numeric >= spec.min && numeric <= spec.max;
+    }
+    case 'text':
+      return typeof value === 'string' || typeof value === 'number';
+    case 'size':
+      return false;
+  }
+}
+
+function isValidSide(value: unknown, spec: SupportSpec & { type: 'size' }): value is number {
+  const numeric = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(numeric) && numeric >= spec.minSide && numeric <= spec.maxSide;
+}

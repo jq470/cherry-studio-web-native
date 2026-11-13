@@ -1,0 +1,223 @@
+import { useInfiniteQuery } from '@tanstack/react-query';
+import { useCallback, useMemo, useRef, useState } from 'react';
+
+import { queryKeys, useApiClient } from '@/frontend/data';
+import { useMessageRenderWindow } from '@/frontend/hooks/chat/useMessageRenderWindow';
+import { getOlderLoadAction } from '@/frontend/hooks/chat/utils/messageHistoryWindowStrategy';
+import { messageWindowPolicy } from '@/frontend/hooks/chat/utils/messageWindowPolicy';
+import type { AgentMessageView } from '@/shared/contracts/agent';
+import type {
+  AgentSessionMessagePage,
+  ListAgentSessionMessagesQueryParams,
+} from '@/shared/data/api/schemas/agentSessionMessages';
+
+export type AgentMessageHistoryWindow = {
+  dataKey: string;
+  error?: Error;
+  hasNewerMessages: boolean;
+  hasOlderMessages: boolean;
+  initialScrollTarget?: 'end' | { messageId: string };
+  isLoadingInitial: boolean;
+  isRefreshing: boolean;
+  isLoadingOlder: boolean;
+  isLoadingNewer: boolean;
+  loadOlder: () => Promise<void>;
+  loadNewer: () => Promise<void>;
+  messages: readonly AgentMessageView[];
+  returnToLatest?: () => void;
+  retry: () => Promise<void>;
+};
+
+export type MessageNavigation = {
+  messageId?: string;
+  messageRequestId?: string;
+  aroundMode?: 'exact';
+  preparedPage?: AgentSessionMessagePage;
+};
+
+function flattenMessagePages(pages: readonly AgentSessionMessagePage[]): AgentMessageView[] {
+  const messages: AgentMessageView[] = [];
+  const seen = new Set<string>();
+  for (let pageIndex = pages.length - 1; pageIndex >= 0; pageIndex -= 1) {
+    const page = pages[pageIndex];
+    for (let itemIndex = page.items.length - 1; itemIndex >= 0; itemIndex -= 1) {
+      const message = page.items[itemIndex];
+      if (!seen.has(message.id)) {
+        seen.add(message.id);
+        messages.push(message);
+      }
+    }
+  }
+  return messages;
+}
+
+/**
+ * One local transcript window, initially at either the live edge or a search result. The Query
+ * cache is keyed by Session, so leaving and re-entering the chat shows the loaded pages again;
+ * transcript changes invalidate them in place instead of replacing the window.
+ */
+export function useAgentMessageHistoryWindow(
+  sessionId: string | undefined,
+  navigation: MessageNavigation = {},
+  {
+    settledOnly = false,
+    prepareAround,
+  }: {
+    settledOnly?: boolean;
+    /** Runs once before the first window around a message is read, such as selecting its branch. */
+    prepareAround?: (messageId: string) => Promise<void>;
+  } = {},
+): AgentMessageHistoryWindow {
+  const apiClient = useApiClient();
+  const { messageId, messageRequestId, aroundMode } = navigation;
+  const navigationKey = JSON.stringify([
+    sessionId,
+    messageId,
+    messageRequestId,
+    ...(aroundMode ? [aroundMode] : []),
+  ]);
+  const [latestNavigationKey, setLatestNavigationKey] = useState<string>();
+  const isReturningToLatest = latestNavigationKey === navigationKey;
+  const aroundMessageId = isReturningToLatest ? undefined : messageId;
+  const isAroundMessage = Boolean(aroundMessageId);
+  const dataKey = messageId
+    ? `${navigationKey}:${isAroundMessage ? 'message' : 'latest'}`
+    : (sessionId ?? '');
+  const preparedPage =
+    navigation.preparedPage &&
+    (!aroundMode || navigation.preparedPage.items.some((item) => item.id === aroundMessageId))
+      ? navigation.preparedPage
+      : undefined;
+  const initialPageParam: ListAgentSessionMessagesQueryParams = {
+    aroundMessageId,
+    ...(aroundMessageId && aroundMode ? { aroundMode } : {}),
+  };
+  // Preparing changes the transcript, which refetches this window; preparing again on that
+  // refetch would loop and undo the reader's later choices.
+  const preparedNavigationKey = useRef<string>(undefined);
+  const query = useInfiniteQuery({
+    enabled: Boolean(sessionId),
+    getNextPageParam: (
+      page: AgentSessionMessagePage,
+    ): ListAgentSessionMessagesQueryParams | undefined =>
+      page.nextCursor ? { cursor: page.nextCursor, direction: 'older' } : undefined,
+    getPreviousPageParam: (
+      page: AgentSessionMessagePage,
+    ): ListAgentSessionMessagesQueryParams | undefined =>
+      page.previousCursor ? { cursor: page.previousCursor, direction: 'newer' } : undefined,
+    initialPageParam,
+    ...(preparedPage && aroundMessageId
+      ? { initialData: { pages: [preparedPage], pageParams: [initialPageParam] } }
+      : {}),
+    queryFn: async ({ pageParam, signal }) => {
+      if (
+        pageParam.aroundMessageId &&
+        !preparedPage &&
+        preparedNavigationKey.current !== navigationKey
+      ) {
+        await prepareAround?.(pageParam.aroundMessageId);
+        signal.throwIfAborted();
+        preparedNavigationKey.current = navigationKey;
+      }
+      const page = await apiClient.get(
+        `/agent-sessions/${sessionId ?? '__missing_session__'}/messages`,
+        {
+          query: { ...pageParam, limit: messageWindowPolicy.initialFetchCount, settledOnly },
+          signal,
+        },
+      );
+      if (signal.aborted) throw new Error('Message history request cancelled');
+      if (
+        pageParam.aroundMode === 'exact' &&
+        !page.items.some((item) => item.id === pageParam.aroundMessageId)
+      )
+        throw new Error('Exact message window does not contain its target.');
+      return page;
+    },
+    queryKey: [
+      ...queryKeys.agentSessions.messages(sessionId ?? '__missing_session__'),
+      {
+        aroundMessageId,
+        aroundMode,
+        ...(aroundMessageId ? { messageRequestId } : {}),
+        limit: messageWindowPolicy.initialFetchCount,
+        settledOnly,
+      },
+    ],
+    staleTime: messageWindowPolicy.staleTimeMs,
+    // Loaded pages outlive the page only while still fresh; past that a revisit refetches every
+    // page anyway, so retaining a long transcript in memory buys nothing.
+    gcTime: messageWindowPolicy.staleTimeMs,
+  });
+  const allMessages = useMemo(
+    () => flattenMessagePages(query.data?.pages ?? []),
+    [query.data?.pages],
+  );
+  const { hasHiddenMessages, hiddenMessageCount, revealMore, visibleMessages } =
+    useMessageRenderWindow(allMessages);
+  const {
+    fetchNextPage,
+    fetchPreviousPage,
+    hasNextPage,
+    hasPreviousPage,
+    isFetching,
+    isFetchingNextPage,
+    isFetchingPreviousPage,
+    refetch,
+  } = query;
+  const loadOlder = useCallback(async () => {
+    if (
+      !isAroundMessage &&
+      getOlderLoadAction({ hasHiddenMessages, hiddenMessageCount }) === 'reveal'
+    ) {
+      revealMore();
+    } else if (hasNextPage && !isFetching) {
+      await fetchNextPage({ cancelRefetch: false });
+    }
+  }, [
+    fetchNextPage,
+    hasHiddenMessages,
+    hasNextPage,
+    hiddenMessageCount,
+    isAroundMessage,
+    isFetching,
+    revealMore,
+  ]);
+  const loadNewer = useCallback(async () => {
+    if (hasPreviousPage && !isFetching) {
+      await fetchPreviousPage({ cancelRefetch: false });
+    }
+  }, [fetchPreviousPage, hasPreviousPage, isFetching]);
+  const returnToLatest = useCallback(() => {
+    setLatestNavigationKey(navigationKey);
+  }, [navigationKey]);
+  const retry = useCallback(async () => {
+    await refetch();
+  }, [refetch]);
+
+  return {
+    dataKey,
+    error: query.error ?? undefined,
+    // An initial target query has not established continuity with the live edge yet.
+    hasNewerMessages: isAroundMessage && (!query.data || Boolean(hasPreviousPage)),
+    hasOlderMessages: Boolean(hasNextPage || (!isAroundMessage && hasHiddenMessages)),
+    initialScrollTarget: aroundMessageId
+      ? { messageId: aroundMessageId }
+      : isReturningToLatest
+        ? 'end'
+        : undefined,
+    isLoadingInitial: query.isLoading,
+    isRefreshing: Boolean(
+      isFetching && !isFetchingNextPage && !isFetchingPreviousPage && query.data,
+    ),
+    isLoadingOlder: isFetchingNextPage,
+    isLoadingNewer: isFetchingPreviousPage,
+    loadOlder,
+    loadNewer,
+    messages: isAroundMessage ? allMessages : visibleMessages,
+    returnToLatest: isAroundMessage ? returnToLatest : undefined,
+    retry,
+  };
+}
+
+export const __testing = { flattenMessagePages };

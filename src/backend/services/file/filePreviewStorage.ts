@@ -1,0 +1,209 @@
+import { File } from 'expo-file-system';
+import { Image } from 'expo-image';
+import { ImageManipulator, SaveFormat } from 'expo-image-manipulator';
+
+import type { FileEntryService } from '@/backend/data/services/FileEntryService';
+import type { ResolvedFileUris } from '@/shared/contracts';
+import { FileAttachmentError } from '@/shared/contracts/fileAttachment';
+import { loggerService } from '@/shared/core/logger/LoggerService';
+import type { FileEntry, FileEntryId } from '@/shared/data/types/file';
+
+import { filePreviewDirectory, imageThumbnailCacheKey } from './filePreviewCache';
+import {
+  createInternalEntry,
+  type CreateInternalEntryInput,
+  discardInternalEntries,
+  getInternalFileUri,
+} from './fileStorage';
+
+const logger = loggerService.withContext('FilePreviewStorage');
+const thumbnailDirectory = filePreviewDirectory();
+const maxConcurrentGenerations = 2;
+const thumbnailMaxDimension = 512;
+const webpQuality = 0.78;
+const pendingThumbnails = new Map<string, Promise<string>>();
+const generationQueue: (() => void)[] = [];
+let activeGenerations = 0;
+
+/** Called only behind the cold-start gate, before any preview readers or generators exist. */
+export function resetFilePreviewsForRestore(): void {
+  if (thumbnailDirectory.exists) thumbnailDirectory.delete();
+}
+
+export async function createInternalEntryWithPreview(
+  entries: Pick<FileEntryService, 'create' | 'delete'>,
+  input: CreateInternalEntryInput,
+  signal?: AbortSignal,
+): Promise<FileEntry> {
+  const entry = await createInternalEntry(entries, input, signal);
+  try {
+    signal?.throwIfAborted();
+    const { previewUri, uri } = await resolveFilePreviewUris(entry);
+    signal?.throwIfAborted();
+    if (
+      input.source === 'base64' &&
+      input.provenance === 'generated' &&
+      (!previewUri || previewUri === uri)
+    ) {
+      // A thumbnail failure is harmless only if the renderer can display the original.
+      // Successful thumbnails already decoded the source, so avoid decoding those twice.
+      // A bounded decode proves the bytes are displayable without a full-size bitmap.
+      if (!uri) throw new FileAttachmentError({ code: 'unavailable', fileEntryId: entry.id });
+      const image = await Image.loadAsync(uri, {
+        maxHeight: thumbnailMaxDimension,
+        maxWidth: thumbnailMaxDimension,
+      });
+      image.release();
+    }
+    signal?.throwIfAborted();
+    return entry;
+  } catch (error) {
+    await discardInternalEntries(entries, [entry]);
+    throw error;
+  }
+}
+
+export async function resolveFilePreviewUris(entry: FileEntry): Promise<ResolvedFileUris> {
+  const resolved = resolveCachedFilePreviewUris(entry);
+  if (resolved.previewUri || !resolved.uri) {
+    return resolved;
+  }
+
+  return { previewUri: await generateFilePreviewUri(entry), uri: resolved.uri };
+}
+
+/** Trash thumbnails never make the file available to ordinary previews or attachments. */
+export async function getTrashedImagePreviewUri(
+  entries: Pick<FileEntryService, 'findTrashedById'>,
+  id: FileEntryId,
+  deletedAt: number,
+): Promise<string | undefined> {
+  const entry = await entries.findTrashedById(id, deletedAt);
+  if (!entry?.mediaType.startsWith('image/')) return undefined;
+  const { previewUri, uri } = resolveCachedFilePreviewUris(entry);
+  return previewUri ?? uri;
+}
+
+export function resolveCachedFilePreviewUris(entry: FileEntry): ResolvedFileUris {
+  const uri = getInternalFileUri(entry);
+  if (!uri) {
+    return { previewUri: undefined, uri: undefined };
+  }
+  if (!entry.mediaType.startsWith('image/')) {
+    return { previewUri: uri, uri };
+  }
+
+  const destination = new File(thumbnailDirectory, imageThumbnailCacheKey(entry));
+  return { previewUri: destination.exists ? destination.uri : undefined, uri };
+}
+
+export async function generateFilePreviewUri(entry: FileEntry): Promise<string | undefined> {
+  const resolved = resolveCachedFilePreviewUris(entry);
+  if (!resolved.uri || resolved.previewUri) {
+    return resolved.previewUri;
+  }
+
+  try {
+    return await getImageThumbnailUri(entry, resolved.uri);
+  } catch (error) {
+    logger.warn('Failed to generate an image preview; using the original file', error as Error, {
+      id: entry.id,
+    });
+    return resolved.uri;
+  }
+}
+
+async function getImageThumbnailUri(entry: FileEntry, sourceUri: string): Promise<string> {
+  const destination = new File(thumbnailDirectory, imageThumbnailCacheKey(entry));
+  if (destination.exists) {
+    return destination.uri;
+  }
+
+  const pending = pendingThumbnails.get(destination.uri);
+  if (pending) {
+    return pending;
+  }
+
+  const generation = scheduleGeneration(() => generateThumbnail(sourceUri, destination)).finally(
+    () => {
+      pendingThumbnails.delete(destination.uri);
+    },
+  );
+  pendingThumbnails.set(destination.uri, generation);
+  return generation;
+}
+
+async function generateThumbnail(sourceUri: string, destination: File): Promise<string> {
+  if (!thumbnailDirectory.exists) {
+    thumbnailDirectory.create({ intermediates: true });
+  }
+
+  const sourceContext = ImageManipulator.manipulate(sourceUri, {
+    maxHeight: thumbnailMaxDimension,
+    maxWidth: thumbnailMaxDimension,
+  });
+  let sourceImage: Awaited<ReturnType<typeof sourceContext.renderAsync>> | undefined;
+  let outputContext: ReturnType<typeof ImageManipulator.manipulate> | undefined;
+  let outputImage: Awaited<ReturnType<typeof sourceContext.renderAsync>> | undefined;
+  let temporaryFile: File | undefined;
+
+  try {
+    sourceImage = await sourceContext.renderAsync();
+    const longestDimension = Math.max(sourceImage.width, sourceImage.height);
+    if (!Number.isFinite(longestDimension) || longestDimension <= 0) {
+      throw new Error('Image preview source has invalid dimensions');
+    }
+
+    const scale = Math.min(1, thumbnailMaxDimension / longestDimension);
+    outputContext = ImageManipulator.manipulate(sourceImage);
+    outputContext.resize({
+      height: Math.max(1, Math.round(sourceImage.height * scale)),
+      width: Math.max(1, Math.round(sourceImage.width * scale)),
+    });
+    outputImage = await outputContext.renderAsync();
+    const result = await outputImage.saveAsync({ compress: webpQuality, format: SaveFormat.WEBP });
+    temporaryFile = new File(result.uri);
+
+    if (destination.exists) {
+      if (temporaryFile.exists) {
+        temporaryFile.delete();
+      }
+      return destination.uri;
+    }
+
+    await temporaryFile.move(destination);
+    return destination.uri;
+  } finally {
+    outputImage?.release();
+    outputContext?.release();
+    sourceImage?.release();
+    sourceContext.release();
+  }
+}
+
+function scheduleGeneration<T>(task: () => Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const run = () => {
+      activeGenerations += 1;
+      void task()
+        .then(resolve, reject)
+        .finally(() => {
+          activeGenerations -= 1;
+          drainGenerationQueue();
+        });
+    };
+    generationQueue.push(run);
+    drainGenerationQueue();
+  });
+}
+
+function drainGenerationQueue() {
+  const availableSlots = maxConcurrentGenerations - activeGenerations;
+  for (let slot = 0; slot < availableSlots; slot += 1) {
+    const next = generationQueue.shift();
+    if (!next) {
+      return;
+    }
+    next();
+  }
+}

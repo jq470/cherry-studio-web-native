@@ -1,0 +1,939 @@
+import {
+  AgentEventSchema,
+  AgentContextUsageSchema,
+  AgentRespondQuestionSchema,
+  validateUserAnswers,
+  AgentApprovalViewSchema,
+  AgentErrorViewSchema,
+  AgentFailureSnapshotSchema,
+  AgentInferenceSnapshotV1Schema,
+  AgentInputPartSchema,
+  AgentMessageToolRefSchema,
+  AgentMessagePartSchema,
+  AgentReadReasoningInputSchema,
+  AgentReasoningDetailSchema,
+  AgentMessageDeltaSchema,
+  AgentSessionSnapshotSchema,
+  AgentSessionStatusSchema,
+  AgentStartSessionInputSchema,
+  AgentSubmitMessageInputSchema,
+  AgentRetryMessageInputSchema,
+  AgentEditMessageInputSchema,
+  AgentRenameSessionInputSchema,
+  AgentForkSessionInputSchema,
+  AgentToolRefSchema,
+  readAgentInferenceSnapshot,
+} from '../agent';
+
+const MCP_TOOL_REF = { source: 'mcp', serverId: 'server-1', rawToolName: 'search' } as const;
+
+test('status-only reasoning retains its full-text availability through serialization', () => {
+  const status = { id: 'phase', type: 'reasoning', text: '', hasText: true, state: 'done' };
+  expect(AgentMessagePartSchema.parse(roundTrip(status))).toEqual(status);
+  expect(AgentMessagePartSchema.safeParse({ ...status, hasText: 'yes' }).success).toBe(false);
+});
+
+test('reasoning detail reads round-trip full text and accept only source identifiers', () => {
+  const input = { sessionId: 'session', messageId: 'answer', partId: 'phase' };
+  expect(AgentReadReasoningInputSchema.parse(roundTrip(input))).toEqual(input);
+  for (const invalid of [
+    { ...input, partId: '' },
+    { ...input, text: 'Client supplied text' },
+  ])
+    expect(AgentReadReasoningInputSchema.safeParse(invalid).success).toBe(false);
+  const detail = { text: 'Complete thinking text.\n'.repeat(1000), state: 'streaming' };
+  expect(AgentReasoningDetailSchema.parse(roundTrip(detail))).toEqual(detail);
+  expect(AgentReasoningDetailSchema.safeParse({ ...detail, state: 'pending' }).success).toBe(false);
+});
+
+test('transient context and runtime events round-trip without diagnostic payloads', () => {
+  for (const event of [
+    { type: 'context.updated', status: 'compacting' },
+    { type: 'context.updated', status: 'compaction-failed' },
+    { type: 'context.updated', status: null },
+    { type: 'context.usage.updated', usages: [{ messageId: 'answer', tokens: 12_000 }] },
+    {
+      type: 'context.usage.updated',
+      usages: [{ messageId: 'answer', tokens: 12_000, estimated: true }],
+    },
+    { type: 'context.usage.updated', usages: [] },
+    { type: 'runtime.failed' },
+  ])
+    expect(AgentEventSchema.parse(roundTrip(event))).toEqual(event);
+  expect(AgentEventSchema.safeParse({ type: 'runtime.failed', error: 'device path' }).success).toBe(
+    false,
+  );
+});
+
+test('context usage preserves zero and rejects invalid counts or runtime internals', () => {
+  const usage = { messageId: 'answer', tokens: 0 };
+  expect(AgentContextUsageSchema.parse(roundTrip(usage))).toEqual(usage);
+  for (const invalid of [
+    { ...usage, tokens: -1 },
+    { ...usage, tokens: Infinity },
+    { ...usage, messageId: '' },
+    { ...usage, messages: ['private context'] },
+  ])
+    expect(AgentContextUsageSchema.safeParse(invalid).success).toBe(false);
+});
+
+function roundTrip<T>(value: T): unknown {
+  return JSON.parse(JSON.stringify(value));
+}
+
+describe('answer retry input', () => {
+  test('round-trips only the source identifiers and rejects client-supplied execution state', () => {
+    const input = { sessionId: 'session', messageId: 'answer' };
+    expect(AgentRetryMessageInputSchema.parse(roundTrip(input))).toEqual(input);
+    expect(AgentRetryMessageInputSchema.safeParse({ ...input, messageId: '' }).success).toBe(false);
+    expect(AgentRetryMessageInputSchema.safeParse({ ...input, resume: [] }).success).toBe(false);
+  });
+});
+
+test('reply editing accepts only text parts with an optimistic source and no execution payload', () => {
+  const part = { id: 'text', expectedText: 'Old', text: 'New' };
+  const input = { sessionId: 'session', messageId: 'answer', parts: [part] };
+  expect(AgentEditMessageInputSchema.parse(roundTrip(input))).toEqual(input);
+  for (const invalid of [
+    { ...input, parts: [] },
+    { ...input, parts: [part, part] },
+    { ...input, parts: [{ ...part, text: ' \n ' }] },
+    { ...input, parts: [{ ...part, expectedText: '' }] },
+    { ...input, parts: [{ ...part, text: 'x'.repeat(1_000_001) }] },
+    { ...input, text: 'New' },
+  ])
+    expect(AgentEditMessageInputSchema.safeParse(invalid).success).toBe(false);
+  const event = {
+    type: 'message.edited',
+    message: {
+      id: 'answer',
+      sessionId: 'session',
+      turnId: 'turn',
+      parentId: 'question',
+      role: 'assistant',
+      status: 'success',
+      parts: [{ id: 'text', type: 'text', text: 'New', state: 'done' }],
+      stats: null,
+      modelId: null,
+      inferenceSnapshot: null,
+      createdAt: '2026-10-29T00:00:00.000Z',
+      updatedAt: '2026-10-29T00:01:00.000Z',
+    },
+  };
+  expect(AgentEventSchema.parse(roundTrip(event))).toEqual(event);
+});
+
+describe('Agent Session status contract', () => {
+  test('uses name for session rename and fork inputs', () => {
+    const rename = { sessionId: 'session', name: 'Renamed' };
+    const fork = { sessionId: 'session', fromMessageId: 'message', name: 'Fork' };
+    expect(AgentRenameSessionInputSchema.parse(roundTrip(rename))).toEqual(rename);
+    expect(AgentForkSessionInputSchema.parse(roundTrip(fork))).toEqual(fork);
+    expect(
+      AgentRenameSessionInputSchema.safeParse({ sessionId: 'session', title: 'Old' }).success,
+    ).toBe(false);
+    expect(AgentForkSessionInputSchema.safeParse({ ...fork, title: 'Old' }).success).toBe(false);
+  });
+
+  test('round-trips Desktop compaction parts with one outer id and no summary payload', () => {
+    const part = {
+      id: 'compaction-anchor:turn-1:1',
+      type: 'data-compaction-anchor',
+      data: {
+        status: 'done',
+        phase: 'in-loop',
+        trigger: 'auto',
+        startedAt: '2026-09-18T00:00:00.000Z',
+        completedAt: '2026-09-18T00:00:01.000Z',
+        preTokens: 112_000,
+        postTokens: 30_000,
+        durationMs: 1_000,
+        foldedCount: 6,
+      },
+    };
+    expect(AgentMessagePartSchema.parse(roundTrip(part))).toEqual(part);
+    expect(AgentMessageDeltaSchema.parse(roundTrip({ op: 'part.add', index: 2, part }))).toEqual({
+      op: 'part.add',
+      index: 2,
+      part,
+    });
+    for (const data of [
+      { ...part.data, summary: 'Private history' },
+      { ...part.data, status: 'completed' },
+      { ...part.data, phase: 'tool-loop' },
+      { ...part.data, startedAt: 1 },
+      { ...part.data, preTokens: -1 },
+    ]) {
+      expect(AgentMessagePartSchema.safeParse({ ...part, data }).success).toBe(false);
+    }
+  });
+  test('round-trips immutable status snapshots without admitting transcript or error payloads', () => {
+    const input = { status: 'awaiting-approval', turnId: 'turn-1' };
+    const snapshot = AgentSessionStatusSchema.parse(roundTrip(input));
+
+    expect(snapshot).toEqual(input);
+    expect(Object.isFrozen(snapshot)).toBe(true);
+    expect(AgentSessionStatusSchema.safeParse({ ...input, parts: [] }).success).toBe(false);
+    expect(AgentSessionStatusSchema.safeParse({ ...input, status: 'streaming' }).success).toBe(
+      false,
+    );
+    expect(AgentSessionStatusSchema.safeParse({ ...input, turnId: '' }).success).toBe(false);
+  });
+});
+
+describe('Agent tool and managed-file contracts', () => {
+  test.each(['find-and-install', 'create'])(
+    'preserves %s intent through sends and history without accepting client assessment claims',
+    (skillAction) => {
+      const input = {
+        sessionId: 'session-1',
+        userMessageId: 'user-1',
+        assistantMessageId: 'assistant-1',
+        parts: [{ type: 'text', text: 'Find a note-taking Skill' }],
+        skillAction,
+      };
+      expect(AgentSubmitMessageInputSchema.parse(roundTrip(input))).toEqual(input);
+      const initial = { ...input, agentId: 'agent-1' };
+      expect(AgentStartSessionInputSchema.parse(roundTrip(initial))).toEqual(initial);
+      const part = {
+        id: 'user-text',
+        type: 'text',
+        text: input.parts[0]!.text,
+        state: 'done',
+        skillAction: input.skillAction,
+      };
+      expect(AgentMessagePartSchema.parse(roundTrip(part))).toEqual(part);
+      expect(
+        AgentSubmitMessageInputSchema.safeParse({
+          ...input,
+          skillAction: 'install-without-assessment',
+        }).success,
+      ).toBe(false);
+      expect(
+        AgentSubmitMessageInputSchema.safeParse({
+          ...input,
+          preparedCandidates: ['model-generated'],
+        }).success,
+      ).toBe(false);
+      expect(
+        AgentInputPartSchema.safeParse({
+          type: 'text',
+          text: 'notes',
+          skillAction: 'find-and-install',
+        }).success,
+      ).toBe(false);
+    },
+  );
+
+  test('round-trips image settings through initial sends, follow-ups, and inference snapshots', () => {
+    const imageGeneration = { mode: 'edit', paramValues: { size: '1024x1024', numImages: 2 } };
+    const input = {
+      sessionId: 'session-1',
+      userMessageId: 'user-1',
+      assistantMessageId: 'assistant-1',
+      parts: [{ type: 'text', text: 'Use a blue background' }],
+      imageGeneration,
+    };
+    expect(AgentSubmitMessageInputSchema.parse(roundTrip(input))).toEqual(input);
+    const initial = { ...input, agentId: 'agent-1' };
+    expect(AgentStartSessionInputSchema.parse(roundTrip(initial))).toEqual(initial);
+    const snapshot = {
+      version: 1,
+      model: {
+        uniqueModelId: 'provider::image',
+        providerId: 'provider',
+        modelId: 'image',
+        name: 'Image',
+      },
+      parameters: {},
+      tools: [],
+      imageGeneration,
+    };
+    expect(readAgentInferenceSnapshot(roundTrip(snapshot))).toEqual({
+      status: 'supported',
+      snapshot,
+    });
+    expect(
+      AgentSubmitMessageInputSchema.safeParse({
+        ...input,
+        imageGeneration: { ...imageGeneration, mode: 'text' },
+      }).success,
+    ).toBe(false);
+  });
+
+  test('round-trips plugin display snapshots and rejects mismatched input ranges', () => {
+    const reference = { type: 'plugin', pluginId: 'feishu', label: '飞书', offset: 3 };
+    const input = { type: 'text', text: '使用 飞书', pluginReferences: [reference] };
+    expect(AgentInputPartSchema.parse(roundTrip(input))).toEqual(input);
+    const stored = { ...input, id: 'part-1', state: 'done' };
+    expect(AgentMessagePartSchema.parse(roundTrip(stored))).toEqual(stored);
+    expect(
+      AgentInputPartSchema.safeParse({ ...input, pluginReferences: [reference, reference] })
+        .success,
+    ).toBe(false);
+    expect(
+      AgentInputPartSchema.safeParse({ ...input, pluginReferences: [{ ...reference, offset: 0 }] })
+        .success,
+    ).toBe(false);
+  });
+  test('round-trips Skill display snapshots and rejects mismatched or overlapping ranges', () => {
+    const reference = {
+      type: 'skill',
+      skillId: '00000000-0000-4000-8000-000000000001',
+      label: 'notes',
+      offset: 3,
+    };
+    const input = { type: 'text', text: '📄 notes 飞书', skillReferences: [reference] };
+    expect(AgentInputPartSchema.parse(roundTrip(input))).toEqual(input);
+    expect(
+      AgentMessagePartSchema.parse(roundTrip({ ...input, id: 'part-1', state: 'done' })),
+    ).toEqual({ ...input, id: 'part-1', state: 'done' });
+    for (const skillReferences of [
+      [{ ...reference, offset: 0 }],
+      [reference, reference],
+      [{ ...reference, skillId: 'invalid' }],
+    ]) {
+      expect(AgentInputPartSchema.safeParse({ ...input, skillReferences }).success).toBe(false);
+    }
+    expect(
+      AgentInputPartSchema.safeParse({
+        ...input,
+        pluginReferences: [{ type: 'plugin', pluginId: 'feishu', label: 'notes', offset: 3 }],
+      }).success,
+    ).toBe(false);
+    const action = { type: 'skill-action', action: 'find-and-install', label: '找技能', offset: 0 };
+    expect(
+      AgentInputPartSchema.parse({ type: 'text', text: '找技能', skillReferences: [action] }),
+    ).toEqual({ type: 'text', text: '找技能', skillReferences: [action] });
+  });
+
+  test('round-trips SSH display spans without accepting connection identities or invalid ranges', () => {
+    const reference = { type: 'ssh', label: 'SSH · guoxu', offset: 3 };
+    const input = {
+      type: 'text',
+      text: '📄 SSH · guoxu 这台机器有什么',
+      sshReferences: [reference],
+    };
+    expect(AgentInputPartSchema.parse(roundTrip(input))).toEqual(input);
+    const stored = { ...input, id: 'part-1', state: 'done' };
+    expect(AgentMessagePartSchema.parse(roundTrip(stored))).toEqual(stored);
+    for (const sshReferences of [
+      [{ ...reference, offset: 0 }],
+      [{ ...reference, offset: 100 }],
+      [reference, reference],
+      [{ ...reference, id: '11111111-1111-4111-8111-111111111111' }],
+      [{ ...reference, revision: '22222222-2222-4222-8222-222222222222' }],
+      [{ ...reference, password: 'not-transcript-data' }],
+    ]) {
+      expect(AgentInputPartSchema.safeParse({ ...input, sshReferences }).success).toBe(false);
+    }
+    expect(
+      AgentInputPartSchema.safeParse({
+        ...input,
+        pluginReferences: [
+          { type: 'plugin', pluginId: 'feishu', label: reference.label, offset: 3 },
+        ],
+      }).success,
+    ).toBe(false);
+  });
+
+  test('round-trips explicit plugin references for initial and subsequent messages', () => {
+    const input = {
+      sessionId: 'session-1',
+      userMessageId: 'user-1',
+      assistantMessageId: 'assistant-1',
+      parts: [
+        {
+          type: 'text',
+          text: '飞书 Find the document.',
+          pluginReferences: [{ type: 'plugin', pluginId: 'feishu', label: '飞书', offset: 0 }],
+        },
+      ],
+    };
+    const initial = { ...input, agentId: 'agent-1' };
+    expect(AgentSubmitMessageInputSchema.parse(roundTrip(input))).toEqual(input);
+    expect(AgentStartSessionInputSchema.parse(roundTrip(initial))).toEqual(initial);
+  });
+  test('round-trips bounded input previews separately from tool execution input', () => {
+    const preview = { name: 'page.html', text: '<html>', truncated: false };
+    const delta = { op: 'tool.input.preview', partId: 'tool-1', preview };
+    expect(AgentMessageDeltaSchema.parse(roundTrip(delta))).toEqual(delta);
+    expect(
+      AgentMessageDeltaSchema.safeParse({
+        ...delta,
+        preview: { ...preview, text: 'x'.repeat(8_193) },
+      }).success,
+    ).toBe(false);
+    const part = {
+      id: 'tool-1',
+      type: 'dynamic-tool',
+      toolCallId: 'call-1',
+      toolRef: { source: 'builtin', capabilityId: 'write_file' },
+      toolName: 'write_file',
+      title: 'Write file',
+      state: 'input-streaming',
+      inputPreview: preview,
+    };
+    expect(AgentMessagePartSchema.parse(roundTrip(part))).toEqual(part);
+    expect(AgentMessagePartSchema.parse(roundTrip(part))).not.toHaveProperty('input');
+  });
+  test('rejects the retired turn-only capability field', () => {
+    // Capability enablement moved to the Agent record; a stale caller still
+    // sending the composer-era field must fail loudly, not silently no-op.
+    const input = {
+      parts: [{ text: 'Draw it.', type: 'text' }],
+      sessionId: 'session-1',
+      userMessageId: 'user-1',
+      assistantMessageId: 'assistant-1',
+    } as const;
+
+    expect(AgentSubmitMessageInputSchema.parse(roundTrip(input))).toEqual(input);
+    expect(
+      AgentSubmitMessageInputSchema.safeParse({ ...input, userMessageId: undefined }).success,
+    ).toBe(false);
+    expect(
+      AgentSubmitMessageInputSchema.safeParse({ ...input, assistantMessageId: '' }).success,
+    ).toBe(false);
+    expect(
+      AgentSubmitMessageInputSchema.safeParse({
+        ...input,
+        temporaryCapabilities: ['web-search'],
+      }).success,
+    ).toBe(false);
+  });
+
+  test('requires preallocated identities for a Draft submission', () => {
+    const input = {
+      agentId: 'agent-1',
+      sessionId: 'session-1',
+      userMessageId: 'user-1',
+      assistantMessageId: 'assistant-1',
+      parts: [{ text: 'Hello.', type: 'text' }],
+    } as const;
+
+    expect(AgentStartSessionInputSchema.parse(roundTrip(input))).toEqual(input);
+    expect(AgentStartSessionInputSchema.safeParse({ ...input, sessionId: undefined }).success).toBe(
+      false,
+    );
+  });
+
+  test('round-trips the active first exchange used for Session handoff', () => {
+    const userMessage = {
+      createdAt: '2026-08-31T00:00:00.000Z',
+      id: 'user-1',
+      inferenceSnapshot: null,
+      modelId: null,
+      parts: [{ id: 'input-0', state: 'done', text: 'Hello.', type: 'text' }],
+      role: 'user',
+      sessionId: 'session-1',
+      status: 'success',
+      turnId: 'turn-1',
+      updatedAt: '2026-08-31T00:00:00.000Z',
+      stats: null,
+    } as const;
+    const assistantMessage = {
+      ...userMessage,
+      id: 'assistant-1',
+      modelId: 'provider-1::model-1',
+      parts: [],
+      role: 'assistant',
+      status: 'pending',
+    } as const;
+    const snapshot = {
+      queuedInputs: [
+        {
+          turnId: 'queued-turn',
+          userMessage: { ...userMessage, id: 'queued-user', turnId: 'queued-turn' },
+          assistantMessageId: 'queued-answer',
+        },
+      ],
+      activeTurn: {
+        assistantMessageId: assistantMessage.id,
+        endedAt: null,
+        error: null,
+        id: 'turn-1',
+        sessionId: 'session-1',
+        startedAt: '2026-08-31T00:00:00.000Z',
+        status: 'running',
+      },
+      activeUserMessage: userMessage,
+      agent: { id: 'agent-1', name: 'Agent' },
+      capabilities: { approvals: true, attachments: true, reasoning: true, tools: true },
+      hasHistoryBeforeActiveTurn: false,
+      pendingApprovals: [],
+      pendingQuestion: null,
+      session: {
+        agentId: 'agent-1',
+        createdAt: '2026-08-31T00:00:00.000Z',
+
+        // Null rather than omitted: lineage is absent, not unknown, and a JSON
+        // round trip must keep telling the difference.
+        forkBoundaryMessageId: null,
+        forkedFromSessionId: null,
+        id: 'session-1',
+        name: '',
+        isNameManuallyEdited: false,
+        updatedAt: '2026-08-31T00:00:00.000Z',
+      },
+      streamingMessage: assistantMessage,
+      additionalMessages: [
+        { ...assistantMessage, id: 'settled-sibling', status: 'success', siblingsGroupId: 1 },
+      ],
+      contextUsages: [{ messageId: 'assistant-1', tokens: 100 }],
+    } as const;
+
+    expect(AgentSessionSnapshotSchema.parse(roundTrip(snapshot))).toEqual(snapshot);
+    const queueEvent = { type: 'queue.updated', inputs: snapshot.queuedInputs };
+    expect(AgentEventSchema.parse(roundTrip(queueEvent))).toEqual(queueEvent);
+  });
+
+  test('round-trips the versioned inference snapshot and preserves unsupported versions', () => {
+    const snapshot = {
+      version: 1,
+      model: {
+        uniqueModelId: 'provider-1::model-1',
+        providerId: 'provider-1',
+        modelId: 'model-1',
+        apiModelId: 'served-model-1',
+        name: 'Model One',
+      },
+      reasoningEffort: 'high',
+      parameters: { temperature: 0.2, maxOutputTokens: 2048 },
+      tools: [
+        {
+          ref: MCP_TOOL_REF,
+          providerName: 'mcp_server_1_search_a1b2',
+          displayName: 'Search',
+          approval: 'ask',
+        },
+      ],
+    } as const;
+
+    expect(AgentInferenceSnapshotV1Schema.parse(roundTrip(snapshot))).toEqual(snapshot);
+    expect(readAgentInferenceSnapshot(roundTrip(snapshot))).toEqual({
+      status: 'supported',
+      snapshot,
+    });
+
+    const future = { version: 2, opaque: { retained: true } };
+    expect(readAgentInferenceSnapshot(roundTrip(future))).toEqual({
+      status: 'unsupported',
+      raw: future,
+    });
+  });
+
+  test.each(['apiKey', 'authorization', 'endpoint', 'headers', 'callback', 'inputSchema'])(
+    'rejects inference snapshot field %s outside the privacy allowlist',
+    (field) => {
+      expect(
+        AgentInferenceSnapshotV1Schema.safeParse({
+          version: 1,
+          model: {
+            uniqueModelId: 'provider-1::model-1',
+            providerId: 'provider-1',
+            modelId: 'model-1',
+            name: 'Model One',
+          },
+          parameters: {},
+          tools: [],
+          [field]: 'sensitive',
+        }).success,
+      ).toBe(false);
+    },
+  );
+
+  test.each([{ source: 'builtin', capabilityId: 'calendar.read' }, MCP_TOOL_REF])(
+    'round-trips the stable $source tool identity',
+    (toolRef) => {
+      expect(AgentToolRefSchema.parse(roundTrip(toolRef))).toEqual(toolRef);
+    },
+  );
+
+  test('accepts meta identity only for persisted message activity', () => {
+    const metaRef = { source: 'meta', name: 'tool_search' } as const;
+
+    expect(AgentMessageToolRefSchema.parse(roundTrip(metaRef))).toEqual(metaRef);
+    expect(AgentToolRefSchema.safeParse(metaRef).success).toBe(false);
+    expect(
+      AgentMessagePartSchema.parse({
+        id: 'tool-search-part',
+        type: 'dynamic-tool',
+        toolCallId: 'tool-search-call',
+        toolRef: metaRef,
+        toolName: 'tool_search',
+        title: 'Search tools',
+        state: 'output-available',
+        input: { query: 'calendar' },
+        output: { value: { matchedNamespaces: [] }, artifacts: [] },
+      }),
+    ).toBeDefined();
+  });
+
+  test('accepts a tool whose provider input is still streaming', () => {
+    const part = {
+      id: 'tool-part-streaming',
+      type: 'dynamic-tool',
+      toolCallId: 'call-streaming',
+      toolRef: { source: 'builtin', capabilityId: 'write_file' },
+      toolName: 'write_file',
+      title: 'Write file',
+      state: 'input-streaming',
+    } as const;
+
+    expect(AgentMessagePartSchema.parse(roundTrip(part))).toEqual(part);
+  });
+
+  test('running child progress round-trips with bounded arguments and closed statuses', () => {
+    const part = {
+      id: 'parent',
+      type: 'dynamic-tool',
+      toolCallId: 'parent',
+      toolRef: { source: 'builtin', capabilityId: 'run_js' },
+      toolName: 'codemode',
+      title: 'JavaScript',
+      state: 'running',
+      progress: { calls: [{ id: 'parent/c1', name: 'read_file', args: '{}', status: 'running' }] },
+    };
+    expect(AgentMessagePartSchema.parse(roundTrip(part))).toEqual(part);
+    expect(
+      AgentMessagePartSchema.safeParse({
+        ...part,
+        progress: { calls: [{ ...part.progress.calls[0], args: 'x'.repeat(1001) }] },
+      }).success,
+    ).toBe(false);
+    expect(
+      AgentMessagePartSchema.safeParse({
+        ...part,
+        progress: { calls: [{ ...part.progress.calls[0], status: 'unknown' }] },
+      }).success,
+    ).toBe(false);
+  });
+
+  test('accepts managed file ids and rejects raw file URIs', () => {
+    const input = {
+      type: 'file',
+      fileEntryId: 'file-1',
+      mediaType: 'image/png',
+      filename: 'image.png',
+    } as const;
+    const messagePart = {
+      ...input,
+      id: 'file-part-1',
+      purpose: 'input-attachment',
+    } as const;
+
+    expect(AgentInputPartSchema.parse(roundTrip(input))).toEqual(input);
+    expect(AgentMessagePartSchema.parse(roundTrip(messagePart))).toEqual(messagePart);
+    expect(AgentInputPartSchema.safeParse({ ...input, name: 'old.png' }).success).toBe(false);
+    expect(
+      AgentInputPartSchema.safeParse({
+        type: 'file',
+        mediaType: 'image/png',
+        uri: 'file:///private/image.png',
+      }).success,
+    ).toBe(false);
+  });
+
+  test.each([
+    ['ATTACHMENT_INVALID', 'Attachment "notes.txt" is not valid UTF-8 text.'],
+    ['AGENT_MODEL_NOT_CONFIGURED', 'Agent has no configured model: agent-1'],
+  ])('round-trips the %s admission error', (code, message) => {
+    const error = {
+      code,
+      message,
+      retryable: false,
+    } as const;
+
+    expect(AgentErrorViewSchema.parse(roundTrip(error))).toEqual(error);
+    const part = { id: 'failure', type: 'data-error', data: error };
+    expect(AgentMessagePartSchema.parse(roundTrip(part))).toEqual(part);
+    expect(AgentMessagePartSchema.safeParse({ id: 'failure', type: 'error', error }).success).toBe(
+      false,
+    );
+  });
+
+  test('round-trips a versioned execution failure without flattening its source identity', () => {
+    const failure = {
+      version: 1,
+      reasonCode: 'permission',
+      source: { layer: 'provider', name: 'AI_APICallError', code: 'access_denied' },
+      context: {
+        statusCode: 403,
+        providerId: 'openai',
+        modelId: 'gpt-test',
+        responseBody: '{"error":"access_denied"}',
+      },
+    } as const;
+    const error = {
+      code: 'EXECUTION_FAILED',
+      message: 'OpenAI API error (403): access denied',
+      retryable: false,
+      failure,
+    } as const;
+
+    expect(AgentFailureSnapshotSchema.parse(roundTrip(failure))).toEqual(failure);
+    expect(AgentErrorViewSchema.parse(roundTrip(error))).toEqual(error);
+    expect(AgentErrorViewSchema.safeParse({ ...error, code: 'AGENT_NOT_FOUND' }).success).toBe(
+      false,
+    );
+  });
+
+  test('round-trips stable tool identity and the RuntimeToolResult projection', () => {
+    const part = {
+      id: 'tool-part-1',
+      type: 'dynamic-tool',
+      toolCallId: 'call-1',
+      toolRef: MCP_TOOL_REF,
+      toolName: 'mcp_server_1_search_a1b2',
+      title: 'Search',
+      state: 'output-available',
+      input: { query: 'Cherry Studio' },
+      output: {
+        value: { matches: 2 },
+        artifacts: [
+          {
+            ref: { kind: 'managed-file', fileEntryId: 'file-2' },
+            mediaType: 'text/markdown',
+            name: 'result.md',
+            kind: 'created',
+          },
+        ],
+      },
+    } as const;
+
+    expect(AgentMessagePartSchema.parse(roundTrip(part))).toEqual(part);
+    expect(
+      AgentMessagePartSchema.safeParse({
+        ...part,
+        providerName: 'search',
+      }).success,
+    ).toBe(false);
+  });
+
+  test.each(['output-available', 'denied', 'error', 'interrupted'] as const)(
+    'requires a normalized result envelope for terminal state %s',
+    (state) => {
+      const base = {
+        id: 'tool-part-1',
+        type: 'dynamic-tool',
+        toolCallId: 'call-1',
+        toolRef: MCP_TOOL_REF,
+        toolName: 'mcp_server_1_search_a1b2',
+        title: 'Search',
+        state,
+      } as const;
+
+      expect(AgentMessagePartSchema.safeParse(base).success).toBe(false);
+      expect(AgentMessagePartSchema.safeParse({ ...base, output: { matches: 2 } }).success).toBe(
+        false,
+      );
+      const value =
+        state === 'denied'
+          ? { status: 'denied', reason: 'The user denied this tool call.' }
+          : state === 'error'
+            ? {
+                status: 'error',
+                error: {
+                  code: 'tool_execution_error',
+                  message: 'The tool failed to execute.',
+                  retryable: false,
+                },
+              }
+            : state === 'interrupted'
+              ? { status: 'interrupted', reason: 'The turn was interrupted.' }
+              : { status: 'ok' };
+      expect(
+        AgentMessagePartSchema.parse({
+          ...base,
+          output: { value, artifacts: [] },
+        }),
+      ).toBeDefined();
+    },
+  );
+
+  test.each(['pending', 'approved', 'denied', 'cancelled'] as const)(
+    'a %s approval round-trips a stable ref and display snapshot without a provider alias',
+    (status) => {
+      const approval = {
+        id: 'approval-1',
+        sessionId: 'session-1',
+        turnId: 'turn-1',
+        toolCallId: 'call-1',
+        toolRef: MCP_TOOL_REF,
+        displayName: 'Search',
+        input: { query: 'Cherry Studio' },
+        status,
+      } as const;
+
+      expect(AgentApprovalViewSchema.parse(roundTrip(approval))).toEqual(approval);
+    },
+  );
+});
+
+describe('user question protocol', () => {
+  const question = {
+    questions: [
+      {
+        id: 'focus',
+        question: 'Choose a focus',
+        selection: 'multiple' as const,
+        options: [
+          { id: 'a', label: 'Writing' },
+          { id: 'b', label: 'Reading' },
+        ],
+      },
+    ],
+  };
+  const answerWith = (answer: { selectedOptionIds: string[]; text: string; skipped: boolean }) => ({
+    answers: [{ questionId: 'focus', ...answer }],
+  });
+  test('round-trips pending questions, answers, and the waiting turn status', () => {
+    const event = {
+      type: 'question.updated',
+      question: { turnId: 'turn', toolCallId: 'call', question },
+    };
+    expect(AgentEventSchema.parse(roundTrip(event))).toEqual(event);
+    const response = {
+      sessionId: 'session',
+      turnId: 'turn',
+      toolCallId: 'call',
+      answer: answerWith({ selectedOptionIds: ['a', 'b'], text: 'At work', skipped: false }),
+    };
+    expect(AgentRespondQuestionSchema.parse(roundTrip(response))).toEqual(response);
+    expect(
+      AgentSessionStatusSchema.parse({ turnId: 'turn', status: 'awaiting-input' }).status,
+    ).toBe('awaiting-input');
+  });
+  test('rejects empty answers, duplicate options, and answers combined with skipping', () => {
+    expect(() =>
+      validateUserAnswers(
+        question,
+        answerWith({ selectedOptionIds: [], text: '', skipped: false }),
+      ),
+    ).toThrow();
+    expect(() =>
+      validateUserAnswers(
+        question,
+        answerWith({ selectedOptionIds: ['a', 'a'], text: '', skipped: false }),
+      ),
+    ).toThrow();
+    expect(() =>
+      validateUserAnswers(
+        question,
+        answerWith({ selectedOptionIds: [], text: 'yes', skipped: true }),
+      ),
+    ).toThrow();
+    expect(
+      AgentRespondQuestionSchema.safeParse({
+        sessionId: 's',
+        turnId: 't',
+        toolCallId: 'c',
+        answer: answerWith({ selectedOptionIds: [], text: 'x'.repeat(4001), skipped: false }),
+      }).success,
+    ).toBe(false);
+  });
+});
+
+describe('local message quotes', () => {
+  const quote = {
+    id: 'quote-1',
+    sourceMessageId: '00000000-0000-7000-8000-000000000001',
+    text: '\n```ts\nconst source = "complete";\n```\n',
+  };
+  const carrier = {
+    type: 'text',
+    text: 'Explain',
+    quotes: [quote],
+    quoteAuthor: { role: 'assistant', name: 'Captured' },
+  };
+  const submit = (parts: unknown[]) => ({
+    sessionId: 's',
+    userMessageId: 'u',
+    assistantMessageId: 'a',
+    parts,
+  });
+  test('round-trips the exact snapshot and accepts old input without metadata', () => {
+    expect(AgentInputPartSchema.parse(roundTrip(carrier))).toEqual(carrier);
+    expect(AgentSubmitMessageInputSchema.parse(submit([carrier])).parts).toEqual([carrier]);
+    expect(AgentInputPartSchema.parse({ type: 'text', text: 'old' })).toEqual({
+      type: 'text',
+      text: 'old',
+    });
+  });
+  test.each([
+    { ...carrier, quotes: [] },
+    { ...carrier, quotes: [{ ...quote, id: '' }] },
+    { ...carrier, quotes: [{ ...quote, sourceMessageId: 'not-a-uuid' }] },
+    { ...carrier, quotes: [{ ...quote, text: ' \n ' }] },
+    { ...carrier, quoteAuthor: undefined },
+    { ...carrier, quotes: undefined },
+    { ...carrier, type: 'reasoning', id: 'r', state: 'done' },
+  ])('rejects malformed or orphaned quote fields %#', (part) => {
+    expect(AgentInputPartSchema.safeParse(part).success).toBe(false);
+  });
+  test('accepts multiple inline quotes and rejects mismatched or overlapping ranges', () => {
+    const text = '“First” answer\n“Second” follow-up';
+    const quotes = [
+      { ...quote, reference: { label: '“First”', offset: 0 } },
+      {
+        ...quote,
+        id: 'second',
+        reference: { label: '“Second”', offset: text.indexOf('“Second”') },
+      },
+    ];
+    expect(AgentInputPartSchema.parse({ ...carrier, text, quotes })).toMatchObject({ quotes });
+    expect(
+      AgentInputPartSchema.safeParse({
+        ...carrier,
+        text,
+        quotes: [quotes[0], { ...quotes[1], reference: { label: '“First”', offset: 0 } }],
+      }).success,
+    ).toBe(false);
+    expect(AgentInputPartSchema.safeParse({ ...carrier, text: 'Wrong text', quotes }).success).toBe(
+      false,
+    );
+    expect(
+      AgentInputPartSchema.safeParse({
+        ...carrier,
+        text: '“MCP”',
+        quotes: [{ ...quote, reference: { label: '“MCP”', offset: 0 } }],
+        pluginReferences: [{ type: 'plugin', pluginId: 'mcp', label: 'MCP', offset: 1 }],
+      }).success,
+    ).toBe(false);
+  });
+  test('checks the entire input, first carrier and attachment-only sendability', () => {
+    expect(AgentSubmitMessageInputSchema.safeParse(submit([carrier, carrier])).success).toBe(false);
+    expect(
+      AgentSubmitMessageInputSchema.safeParse(submit([{ type: 'text', text: 'primary' }, carrier]))
+        .success,
+    ).toBe(false);
+    expect(
+      AgentSubmitMessageInputSchema.safeParse(submit([{ ...carrier, text: '' }])).success,
+    ).toBe(false);
+    const attachment = { type: 'file', fileEntryId: 'file', mediaType: 'image/png' };
+    expect(
+      AgentSubmitMessageInputSchema.safeParse(submit([{ ...carrier, text: '' }, attachment]))
+        .success,
+    ).toBe(true);
+  });
+  test('reasoning keeps its old reference fields but cannot carry a quote', () => {
+    const old = {
+      id: 'r',
+      type: 'reasoning',
+      state: 'done',
+      text: '',
+      pluginReferences: [],
+      skillReferences: [],
+      selectionReferences: [],
+      skillSelections: [],
+    };
+    expect(AgentMessagePartSchema.parse(old)).toEqual(old);
+    expect(
+      AgentMessagePartSchema.safeParse({
+        ...old,
+        quotes: [quote],
+        quoteAuthor: { role: 'assistant' },
+      }).success,
+    ).toBe(false);
+  });
+});

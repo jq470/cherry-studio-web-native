@@ -1,0 +1,62 @@
+import { type AnySQLiteColumn, index, integer, sqliteTable, text } from 'drizzle-orm/sqlite-core';
+
+import { createUpdateTimestamps, uuidPrimaryKeyOrdered } from './_columnHelpers';
+import { agentTable } from './agent';
+import { fileFolderTable } from './fileLibrary';
+
+/**
+ * Agent Session table - one long-lived conversation whose messages form a tree
+ * (docs/references/agent/agent-persistence.md).
+ *
+ * An optional folder binding provides a shared file workspace without a shell
+ * environment. The Host owns the local Runtime binding. Sessions hard-delete and
+ * cascade their messages; list ordering is recency (`lastActivityAt`), so
+ * there is no order key.
+ */
+export const agentSessionTable = sqliteTable(
+  'agent_session',
+  {
+    id: uuidPrimaryKeyOrdered(),
+    // RESTRICT: agents soft-delete first; hard cleanup requires no Sessions.
+    agentId: text()
+      .notNull()
+      .references(() => agentTable.id, { onDelete: 'restrict' }),
+    name: text().notNull().default(''),
+    workspaceFolderId: text().references(() => fileFolderTable.id, { onDelete: 'set null' }),
+    // Whether the name was manually edited by user
+    isNameManuallyEdited: integer({ mode: 'boolean' }).notNull().default(false),
+    /** Invalidates disposable execution history in the same transaction as transcript edits. */
+    runtimeRevision: integer().notNull().default(0),
+    // Dedicated conversation activity time: advances to reservation time or
+    // terminal stats.runtimeTiming.completedAt, and is inherited by history forks.
+    // Administrative mutations such as renames and forks must not stamp "now".
+    lastActivityAt: integer()
+      .notNull()
+      .$defaultFn(() => Date.now()),
+    ...createUpdateTimestamps,
+    // Fork provenance (agent-protocol.md "Branching" rule 2). SET NULL, not
+    // CASCADE: deleting the source must drop the lineage claim, never the
+    // forked Session.
+    forkedFromSessionId: text().references((): AnySQLiteColumn => agentSessionTable.id, {
+      onDelete: 'set null',
+    }),
+    // Id of the copied message inside this Session that closes the inherited
+    // prefix. Application-owned rather than a cross-table FK to avoid a
+    // circular Session ↔ Message schema dependency; fork/delete transactions
+    // maintain it together with forkedFromSessionId.
+    forkBoundaryMessageId: text(),
+    // Selected leaf of the message tree (Desktop's topic.activeNodeId). Display
+    // and model history walk parentId upward from it. Application-owned, like
+    // forkBoundaryMessageId; NULL only for a Session without messages.
+    activeNodeId: text(),
+  },
+  (t) => [
+    index('agent_session_agent_id_idx').on(t.agentId),
+    index('agent_session_last_activity_at_idx').on(t.lastActivityAt),
+    // Mobile loads one expanded sibling list at a time in stable creation order.
+    index('agent_session_forked_from_created_id_idx').on(t.forkedFromSessionId, t.createdAt, t.id),
+  ],
+);
+
+export type AgentSessionRow = typeof agentSessionTable.$inferSelect;
+export type InsertAgentSessionRow = typeof agentSessionTable.$inferInsert;

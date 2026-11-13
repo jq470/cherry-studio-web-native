@@ -1,0 +1,197 @@
+import {
+  Alert,
+  BottomSheetProvider,
+  OverlayNavigationProvider,
+  Portal,
+  Toast,
+} from '@cherrystudio/ui/components';
+
+import '../frontend/styles/global.css';
+import '@/bootstrap/preboot/abortSignal';
+import '@/bootstrap/preboot/blob';
+import '@/bootstrap/preboot/promise';
+import '@/bootstrap/preboot/webCrypto';
+import { Stack } from 'expo-router';
+import * as SplashScreen from 'expo-splash-screen';
+import { HeroUINativeProvider } from 'heroui-native/provider';
+import type { PropsWithChildren } from 'react';
+import { useTranslation } from 'react-i18next';
+import { Platform } from 'react-native';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
+import { KeyboardProvider } from 'react-native-keyboard-controller';
+import { withUniwind } from 'uniwind';
+
+import { AppBootstrapGate, AppBootstrapProvider, useAppBootstrapState } from '@/bootstrap';
+import { reportStartupCoverPresented } from '@/bootstrap/runtime/startupCoverHandoff';
+import { AppUpdateObserver, AppUpdateProvider } from '@/frontend/appShell/appUpdate';
+import { BackgroundActivityBridge } from '@/frontend/appShell/backgroundActivity';
+import { BackupDialog, RestoreOutcomeNotice } from '@/frontend/appShell/backup';
+import { ConversationProvider } from '@/frontend/appShell/conversation';
+import { FeedbackCaptureProvider, FeedbackHintProvider } from '@/frontend/appShell/feedback';
+import { headerScreenOptions, RouteHeaderProvider } from '@/frontend/appShell/header';
+import { McpInteractionDialog } from '@/frontend/appShell/mcp';
+import { getRootHeaderStyle, NavigationThemeProvider } from '@/frontend/appShell/navigation';
+import { configureReporting, wrapReportingRoot } from '@/frontend/appShell/observability';
+import { PrivacyConsentGate } from '@/frontend/appShell/privacy';
+import { AppErrorBoundary } from '@/frontend/appShell/recovery';
+import { APP_SEARCH_TRANSITION_DURATION_MS } from '@/frontend/appShell/search';
+import { SshAuthenticationDialog } from '@/frontend/appShell/ssh';
+import { StartupCoordinator, StartupRouteReadyReporter } from '@/frontend/appShell/startup';
+import { SystemEntryBridge } from '@/frontend/appShell/systemEntry';
+import { UuRemoteCallbackBridge } from '@/frontend/appShell/uuRemote';
+import { MermaidRendererHost } from '@/frontend/components/MermaidDiagram';
+import { QueryProvider } from '@/frontend/data';
+import { useThemeColor } from '@/frontend/hooks/useThemeColor';
+import { LanguagePreferenceObserver } from '@/frontend/i18n';
+import { isLiquidGlassAvailable } from '@/frontend/utils/constants';
+import { getSingleRouteParam } from '@/frontend/utils/routeParams';
+
+// Hold the native surface until the matching React Native startup cover has
+// committed its first layout.
+void SplashScreen.preventAutoHideAsync().catch(() => {});
+
+// The router integration has to be live before the first screen mounts, so this
+// runs at module scope alongside the splash screen hold rather than in an effect.
+configureReporting('layout');
+
+const RootGestureView = withUniwind(GestureHandlerRootView);
+
+function RootLayout() {
+  return (
+    <RootGestureView className="flex-1">
+      {/* iOS warmup focuses and removes a hidden input on the startup main thread. */}
+      <KeyboardProvider preload={Platform.OS !== 'ios'}>
+        <HeroUINativeProvider config={{ devInfo: { stylingPrinciples: false }, toast: 'disabled' }}>
+          <OverlayNavigationProvider>
+            <Portal.AccessibilityBoundary>
+              <Toast.Provider>
+                <QueryProvider>
+                  <AppBootstrapProvider>
+                    <BootstrapStartupCoordinator>
+                      <AppBootstrapGate>
+                        <StartupRouteReadyReporter>
+                          {/* Inside the reporter so a failed first render still lays out and ends startup. */}
+                          <AppErrorBoundary>
+                            <NavigationThemeProvider>
+                              <AppAlertProvider>
+                                <BottomSheetProvider>
+                                  <RouteHeaderProvider rootAction="back">
+                                    <AppUpdateProvider>
+                                      <AppUpdateObserver />
+                                      <BackgroundActivityBridge />
+                                      <LanguagePreferenceObserver />
+                                      <UuRemoteCallbackBridge />
+                                      {/* Before the navigator, so opaque screens cover the renderer page. */}
+                                      <MermaidRendererHost />
+                                      <FeedbackCaptureProvider>
+                                        <FeedbackHintProvider>
+                                          <ConversationProvider>
+                                            <SystemEntryBridge>
+                                              <RootStack />
+                                            </SystemEntryBridge>
+                                          </ConversationProvider>
+                                        </FeedbackHintProvider>
+                                      </FeedbackCaptureProvider>
+                                      <PrivacyConsentGate />
+                                      <RestoreOutcomeNotice />
+                                      <BackupDialog />
+                                      <McpInteractionDialog />
+                                      <SshAuthenticationDialog />
+                                    </AppUpdateProvider>
+                                  </RouteHeaderProvider>
+                                </BottomSheetProvider>
+                              </AppAlertProvider>
+                            </NavigationThemeProvider>
+                          </AppErrorBoundary>
+                        </StartupRouteReadyReporter>
+                      </AppBootstrapGate>
+                    </BootstrapStartupCoordinator>
+                  </AppBootstrapProvider>
+                </QueryProvider>
+              </Toast.Provider>
+            </Portal.AccessibilityBoundary>
+          </OverlayNavigationProvider>
+        </HeroUINativeProvider>
+      </KeyboardProvider>
+    </RootGestureView>
+  );
+}
+
+// `wrap` mounts the metrics root above the tree, which is what times the first
+// render. It has to sit outside `RootLayout` rather than inside its JSX so the
+// measurement starts before any provider below renders.
+export default wrapReportingRoot(RootLayout);
+
+function AppAlertProvider({ children }: PropsWithChildren) {
+  const { t } = useTranslation();
+
+  return (
+    <Alert.Provider labels={{ cancel: t('common.cancel'), ok: t('common.ok') }}>
+      {children}
+    </Alert.Provider>
+  );
+}
+
+function BootstrapStartupCoordinator({ children }: PropsWithChildren) {
+  const bootstrapState = useAppBootstrapState();
+
+  return (
+    <StartupCoordinator
+      bootstrapReady={bootstrapState.status !== 'loading'}
+      onCoverPresented={reportStartupCoverPresented}
+    >
+      {children}
+    </StartupCoordinator>
+  );
+}
+
+function RootStack() {
+  const [backgroundColor, foregroundColor] = useThemeColor(['background', 'foreground']);
+
+  return (
+    <Stack
+      screenOptions={{
+        ...headerScreenOptions,
+        headerStyle: getRootHeaderStyle(backgroundColor),
+        headerTransparent: isLiquidGlassAvailable,
+        headerTintColor: foregroundColor,
+      }}
+    >
+      <Stack.Screen name="(drawer)" options={{ headerShown: false }} />
+      <Stack.Screen name="onboarding" options={{ headerShown: false }} />
+      <Stack.Screen name="home" options={{ headerShown: false }} />
+      <Stack.Screen
+        name="search"
+        options={{
+          animation: 'fade_from_bottom',
+          animationDuration: APP_SEARCH_TRANSITION_DURATION_MS,
+          headerShown: false,
+        }}
+      />
+      <Stack.Screen
+        // Reopening the file already on top reuses it, so a repeated tap cannot stack a copy.
+        getId={({ params }) => {
+          const fileEntryId = getSingleRouteParam(params?.fileEntryId);
+          const imageEditRequestId = getSingleRouteParam(params?.imageEditRequestId);
+          return imageEditRequestId ? `${fileEntryId}:${imageEditRequestId}` : fileEntryId;
+        }}
+        name="files/[fileEntryId]"
+        options={{ headerTransparent: false }}
+      />
+      <Stack.Screen name="share-destination" options={{ headerTransparent: false }} />
+      <Stack.Screen name="mermaid-diagram" options={{ headerTransparent: false }} />
+      <Stack.Screen name="edit-reply" options={{ headerTransparent: false }} />
+      <Stack.Screen name="uu-remote/callback" options={{ headerShown: false, animation: 'none' }} />
+      <Stack.Screen
+        name="share"
+        options={{
+          contentStyle: { backgroundColor: 'transparent' },
+          headerShown: false,
+          presentation: 'transparentModal',
+          animation: 'none',
+          gestureEnabled: false,
+        }}
+      />
+    </Stack>
+  );
+}

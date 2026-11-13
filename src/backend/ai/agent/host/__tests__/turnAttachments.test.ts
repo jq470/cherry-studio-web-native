@@ -1,0 +1,552 @@
+import { DocumentTextError } from '@/backend/services/file/documentText';
+import { traceErrorAttributes } from '@/backend/utils/diagnosticTrace';
+import {
+  AgentProtocolError,
+  type AgentInputPart,
+  type AgentMessageView,
+} from '@/shared/contracts/agent';
+import { FileEntryIdSchema, type FileEntryId } from '@/shared/data/types/file';
+
+import {
+  createTurnResourceLedger,
+  type ManagedFileFact,
+  type ManagedFileResolver,
+} from '../../resources/managedFileResolver';
+import { FakeRuntime, type RuntimeModelPreflight } from '../../runtime';
+import {
+  assertAttachmentRequestSupported,
+  materializeRuntimeAttachments,
+  resolveManagedInput,
+  resolveRuntimeContentAttachments,
+} from '../turnAttachments';
+
+const FIRST_ID = FileEntryIdSchema.parse('00000000-0000-7000-8000-000000000001');
+const SECOND_ID = FileEntryIdSchema.parse('00000000-0000-7000-8000-000000000002');
+const NOW = '2026-01-01T00:00:00.000Z';
+
+const IMAGE_MODEL: RuntimeModelPreflight = {
+  contextWindow: 128_000,
+  inputModalities: ['text', 'image'],
+  maxInputTokens: 120_000,
+  maxOutputTokens: 8_000,
+  supportsTools: true,
+};
+
+const TEXT_MODEL: RuntimeModelPreflight = {
+  ...IMAGE_MODEL,
+  inputModalities: ['text'],
+};
+
+describe('turn attachments', () => {
+  test('rehydrates only MCP images explicitly retained in both the model channel and managed artifacts', async () => {
+    const image = fact(FIRST_ID, 'tool.png', 'image/png');
+    const files = resolver(new Map([[FIRST_ID, image]]));
+    const history = messageWithFile(image);
+    history.role = 'assistant';
+    history.parts = [
+      {
+        id: 'tool-part',
+        type: 'dynamic-tool',
+        toolCallId: 'call',
+        toolName: 'mcp_widget',
+        title: 'Widget',
+        toolRef: { source: 'mcp', serverId: 'server', rawToolName: 'widget' },
+        state: 'output-available',
+        input: {},
+        output: {
+          value: { content: [] },
+          modelContent: [
+            { type: 'image', fileEntryId: FIRST_ID, mimeType: 'image/png' },
+            { type: 'image', fileEntryId: SECOND_ID, mimeType: 'image/png' },
+          ],
+          artifacts: [
+            {
+              ref: { kind: 'managed-file', fileEntryId: FIRST_ID },
+              mediaType: 'image/png',
+              name: image.name,
+              kind: 'created',
+            },
+          ],
+        },
+      },
+    ];
+    const result = await resolveManagedInput(files, [], [history], new AbortController().signal);
+    expect(files.resolveAvailable).toHaveBeenCalledWith([FIRST_ID]);
+    expect(result.availableFiles.has(FIRST_ID)).toBe(true);
+    expect(result.inputFiles.size).toBe(0);
+  });
+  test.each([
+    ['report.pdf', 'application/pdf'],
+    ['report.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+    ['report.pptx', 'application/vnd.openxmlformats-officedocument.presentationml.presentation'],
+    ['report.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
+  ])(
+    'admits %s to a text-only model and materializes extracted content',
+    async (name, mediaType) => {
+      const document = fact(FIRST_ID, name, mediaType);
+      const facts = new Map([[FIRST_ID, document]]);
+      const resources = createTurnResourceLedger(facts, []);
+      const input: AgentInputPart[] = [
+        { type: 'file', fileEntryId: FIRST_ID, filename: name, mediaType },
+      ];
+      const files = resolver(facts, {
+        readDocumentText: async () => ({ text: 'Document content', truncated: false }),
+      });
+      assertAttachmentRequestSupported(new FakeRuntime(), input, [], resources, TEXT_MODEL);
+      const textAttachments = await resolveRuntimeContentAttachments(
+        files,
+        input,
+        [],
+        resources,
+        new AbortController().signal,
+        TEXT_MODEL,
+        'builtin',
+      );
+      const attachments = await materializeRuntimeAttachments({
+        files,
+        history: [],
+        inputParts: input,
+        modelPreflight: TEXT_MODEL,
+        resources,
+        signal: new AbortController().signal,
+        contentAttachments: textAttachments,
+      });
+      expect(attachments.get(FIRST_ID)).toMatchObject({
+        type: 'text-attachment',
+        fileEntryId: FIRST_ID,
+        name,
+        mediaType,
+        text: 'Document content',
+        truncated: false,
+        trust: 'untrusted-user-content',
+      });
+      expect(files.readAsDataUrl).not.toHaveBeenCalled();
+      expect(files.readAsBytes).not.toHaveBeenCalled();
+    },
+  );
+
+  test('gives image-only documents a distinct user-facing rejection', async () => {
+    const document = fact(FIRST_ID, 'scan.pdf', 'application/pdf');
+    const facts = new Map([[FIRST_ID, document]]);
+    await expect(
+      resolveRuntimeContentAttachments(
+        resolver(facts, {
+          readDocumentText: async () => {
+            throw new DocumentTextError('empty');
+          },
+        }),
+        [{ type: 'file', fileEntryId: FIRST_ID, mediaType: document.mediaType }],
+        [],
+        createTurnResourceLedger(facts, []),
+        new AbortController().signal,
+        TEXT_MODEL,
+        'builtin',
+      ),
+    ).rejects.toMatchObject({ view: { code: 'ATTACHMENT_NO_TEXT' } });
+  });
+  test('resolves current and historical managed facts while canonicalizing current input', async () => {
+    const current = fact(FIRST_ID, 'managed.png', 'image/png');
+    const historical = fact(SECOND_ID, 'history.txt', 'text/plain');
+    const facts = new Map([
+      [FIRST_ID, current],
+      [SECOND_ID, historical],
+    ]);
+    const files = resolver(facts);
+    const input: AgentInputPart[] = [
+      { type: 'text', text: 'Inspect this.' },
+      { type: 'file', fileEntryId: FIRST_ID, mediaType: 'image/png' },
+    ];
+
+    const resolved = await resolveManagedInput(
+      files,
+      input,
+      [messageWithFile(historical)],
+      new AbortController().signal,
+    );
+
+    expect(files.resolveAvailable).toHaveBeenCalledWith([FIRST_ID, SECOND_ID]);
+    expect(resolved.availableFiles).toEqual(facts);
+    expect(resolved.inputFiles).toEqual(new Map([[FIRST_ID, current]]));
+    expect(resolved.parts).toEqual([
+      { type: 'text', text: 'Inspect this.' },
+      {
+        type: 'file',
+        fileEntryId: FIRST_ID,
+        mediaType: 'image/png',
+        filename: 'managed.png',
+      },
+    ]);
+    expect(input[1]).not.toHaveProperty('name');
+  });
+
+  test('rejects forged current metadata with a protocol-safe error', async () => {
+    const files = resolver(new Map([[FIRST_ID, fact(FIRST_ID, 'managed.png', 'image/png')]]));
+
+    await expect(
+      resolveManagedInput(
+        files,
+        [
+          {
+            type: 'file',
+            fileEntryId: FIRST_ID,
+            mediaType: 'image/jpeg',
+            filename: 'forged.jpg',
+          },
+        ],
+        [],
+        new AbortController().signal,
+      ),
+    ).rejects.toMatchObject({
+      view: {
+        code: 'ATTACHMENT_METADATA_MISMATCH',
+        message: 'Attached file metadata could not be verified.',
+        retryable: false,
+      },
+    });
+  });
+
+  test('projects attachment capability and media admission failures at the Host boundary', () => {
+    const historicalText = fact(FIRST_ID, 'history.txt', 'text/plain');
+    const historicalResources = createTurnResourceLedger(
+      new Map(),
+      [FIRST_ID],
+      new Map([[FIRST_ID, historicalText]]),
+    );
+    const runtimeWithoutAttachments = new FakeRuntime({
+      descriptor: {
+        id: 'text-only',
+        name: 'Text-only Runtime',
+        capabilities: {
+          approvals: true,
+          attachments: false,
+          reasoning: true,
+          tools: true,
+        },
+      },
+    });
+
+    expect(
+      captureProtocolError(() =>
+        assertAttachmentRequestSupported(
+          runtimeWithoutAttachments,
+          [],
+          [messageWithFile(historicalText)],
+          historicalResources,
+          TEXT_MODEL,
+        ),
+      ),
+    ).toMatchObject({ view: { code: 'CAPABILITY_UNSUPPORTED' } });
+
+    const unsupported = fact(SECOND_ID, 'archive.zip', 'application/zip');
+    const unsupportedResources = createTurnResourceLedger(new Map([[SECOND_ID, unsupported]]), []);
+    expect(
+      captureProtocolError(() =>
+        assertAttachmentRequestSupported(
+          new FakeRuntime(),
+          [
+            {
+              type: 'file',
+              fileEntryId: SECOND_ID,
+              mediaType: unsupported.mediaType,
+              filename: unsupported.name,
+            },
+          ],
+          [],
+          unsupportedResources,
+          IMAGE_MODEL,
+        ),
+      ),
+    ).toMatchObject({ view: { code: 'ATTACHMENT_INVALID' } });
+  });
+
+  test('retains OCR text through materialization for current images and history replay on a text model', async () => {
+    const image = fact(FIRST_ID, 'receipt.png', 'image/png');
+    const facts = new Map([[FIRST_ID, image]]);
+    const resources = createTurnResourceLedger(facts, []);
+    const input: AgentInputPart[] = [
+      { type: 'file', fileEntryId: FIRST_ID, mediaType: image.mediaType, filename: image.name },
+    ];
+    const files = resolver(facts, {
+      readImageText: async () => ({ text: 'Total: 42', truncated: false }),
+    });
+    for (const replay of [false, true]) {
+      const inputParts = replay ? [] : input;
+      const history = replay ? [messageWithFile(image)] : [];
+      assertAttachmentRequestSupported(
+        new FakeRuntime(),
+        inputParts,
+        history,
+        resources,
+        TEXT_MODEL,
+      );
+      const contentAttachments = await resolveRuntimeContentAttachments(
+        files,
+        inputParts,
+        history,
+        resources,
+        new AbortController().signal,
+        TEXT_MODEL,
+        'builtin',
+      );
+      const materialized = await materializeRuntimeAttachments({
+        files,
+        inputParts,
+        history,
+        resources,
+        contentAttachments,
+        modelPreflight: TEXT_MODEL,
+        signal: new AbortController().signal,
+      });
+      expect(materialized.get(FIRST_ID)).toMatchObject({
+        type: 'text-attachment',
+        text: 'Total: 42',
+        trust: 'untrusted-user-content',
+        attachmentReport: { mode: 'image-text', parser: 'native-image-ocr' },
+      });
+    }
+    expect(files.readAsDataUrl).not.toHaveBeenCalled();
+    expect(files.readAsBytes).not.toHaveBeenCalled();
+  });
+
+  test('projects invalid current text content to an attachment protocol error', async () => {
+    const text = fact(FIRST_ID, 'spoofed.txt', 'text/plain', 3);
+    const files = resolver(new Map([[FIRST_ID, text]]), {
+      readAsBytes: async () => Uint8Array.from([65, 0, 66]),
+    });
+    const input: AgentInputPart[] = [
+      {
+        type: 'file',
+        fileEntryId: FIRST_ID,
+        mediaType: text.mediaType,
+        filename: text.name,
+      },
+    ];
+
+    await expect(
+      resolveRuntimeContentAttachments(
+        files,
+        input,
+        [],
+        createTurnResourceLedger(new Map([[FIRST_ID, text]]), []),
+        new AbortController().signal,
+        TEXT_MODEL,
+        'builtin',
+      ),
+    ).rejects.toMatchObject({
+      view: {
+        code: 'ATTACHMENT_INVALID',
+        message: expect.stringContaining('contains NUL bytes'),
+      },
+    });
+  });
+
+  test('current image whose read fails rejects as an unavailable attachment', async () => {
+    const result = resolveCurrentImageAttachments(async () => {
+      throw new Error('boom');
+    });
+
+    await expect(result).rejects.toBeInstanceOf(AgentProtocolError);
+    await expect(result).rejects.toMatchObject({
+      view: {
+        code: 'ATTACHMENT_UNAVAILABLE',
+        retryable: false,
+        attachmentIssue: { code: 'unavailable' },
+      },
+    });
+  });
+
+  test('current image without a matching data URL rejects the same way', async () => {
+    for (const uri of [undefined, 'data:image/jpeg;base64,AAAA']) {
+      const result = resolveCurrentImageAttachments(async () => uri);
+
+      await expect(result).rejects.toMatchObject({
+        view: {
+          code: 'ATTACHMENT_UNAVAILABLE',
+          retryable: false,
+          attachmentIssue: { code: 'unavailable' },
+        },
+      });
+      await expect(result).rejects.toBeInstanceOf(AgentProtocolError);
+    }
+  });
+
+  test('historical image read failure stays omitted', async () => {
+    const image = fact(FIRST_ID, 'historical.png', 'image/png');
+    const facts = new Map([[FIRST_ID, image]]);
+    const files = resolver(facts, {
+      readAsDataUrl: async () => {
+        throw new Error('boom');
+      },
+    });
+    const attachments = await materializeRuntimeAttachments({
+      files,
+      history: [messageWithFile(image)],
+      inputParts: [],
+      modelPreflight: IMAGE_MODEL,
+      resources: createTurnResourceLedger(new Map(), [FIRST_ID], facts),
+      signal: new AbortController().signal,
+      contentAttachments: new Map(),
+    });
+
+    expect(attachments.has(FIRST_ID)).toBe(false);
+  });
+
+  test('aborted image resolution rethrows the abort reason', async () => {
+    const image = fact(FIRST_ID, 'managed.png', 'image/png');
+    const facts = new Map([[FIRST_ID, image]]);
+    const controller = new AbortController();
+    const reason = new Error('cancelled');
+    controller.abort(reason);
+    const result = materializeRuntimeAttachments({
+      files: resolver(facts, {
+        readAsDataUrl: async () => {
+          throw new Error('boom');
+        },
+      }),
+      history: [],
+      inputParts: [{ type: 'file', fileEntryId: FIRST_ID, mediaType: image.mediaType }],
+      modelPreflight: IMAGE_MODEL,
+      resources: createTurnResourceLedger(facts, []),
+      signal: controller.signal,
+      contentAttachments: new Map(),
+    });
+
+    await expect(result).rejects.toBe(reason);
+    await expect(result).rejects.not.toBeInstanceOf(AgentProtocolError);
+  });
+
+  test('the protocol error keeps its code in diagnostic facts', async () => {
+    const error = await resolveCurrentImageAttachments(async () => {
+      throw new Error('boom');
+    }).catch((error: unknown) => error);
+
+    expect(traceErrorAttributes(error)).toEqual({
+      'error.type': 'AgentProtocolError',
+      'error.code': 'ATTACHMENT_UNAVAILABLE',
+      'error.retryable': false,
+    });
+  });
+
+  test('replaces historical images with id-labelled notes without reading bytes for a text model', async () => {
+    const historical = fact(FIRST_ID, 'historical.png', 'image/png');
+    const files = resolver(new Map([[FIRST_ID, historical]]));
+    const resources = createTurnResourceLedger(
+      new Map(),
+      [FIRST_ID],
+      new Map([[FIRST_ID, historical]]),
+    );
+
+    const attachments = await materializeRuntimeAttachments({
+      files,
+      history: [messageWithFile(historical)],
+      inputParts: [],
+      modelPreflight: TEXT_MODEL,
+      resources,
+      signal: new AbortController().signal,
+      contentAttachments: new Map(),
+    });
+
+    const omitted = {
+      type: 'text',
+      text: `[image attachment omitted: this model does not accept image input] Cherry managed file: ${JSON.stringify({ fileEntryId: FIRST_ID, name: 'historical.png' })}`,
+    };
+    expect(attachments).toEqual(new Map([[FIRST_ID, omitted]]));
+    expect(files.readAsDataUrl).not.toHaveBeenCalled();
+  });
+});
+
+async function resolveCurrentImageAttachments(readAsDataUrl: ManagedFileResolver['readAsDataUrl']) {
+  const image = fact(FIRST_ID, 'managed.png', 'image/png');
+  const facts = new Map([[FIRST_ID, image]]);
+  const files = resolver(facts, { readAsDataUrl });
+  const resources = createTurnResourceLedger(facts, []);
+  const input: AgentInputPart[] = [
+    { type: 'file', fileEntryId: FIRST_ID, mediaType: image.mediaType },
+  ];
+  const signal = new AbortController().signal;
+  const contentAttachments = await resolveRuntimeContentAttachments(
+    files,
+    input,
+    [],
+    resources,
+    signal,
+    IMAGE_MODEL,
+    'builtin',
+  );
+  return materializeRuntimeAttachments({
+    files,
+    history: [],
+    inputParts: input,
+    modelPreflight: IMAGE_MODEL,
+    resources,
+    signal,
+    contentAttachments,
+  });
+}
+
+function fact(
+  fileEntryId: FileEntryId,
+  name: string,
+  mediaType: string,
+  size = 128,
+): ManagedFileFact {
+  return { fileEntryId, mediaType, name, size };
+}
+
+function messageWithFile(file: ManagedFileFact): AgentMessageView {
+  return {
+    id: `message-${file.fileEntryId}`,
+    sessionId: 'session-1',
+    turnId: 'turn-1',
+    role: 'user',
+    status: 'success',
+    parts: [
+      {
+        id: `part-${file.fileEntryId}`,
+        type: 'file',
+        fileEntryId: file.fileEntryId,
+        mediaType: file.mediaType,
+        filename: file.name,
+        purpose: 'input-attachment',
+      },
+    ],
+    stats: null,
+    modelId: null,
+    inferenceSnapshot: null,
+    createdAt: NOW,
+    updatedAt: NOW,
+  };
+}
+
+function resolver(
+  facts: ReadonlyMap<string, ManagedFileFact>,
+  overrides: Partial<
+    Pick<
+      ManagedFileResolver,
+      'readAsBytes' | 'readAsDataUrl' | 'readDocumentText' | 'readImageText'
+    >
+  > = {},
+): ManagedFileResolver {
+  return {
+    resolveAvailable: jest.fn(
+      async (fileEntryIds: readonly FileEntryId[]) =>
+        new Map([...facts].filter(([fileEntryId]) => fileEntryIds.includes(fileEntryId))),
+    ),
+    readAsBytes: jest.fn(overrides.readAsBytes ?? (async () => undefined)),
+    readDocumentText: jest.fn(overrides.readDocumentText ?? (async () => undefined)),
+    readImageText: jest.fn(overrides.readImageText ?? (async () => undefined)),
+    readAsDataUrl: jest.fn(overrides.readAsDataUrl ?? (async () => undefined)),
+  };
+}
+
+function captureProtocolError(action: () => void): AgentProtocolError {
+  try {
+    action();
+  } catch (error) {
+    if (error instanceof AgentProtocolError) {
+      return error;
+    }
+    throw error;
+  }
+  throw new Error('Expected an Agent protocol error.');
+}

@@ -1,0 +1,606 @@
+import { sanitizeTraceAttributes } from '@/backend/utils/diagnosticTrace';
+import { AgentProtocolError } from '@/shared/contracts/agent';
+import { PluginError } from '@/shared/contracts/plugins';
+import { createLogRecord } from '@/shared/core/logger/LoggerService';
+import type { TraceSpanRecord } from '@/shared/data/types/trace';
+
+import { projectDiagnosticLog, projectDiagnosticTrace } from '../diagnosticMetadata';
+import { projectDiagnosticLine } from '../sourceCollector';
+
+const trace: TraceSpanRecord = {
+  schemaVersion: 1,
+  revision: 2,
+  capture: 'metadata',
+  processId: 'process-1',
+  traceId: 'a'.repeat(32),
+  spanId: 'b'.repeat(16),
+  parentSpanId: null,
+  name: 'mcp.call_tool',
+  context: {},
+  attributes: {},
+  status: 'error',
+  startedAt: 100,
+  endedAt: 200,
+  durationMs: 100,
+};
+
+test.each([
+  'SAFETY',
+  'MALFORMED_FUNCTION_CALL',
+  'UNEXPECTED_TOOL_CALL',
+  'STOP',
+  'completed',
+  'failed',
+  'cancelled',
+  'in_progress',
+  'queued',
+  'incomplete',
+  'incomplete.max_output_tokens',
+  'incomplete.content_filter',
+])('exports known raw finish reason %s alongside the normalized reason', (reason) => {
+  expect(
+    projectDiagnosticTrace({
+      ...trace,
+      name: 'pi.generate_content',
+      attributes: {
+        'gen_ai.response.finish_reason': 'error',
+        'gen_ai.response.raw_finish_reason': reason,
+      },
+    })?.attributes,
+  ).toEqual({
+    'gen_ai.response.finish_reason': 'error',
+    'gen_ai.response.raw_finish_reason': reason,
+  });
+});
+
+test.each([
+  'private_finish_reason',
+  'private provider response',
+  'incomplete.private_finish_reason',
+  'completed.private_finish_reason',
+  'incomplete.max_output_tokens private provider response',
+  1,
+  true,
+])('rejects non-enum raw finish reasons at export: %s', (reason) => {
+  expect(
+    projectDiagnosticTrace({
+      ...trace,
+      name: 'pi.generate_content',
+      attributes: { 'gen_ai.response.raw_finish_reason': reason },
+    })?.attributes,
+  ).toEqual({});
+});
+
+test('retains admission rejection codes through log persistence and export without private text', () => {
+  const error = new AgentProtocolError({
+    code: 'SESSION_BUSY',
+    message: 'private session details',
+    retryable: true,
+  });
+  const raw = createLogRecord('error', 'Agent operation failed', 'DurableAgentHost', {}, [
+    { operation: 'ai.admission', error },
+  ]);
+  const persisted = projectDiagnosticLog(raw);
+  expect(persisted?.facts).toEqual({
+    operation: 'ai.admission',
+    'error.type': 'AgentProtocolError',
+    'error.code': 'SESSION_BUSY',
+    'error.retryable': true,
+  });
+  const exported = projectDiagnosticLog(JSON.parse(JSON.stringify(persisted)));
+  expect(exported).toEqual(persisted);
+  expect(JSON.stringify(exported)).not.toMatch(/private|stack|view/);
+});
+
+test('retains useful error facts without free text, credentials, payloads or stack traces', () => {
+  const error = Object.assign(
+    new PluginError('quota', 'private upstream response', { statusCode: 429 }),
+    {
+      cause: new Error('private credential'),
+      body: 'private response',
+    },
+  );
+  const raw = createLogRecord(
+    'error',
+    'Uncaught JavaScript exception',
+    'Plugin',
+    { sessionId: 'session-1' },
+    [
+      error,
+      {
+        isFatal: true,
+        request: { authorization: 'Bearer private' },
+        prompt: 'private chat',
+      },
+    ],
+  );
+  const projected = projectDiagnosticLog(raw);
+  expect(projected).toMatchObject({
+    capture: 'metadata',
+    message: 'Uncaught JavaScript exception',
+    facts: {
+      sessionId: 'session-1',
+      isFatal: true,
+      'plugin.error.reason': 'quota',
+      'http.status_code': 429,
+    },
+  });
+  expect(JSON.stringify(projected)).not.toMatch(/private|stack|cause|body|prompt|Bearer/);
+  expect(projectDiagnosticLog({ ...raw, level: 'info' })).toBeUndefined();
+  expect(projectDiagnosticLog({ ...raw, message: 'private arbitrary message' })?.message).toBe(
+    'Application error',
+  );
+});
+
+test('retains startup timings through file export while rejecting other info logs and private fields', () => {
+  const raw = createLogRecord('info', 'Startup stage', 'Startup', {}, [
+    {
+      operation: 'startup.service',
+      outcome: 'completed',
+      serviceName: 'DbService',
+      phase: 'gate',
+      startupStartedAt: 1000,
+      jsEntryStartMs: 200,
+      elapsedMs: 500,
+      durationMs: 125,
+      rnStartupStartMs: 0,
+      rnRuntimeStartMs: 10,
+      rnBundleEntryStartMs: 80,
+      path: '/private/database',
+      language: 'private-preference',
+      error: new Error('private failure'),
+    },
+  ]);
+  const persisted = projectDiagnosticLog(raw);
+  const exported = projectDiagnosticLine(
+    { tooLarge: false, data: new TextEncoder().encode(JSON.stringify(persisted)) },
+    'logs',
+    { fromMs: 0, toMs: Date.now() + 1000 },
+  );
+  if (!exported || exported === 'malformed') throw new Error('Expected startup metadata');
+  const value = JSON.parse(new TextDecoder().decode(exported.data));
+  expect(value).toMatchObject({
+    level: 'info',
+    message: 'Startup stage',
+    facts: {
+      operation: 'startup.service',
+      outcome: 'completed',
+      serviceName: 'DbService',
+      phase: 'gate',
+      startupStartedAt: 1000,
+      jsEntryStartMs: 200,
+      elapsedMs: 500,
+      durationMs: 125,
+      rnStartupStartMs: 0,
+      rnRuntimeStartMs: 10,
+      rnBundleEntryStartMs: 80,
+    },
+  });
+  expect(JSON.stringify(value)).not.toMatch(/private|stack|path|language/);
+  expect(projectDiagnosticLog({ ...raw, message: 'arbitrary info' })).toBeUndefined();
+  expect(projectDiagnosticLog({ ...raw, module: 'OtherModule' })).toBeUndefined();
+});
+
+test('retains Office stage timings through file export without document contents or unrelated info logs', () => {
+  const raw = createLogRecord('info', 'Office stage', 'Office', {}, [
+    {
+      operation: 'office.sandbox_execution',
+      toolCallId: 'call-1',
+      capabilityId: 'run_office_script',
+      outcome: 'ended',
+      durationMs: 125,
+      path: '/private/report.xlsx',
+      arguments: { code: 'private document script' },
+      document: 'private document contents',
+    },
+  ]);
+  const persisted = projectDiagnosticLog(raw);
+  const exported = projectDiagnosticLine(
+    { tooLarge: false, data: new TextEncoder().encode(JSON.stringify(persisted)) },
+    'logs',
+    { fromMs: 0, toMs: Date.now() + 1000 },
+  );
+  if (!exported || exported === 'malformed') throw new Error('Expected Office metadata');
+  expect(JSON.parse(new TextDecoder().decode(exported.data))).toMatchObject({
+    level: 'info',
+    module: 'Office',
+    message: 'Office stage',
+    facts: {
+      operation: 'office.sandbox_execution',
+      toolCallId: 'call-1',
+      capabilityId: 'run_office_script',
+      outcome: 'ended',
+      durationMs: 125,
+    },
+  });
+  expect(new TextDecoder().decode(exported.data)).not.toMatch(/private|arguments|document/);
+  expect(projectDiagnosticLog({ ...raw, message: 'arbitrary info' })).toBeUndefined();
+  expect(projectDiagnosticLog({ ...raw, module: 'OtherModule' })).toBeUndefined();
+});
+
+test('preserves the service and dependency responsible for a startup phase promotion', () => {
+  const persisted = projectDiagnosticLog(
+    createLogRecord('warn', 'Service promoted to startup gate', 'Lifecycle', {}, [
+      {
+        operation: 'service.phase.promote',
+        serviceName: 'BackgroundReplyRuntime',
+        requiredBy: 'RemoteAgentRuntime',
+        fromPhase: 'postReady',
+        toPhase: 'gate',
+      },
+    ]),
+  );
+  expect(projectDiagnosticLog(JSON.parse(JSON.stringify(persisted)))).toMatchObject({
+    message: 'Service promoted to startup gate',
+    facts: {
+      operation: 'service.phase.promote',
+      serviceName: 'BackgroundReplyRuntime',
+      requiredBy: 'RemoteAgentRuntime',
+      fromPhase: 'postReady',
+      toPhase: 'gate',
+    },
+  });
+});
+
+test('exports only allowlisted trace fields even if stored metadata contains extra sensitive values', () => {
+  const record = {
+    ...trace,
+    context: { sessionId: 'session-1', requestId: 'sk-private' },
+    attributes: {
+      'plugin.id': 'feishu',
+      'plugin.error.reason': 'access',
+      'http.status_code': 403,
+      'tool.name': 'list_tasks',
+      'error.code': 'Bearer-private',
+      'error.stage': 'stream',
+      'error.category': 'permission',
+      'error.retryable': false,
+      'tool.result.status': 'partial',
+      endpoint: 'https://private.test',
+      'tool.arguments': 'private parameters',
+      'tool.result': 'private response',
+    },
+  };
+  const projected = projectDiagnosticTrace(record);
+  expect(projected).toMatchObject({
+    context: { sessionId: 'session-1' },
+    attributes: {
+      'plugin.id': 'feishu',
+      'plugin.error.reason': 'access',
+      'http.status_code': 403,
+      'tool.name': 'list_tasks',
+      'error.stage': 'stream',
+      'error.category': 'permission',
+      'error.retryable': false,
+      'tool.result.status': 'partial',
+    },
+  });
+  expect(JSON.stringify(projected)).not.toMatch(/private|Bearer|endpoint|arguments/);
+  expect(projected?.attributes).not.toHaveProperty(['tool.result']);
+  expect(projectDiagnosticTrace({ ...record, name: 'agent.event' })).toBeUndefined();
+});
+
+test('uses terminal time for completed requests and start time for unfinished requests', () => {
+  const record = { ...trace, startedAt: 100, endedAt: 1500, durationMs: 1400 };
+  const range = { fromMs: 1000, toMs: 2000 };
+  const line = (value: unknown) => ({
+    tooLarge: false,
+    data: new TextEncoder().encode(JSON.stringify(value)),
+  });
+  expect(projectDiagnosticLine(line(record), 'traces', range)).toMatchObject({ timestamp: 1500 });
+  expect(
+    projectDiagnosticLine(
+      line({ ...record, endedAt: undefined, status: 'running' }),
+      'traces',
+      range,
+    ),
+  ).toBeUndefined();
+});
+
+test('preserves request budgets and failure facts together through capture and archive projection', () => {
+  const attributes = sanitizeTraceAttributes({
+    'runtime.name': 'pi-durable',
+    'gen_ai.request.model': 'test-model',
+    'gen_ai.provider.id': 'test-provider',
+    'gen_ai.provider.api': 'openai-completions',
+    'gen_ai.model.context_window': 128_000,
+    'gen_ai.model.max_input_tokens': 120_000,
+    'gen_ai.model.max_output_tokens': 8192,
+    'gen_ai.request.output_budget_tokens': 4096,
+    'gen_ai.request.estimated_input_tokens': 100,
+    'gen_ai.request.estimate_source': 'pi_estimate',
+    'gen_ai.request.message_count': 2,
+    'gen_ai.request.tool_count': 5,
+    'gen_ai.request.max_tokens': 4096,
+    'gen_ai.request.max_tokens_field': 'max_tokens',
+    'gen_ai.response.finish_reason': 'error',
+    'error.type': 'ProviderError',
+    'error.code': 'runtime_error',
+    'error.origin': 'provider',
+    'error.retryable': false,
+    'error.retry_scope': 'automatic',
+    'error.stage': 'stream',
+    'error.category': 'unknown',
+    'http.status_code': 400,
+  });
+  const persisted = { ...trace, name: 'pi.generate_content', attributes };
+  const exported = projectDiagnosticTrace(JSON.parse(JSON.stringify(persisted)));
+  expect(exported?.attributes).toEqual(persisted.attributes);
+  expect(exported?.attributes).toMatchObject({
+    'gen_ai.request.estimated_input_tokens': 100,
+    'gen_ai.request.max_tokens': 4096,
+    'http.status_code': 400,
+    'error.retry_scope': 'automatic',
+  });
+  expect(exported?.attributes).not.toHaveProperty(['trace.attributes_truncated']);
+});
+
+test('exports only numeric budgets and closed product reasons and retry scopes', () => {
+  const record = {
+    ...trace,
+    name: 'ai.turn_state',
+    attributes: {
+      'error.product_reason': 'context_length',
+      'error.source.code': 'provider_error',
+      'error.retry_scope': 'user',
+      'gen_ai.request.estimated_input_tokens': 'private-value',
+      'gen_ai.request.max_tokens': -1,
+      'gen_ai.request.estimate_source': 'private-value',
+    },
+  };
+  expect(projectDiagnosticTrace(record)?.attributes).toEqual({
+    'error.product_reason': 'context_length',
+    'error.source.code': 'provider_error',
+    'error.retry_scope': 'user',
+  });
+  expect(
+    projectDiagnosticTrace({
+      ...record,
+      attributes: {
+        'error.product_reason': 'private-value',
+        'error.retry_scope': 'private-value',
+      },
+    })?.attributes,
+  ).toEqual({});
+});
+
+test('retains observed compaction lifecycle facts without its error or summary text', () => {
+  const raw = createLogRecord('info', 'Pi durable context compaction', 'PiDurableObserver', {}, [
+    {
+      operation: 'pi.compaction',
+      sessionId: 'session-1',
+      taskId: 42,
+      reasonCode: 'overflow',
+      blocking: true,
+      outcome: 'failed',
+      error: 'private upstream response',
+      summary: 'private conversation',
+    },
+  ]);
+  const persisted = projectDiagnosticLog(raw);
+  const exported = projectDiagnosticLog(JSON.parse(JSON.stringify(persisted)));
+  expect(exported?.facts).toEqual({
+    operation: 'pi.compaction',
+    sessionId: 'session-1',
+    taskId: 42,
+    reasonCode: 'overflow',
+    blocking: true,
+    outcome: 'failed',
+  });
+  expect(JSON.stringify(exported)).not.toContain('private');
+  expect(projectDiagnosticLog({ ...raw, module: 'OtherModule' })).toBeUndefined();
+});
+
+test.each(['running', 'ok', 'error', 'cancelled'] as const)(
+  'exports Pi tool execution records with status %s instead of reporting malformed lines',
+  (status) => {
+    const record = {
+      ...trace,
+      name: 'pi.execute_tool',
+      status,
+      ...(status === 'running' ? { revision: 1, endedAt: undefined, durationMs: undefined } : {}),
+      context: { agentId: 'agent-1', sessionId: 'session-1', turnId: 'turn-1' },
+      attributes: {
+        'tool.name': 'fetch_url',
+        'tool.call.id': 'call-1',
+        'error.code': 'web_lookup_failed',
+        'error.retryable': false,
+        'tool.arguments': 'private parameters',
+        'tool.result': 'private response',
+      },
+    };
+    const projected = projectDiagnosticLine(
+      { tooLarge: false, data: new TextEncoder().encode(JSON.stringify(record)) },
+      'traces',
+      { fromMs: 0, toMs: 1000 },
+    );
+    expect(projected).toEqual({
+      timestamp: status === 'running' ? 100 : 200,
+      data: expect.any(Uint8Array),
+    });
+    if (!projected || projected === 'malformed') throw new Error('Expected exported tool trace');
+    const exported = new TextDecoder().decode(projected.data);
+    expect(JSON.parse(exported)).toMatchObject({
+      name: record.name,
+      status,
+      context: record.context,
+      attributes: {
+        'tool.name': 'fetch_url',
+        'tool.call.id': 'call-1',
+        'error.code': 'web_lookup_failed',
+        'error.retryable': false,
+      },
+    });
+    expect(exported).not.toMatch(/private|arguments|result/);
+  },
+);
+
+test.each([
+  'pi.execute_tool',
+  'ai.admission',
+  'ai.recovery',
+  'ai.suspend',
+  'ai.prepare',
+  'ai.observe',
+  'ai.settlement',
+  'ai.checkpoint',
+  'ai.turn_state',
+  'ai.queue',
+])('includes %s in archive lines while still dropping private payload fields', (name) => {
+  const record = {
+    ...trace,
+    name,
+    context: { sessionId: 'session-1', turnId: 'turn-1', requestId: 'request-1' },
+    attributes: {
+      'runtime.name': 'pi-durable',
+      'tool.name': 'read_file',
+      'tool.call.id': 'call-1',
+      'agent.turn.status': 'queued',
+      'agent.queue.length': 2,
+      'agent.recovery.unfinished_count': 1,
+      'error.code': 'SQLITE_FULL',
+      'tool.arguments': 'private input',
+      'error.stack': 'private stack',
+    },
+  };
+  const projected = projectDiagnosticLine(
+    { tooLarge: false, data: new TextEncoder().encode(JSON.stringify(record)) },
+    'traces',
+    { fromMs: 0, toMs: 1000 },
+  );
+  expect(projected).toEqual(expect.objectContaining({ timestamp: 200 }));
+  if (!projected || projected === 'malformed') throw new Error('Expected an exported trace');
+  const exported = JSON.parse(new TextDecoder().decode(projected.data));
+  expect(exported).toMatchObject({
+    name,
+    context: record.context,
+    attributes: {
+      'runtime.name': 'pi-durable',
+      'tool.call.id': 'call-1',
+      'agent.turn.status': 'queued',
+      'agent.queue.length': 2,
+      'agent.recovery.unfinished_count': 1,
+      'error.code': 'SQLITE_FULL',
+    },
+  });
+  expect(JSON.stringify(exported)).not.toMatch(/private|arguments|stack/);
+});
+
+// OpenAI Responses ids join call and item ids; Code Mode appends its nested call number.
+test.each(['call_abc123|fc_def456', 'call_abc123|fc_def456/c3'])(
+  'keeps the %s tool call id',
+  (id) => {
+    const record = {
+      ...trace,
+      name: 'pi.execute_tool',
+      attributes: { 'tool.name': 'read_file', 'tool.call.id': id },
+    };
+    const projected = projectDiagnosticLine(
+      { tooLarge: false, data: new TextEncoder().encode(JSON.stringify(record)) },
+      'traces',
+      { fromMs: 0, toMs: 1000 },
+    );
+    if (!projected || projected === 'malformed') throw new Error('Expected an exported trace');
+    expect(JSON.parse(new TextDecoder().decode(projected.data)).attributes).toMatchObject({
+      'tool.call.id': id,
+    });
+  },
+);
+
+test('preserves durable failure correlation and retry facts through persistent log reprojection', () => {
+  const first = projectDiagnosticLog(
+    createLogRecord('warn', 'Pi durable generation retry scheduled', 'PiDurableObserver', {}, [
+      {
+        sessionId: 'session-1',
+        turnId: 'turn-1',
+        requestId: 'request-1',
+        operation: 'pi.retry',
+        retryAttempt: 2,
+        toolCallId: 'call-1',
+        taskKind: 'pi.generation',
+        taskId: 42,
+        error: Object.assign(new Error('private upstream response'), { code: 'ETIMEDOUT' }),
+        input: 'private chat',
+      },
+    ]),
+  );
+  const exported = projectDiagnosticLog(JSON.parse(JSON.stringify(first)));
+  expect(exported).toMatchObject({
+    message: 'Pi durable generation retry scheduled',
+    facts: {
+      sessionId: 'session-1',
+      turnId: 'turn-1',
+      requestId: 'request-1',
+      operation: 'pi.retry',
+      retryAttempt: 2,
+      toolCallId: 'call-1',
+      taskKind: 'pi.generation',
+      taskId: 42,
+      'error.code': 'ETIMEDOUT',
+    },
+  });
+  expect(JSON.stringify(exported)).not.toMatch(/private|stack|input/);
+});
+
+test('retains classified Pi reports through export without copying failure payloads', () => {
+  const record = projectDiagnosticLog(
+    createLogRecord('warn', 'Pi durable runtime reported a failure', 'PiDurableAgentRuntime', {}, [
+      {
+        operation: 'pi.host_error',
+        callback: 'models',
+        taskKind: 'pi.generation',
+        taskId: 42,
+        extension: 'cherry.tools',
+        error: new Error('private provider response'),
+        body: 'private chat',
+      },
+    ]),
+  );
+  const exported = projectDiagnosticLog(JSON.parse(JSON.stringify(record)));
+  expect(exported).toMatchObject({
+    message: 'Pi durable runtime reported a failure',
+    facts: {
+      operation: 'pi.host_error',
+      callback: 'models',
+      taskKind: 'pi.generation',
+      taskId: 42,
+      extension: 'cherry.tools',
+    },
+  });
+  expect(JSON.stringify(exported)).not.toMatch(/private|stack|body/);
+});
+
+test('projects repetition counts and times without accepting payload fields or invalid ranges', () => {
+  const record = {
+    schemaVersion: 1,
+    capture: 'metadata',
+    timestamp: new Date(2000).toISOString(),
+    level: 'error',
+    module: 'HttpTransport',
+    message: 'HTTP request failed.',
+    facts: {},
+    repetition: {
+      count: 4,
+      firstSeenAt: new Date(1000).toISOString(),
+      lastSeenAt: new Date(2000).toISOString(),
+      body: 'private body',
+    },
+  };
+  const projected = projectDiagnosticLog(record);
+  expect(projected?.repetition).toEqual({
+    count: 4,
+    firstSeenAt: new Date(1000).toISOString(),
+    lastSeenAt: new Date(2000).toISOString(),
+  });
+  expect(JSON.stringify(projected)).not.toContain('private');
+  expect(
+    projectDiagnosticLog({ ...record, repetition: { ...record.repetition, count: -1 } })
+      ?.repetition,
+  ).toBeUndefined();
+  expect(
+    projectDiagnosticLog({
+      ...record,
+      repetition: { ...record.repetition, firstSeenAt: new Date(3000).toISOString() },
+    })?.repetition,
+  ).toBeUndefined();
+});

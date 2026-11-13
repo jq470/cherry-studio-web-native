@@ -1,0 +1,2484 @@
+import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context';
+import type { Api, AssistantMessage, Model, TranscriptContext } from '@earendil-works/pi-ai';
+import { streamSimple as streamAnthropic } from '@earendil-works/pi-ai/api/anthropic-messages';
+import { streamSimple as streamGoogle } from '@earendil-works/pi-ai/api/google-generative-ai';
+import { streamSimple as streamCompletions } from '@earendil-works/pi-ai/api/openai-completions';
+import { streamSimple as streamResponses } from '@earendil-works/pi-ai/api/openai-responses';
+import { createModels } from '@earendil-works/pi-ai/models';
+import { AssistantMessageEventStream } from '@earendil-works/pi-ai/utils/event-stream';
+import { getCurrentSystemPrompt, getCurrentTools } from '@earendil-works/pi-ai/utils/transcript';
+import {
+  AgentDoc,
+  createRegistry,
+  defineDocFamily,
+  GenerationTask,
+  LiveDoc,
+  MemoryStorage,
+  SystemEntry,
+  UserEntry,
+  type JsonObject,
+} from '@earendil-works/pi-durable';
+
+import {
+  buildAgentSystemPrompt,
+  buildInitialSkillInstructions,
+} from '../../../host/agentSystemPrompt';
+import type { SkillTurnEntry, SkillTurnScope } from '../../../host/skillScope';
+import { formatMessageQuote } from '../../../host/turnRuntimeInput';
+import { createSkillTools } from '../../../tools/skill/skillTools';
+import { createLoadWorkflowTool, getPluginWorkflows } from '../../../tools/workflowTool';
+import type {
+  RuntimeConversationEvent,
+  RuntimeDurableSubmission,
+  RuntimeExecutionPorts,
+  RuntimeLane,
+  RuntimeSqlDatabase,
+} from '../../durableTypes';
+import { runtimeLane } from '../../durableTypes';
+import type { RuntimeTool } from '../../types';
+import { bindPiStream, resolvePiApiAdapter } from '../piApiAdapters';
+import { PiDurableAgentRuntime } from '../PiDurableAgentRuntime';
+import { piSubmissionMetadata, piToolBlueprint } from '../piDurableProjection';
+import { PiDurableRuntime } from '../PiDurableRuntime';
+import type { PiRuntimeDependencies, PiStreamFn } from '../piModelTypes';
+import { emptyAssistantMessage, providerErrorEvent } from '../piStreamEvents';
+import { withPiStreamIdleTimeout } from '../piStreamIdleTimeout';
+import { PiToolBudget } from '../piToolBudget';
+import { ToolInstructions } from '../piToolInstructions';
+import type { PiNativeWebTools } from '../piWebTools';
+
+class ReopenableMemoryStorage extends MemoryStorage {
+  override async close(): Promise<void> {}
+}
+const reference = { providerId: 'provider', modelId: 'model' };
+const wire: Model<Api> = {
+  api: 'openai-responses',
+  provider: 'provider',
+  id: 'wire-model',
+  name: 'Model',
+  baseUrl: '',
+  contextWindow: 32768,
+  maxTokens: 4096,
+  input: ['text'],
+  reasoning: false,
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+};
+const lane = runtimeLane('session');
+const seed = {
+  lane,
+  revision: 0,
+  configuration: { model: reference, instructions: 'Help.', options: {}, tools: [] },
+};
+
+function input(id: string): RuntimeDurableSubmission {
+  return {
+    requestId: id,
+    turnId: `turn-${id}`,
+    userMessageId: `user-${id}`,
+    assistantMessageId: `answer-${id}`,
+    createdAt: 1,
+    input: [{ type: 'text', text: `Question ${id}` }],
+    metadata: { originalText: `Question ${id}` },
+  };
+}
+
+function deferred<Value>() {
+  let resolve!: (value: Value) => void;
+  const promise = new Promise<Value>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+function fixture() {
+  const storage = new ReopenableMemoryStorage();
+  const requests: TranscriptContext[] = [];
+  const providerSessions: (string | undefined)[] = [];
+  const ports: RuntimeExecutionPorts = {
+    assertExecutionAllowed: jest.fn(async () => undefined),
+    resolveTool: jest.fn(async () => {
+      throw new Error('No tools.');
+    }),
+    requestApproval: jest.fn(async () => 'deny' as const),
+    admitArtifacts: jest.fn(async () => undefined),
+    recordUsage: jest.fn(async () => undefined),
+  };
+  const dependencies: PiRuntimeDependencies = {
+    preflightModel: async () => ({
+      contextWindow: 32768,
+      maxInputTokens: 28672,
+      maxOutputTokens: 4096,
+      inputModalities: ['text'],
+      supportsTools: true,
+    }),
+    resolveModel: async () => ({
+      model: wire,
+      defaultThinkingLevel: 'off',
+      redactionValues: [],
+      supportsTools: true,
+      usageContext: {
+        providerId: 'provider',
+        providerName: null,
+        modelId: 'model',
+        modelName: null,
+        pricingSnapshot: null,
+        trustProviderReportedCost: false,
+        reportedCostCurrency: null,
+        credentialReceipt: { attribution: 'unknown' },
+      },
+      streamFn: (_model, context, options) => {
+        requests.push(context);
+        providerSessions.push(options?.sessionId);
+        const message: AssistantMessage = {
+          ...emptyAssistantMessage(wire),
+          content: [{ type: 'text', text: `Response ${requests.length}` }],
+          usage: {
+            input: 3,
+            output: 2,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 5,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+        };
+        const stream = new AssistantMessageEventStream();
+        stream.push({ type: 'done', reason: 'stop', message });
+        return stream;
+      },
+    }),
+  };
+  // The native Storage injection owns persistence in this fixture; SQL must never be called here.
+  const unavailable = async () => {
+    throw new Error('Unexpected SQL in the memory fixture.');
+  };
+  const database: RuntimeSqlDatabase = {
+    exec: unavailable,
+    run: unavailable,
+    runCounted: unavailable,
+    get: unavailable,
+    all: unavailable,
+    transaction: unavailable,
+    close: unavailable,
+  };
+  const create = () => new PiDurableAgentRuntime(dependencies, async () => storage);
+  return { storage, requests, providerSessions, ports, database, create, dependencies };
+}
+
+async function submitAndWait(
+  runtime: PiDurableAgentRuntime,
+  submission: RuntimeDurableSubmission,
+  status: 'completed' | 'failed' = 'completed',
+  target: RuntimeLane = lane,
+) {
+  const complete = deferred<void>();
+  const observation = await runtime.observe(target, (event) => {
+    if (
+      event.type === 'turn.updated' &&
+      event.turn.identity.requestId === submission.requestId &&
+      event.turn.status === status
+    )
+      complete.resolve();
+  });
+  try {
+    await runtime.submit(target, submission);
+    await complete.promise;
+  } finally {
+    await observation.unsubscribe();
+  }
+}
+
+describe('Persistent Agent facade', () => {
+  test.each([1, 2])(
+    'a final boundary preserves the order of %s steers before a follow-up, including after reopening',
+    async (count) => {
+      const state = fixture();
+      const entered = [deferred<void>(), deferred<void>()];
+      const release = [deferred<void>(), deferred<void>()];
+      const completed = deferred<void>();
+      const resolveModel = state.dependencies.resolveModel;
+      state.dependencies.resolveModel = async (...args) => ({
+        ...(await resolveModel(...args)),
+        streamFn: (_model, context) => {
+          const index = state.requests.length;
+          state.requests.push(context);
+          const stream = new AssistantMessageEventStream();
+          entered[index]?.resolve();
+          void (release[index]?.promise ?? Promise.resolve()).then(() => {
+            stream.push({
+              type: 'done',
+              reason: 'stop',
+              message: {
+                ...emptyAssistantMessage(wire),
+                content: [{ type: 'text', text: `Response ${index + 1}` }],
+              },
+            });
+            stream.end();
+          });
+          return stream;
+        },
+      });
+      let runtime = state.create();
+      await runtime.initialize(state.database, state.ports);
+      await runtime.ensureConversation(seed);
+      const observation = await runtime.observe(lane, (event) => {
+        if (
+          event.type === 'turn.updated' &&
+          event.turn.identity.requestId === 'waiting' &&
+          event.turn.status === 'completed'
+        )
+          completed.resolve();
+      });
+      try {
+        await runtime.submit(lane, input('first'));
+        await entered[0].promise;
+        await runtime.submit(lane, {
+          ...input('waiting'),
+          metadata: { parentMessageId: 'answer-first' },
+        });
+        for (let index = 1; index <= count; index++) {
+          await runtime.submit(lane, {
+            ...input(`guided-${index}`),
+            metadata: {
+              parentMessageId: index === 1 ? 'answer-waiting' : `answer-guided-${index - 1}`,
+            },
+          });
+        }
+        for (let index = 1; index <= count; index++)
+          expect(await runtime.steer(lane, `guided-${index}`)).toMatchObject({
+            status: 'accepted',
+          });
+        release[0].resolve();
+        await entered[1].promise;
+        const order = [
+          'first',
+          ...Array.from({ length: count }, (_, index) => `guided-${index + 1}`),
+          'waiting',
+        ];
+        expect(
+          state.requests[1]!.messages.filter((message) => message.role === 'user'),
+        ).toMatchObject(order.map((id) => ({ content: `Question ${id}` })));
+        for (let index = 1; index <= count; index++) {
+          expect((await runtime.message(lane, `answer-guided-${index}`))?.turn).toMatchObject({
+            hasAssistant: true,
+            status: 'completed',
+            parts: [],
+            metadata: { parentMessageId: `answer-${order[index - 1]}` },
+          });
+        }
+        expect((await runtime.message(lane, 'answer-waiting'))?.turn).toMatchObject({
+          hasAssistant: true,
+          status: 'running',
+          parts: [],
+          metadata: { parentMessageId: `answer-guided-${count}` },
+        });
+        release[1].resolve();
+        await completed.promise;
+        await observation.unsubscribe();
+        await runtime.close();
+        runtime = state.create();
+        await runtime.initialize(state.database, state.ports);
+        await runtime.configure(lane, seed.configuration);
+        for (let index = 1; index <= count; index++) {
+          expect((await runtime.message(lane, `answer-guided-${index}`))?.turn).toMatchObject({
+            hasAssistant: true,
+            status: 'completed',
+            parts: [],
+            metadata: { parentMessageId: `answer-${order[index - 1]}` },
+          });
+        }
+        expect((await runtime.message(lane, 'answer-waiting'))?.turn).toMatchObject({
+          hasAssistant: true,
+          status: 'completed',
+          parts: [{ type: 'text', text: 'Response 2' }],
+          metadata: { parentMessageId: `answer-guided-${count}` },
+        });
+        expect(state.requests).toHaveLength(2);
+      } finally {
+        for (const item of release) item.resolve();
+        await observation.unsubscribe();
+        await runtime.close();
+      }
+    },
+  );
+
+  test('steering waits for the running tool, changes subsequent ownership and survives reopening', async () => {
+    const state = fixture();
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    const guidedModelEntered = deferred<void>();
+    const releaseGuidedModel = deferred<void>();
+    const completed = deferred<void>();
+    let calls = 0;
+    const tool: RuntimeTool = {
+      ref: { source: 'builtin', capabilityId: 'read_file' },
+      providerName: 'read_file',
+      displayName: 'Read file',
+      description: 'Read a file.',
+      inputSchema: { type: 'object', properties: {} },
+      approval: 'auto',
+      execute: async () => {
+        calls += 1;
+        if (calls === 1) {
+          entered.resolve();
+          await release.promise;
+        }
+        return { value: `Read ${calls}`, artifacts: [] };
+      },
+    };
+    const owners: string[] = [];
+    state.ports.resolveTool = async (identity) => ({
+      ...tool,
+      execute: async (...args) => {
+        owners.push(identity.requestId);
+        return tool.execute(...args);
+      },
+    });
+    const resolveModel = state.dependencies.resolveModel;
+    state.dependencies.resolveModel = async (...args) => ({
+      ...(await resolveModel(...args)),
+      streamFn: (_model, context) => {
+        state.requests.push(context);
+        const count = state.requests.length;
+        const reason = count <= 2 ? 'toolUse' : 'stop';
+        const stream = new AssistantMessageEventStream();
+        const finish = () => {
+          stream.push({
+            type: 'done',
+            reason,
+            message: {
+              ...emptyAssistantMessage(wire),
+              stopReason: reason,
+              content:
+                count <= 2
+                  ? [
+                      { type: 'text', text: `Working ${count}` },
+                      { type: 'toolCall', id: `read-${count}`, name: 'read_file', arguments: {} },
+                    ]
+                  : [{ type: 'text', text: 'Guided answer' }],
+            },
+          });
+          stream.end();
+        };
+        if (count === 2) {
+          guidedModelEntered.resolve();
+          void releaseGuidedModel.promise.then(finish);
+        } else finish();
+        return stream;
+      },
+    });
+    let runtime = state.create();
+    await runtime.initialize(state.database, state.ports);
+    await runtime.ensureConversation({
+      ...seed,
+      configuration: { ...seed.configuration, tools: [tool] },
+    });
+    const observation = await runtime.observe(lane, (event) => {
+      if (
+        event.type === 'turn.updated' &&
+        event.turn.identity.requestId === 'second:steer' &&
+        event.turn.status === 'completed'
+      )
+        completed.resolve();
+    });
+    try {
+      await runtime.submit(lane, input('first'));
+      await entered.promise;
+      await runtime.submit(lane, {
+        ...input('second'),
+        metadata: { parentMessageId: 'answer-first' },
+      });
+      expect(await runtime.steer(lane, 'second')).toMatchObject({ status: 'accepted' });
+      expect(state.requests).toHaveLength(1);
+      expect((await runtime.message(lane, 'answer-second'))?.turn).toMatchObject({
+        assistantMessageId: 'answer-second',
+        hasAssistant: true,
+        status: 'queued',
+        parts: [],
+      });
+      release.resolve();
+      await guidedModelEntered.promise;
+      expect((await runtime.message(lane, 'answer-second'))?.turn).toMatchObject({
+        assistantMessageId: 'answer-second',
+        hasAssistant: true,
+        status: 'running',
+        parts: [],
+      });
+      releaseGuidedModel.resolve();
+      await completed.promise;
+      expect(owners).toEqual(['first', 'second:steer']);
+      expect(JSON.stringify(state.requests[1])).toContain('Question second');
+      await observation.unsubscribe();
+      await runtime.close();
+      runtime = state.create();
+      await runtime.initialize(state.database, state.ports);
+      await runtime.configure(lane, { ...seed.configuration, tools: [tool] });
+      const first = (await runtime.message(lane, 'answer-first'))!.turn;
+      const second = (await runtime.message(lane, 'answer-second'))!.turn;
+      expect(first.status).toBe('completed');
+      expect(first.parts.flatMap((part) => (part.type === 'text' ? [part.text] : []))).toEqual([
+        'Working 1',
+      ]);
+      expect(second.parts.flatMap((part) => (part.type === 'text' ? [part.text] : []))).toEqual([
+        'Working 2',
+        'Guided answer',
+      ]);
+      expect(second.userMessageId).toBe('user-second');
+      expect(second.assistantMessageId).toBe('answer-second');
+    } finally {
+      release.resolve();
+      releaseGuidedModel.resolve();
+      await observation.unsubscribe();
+      await runtime.close();
+    }
+  });
+
+  test('estimates rebuild materials without opening storage or requesting a model', () => {
+    const state = fixture();
+    const runtime = state.create();
+    expect(
+      runtime.estimateStoredContextUsage({
+        model: reference,
+        instructions: 'Help.',
+        contextCheckpoint: null,
+        history: [
+          {
+            turnId: 'earlier',
+            messages: [
+              { role: 'user', parts: [{ type: 'text', text: 'Question.' }] },
+              {
+                role: 'assistant',
+                parts: [
+                  { type: 'text', text: 'Searching. ' },
+                  { type: 'text', text: 'Cherries are red.' },
+                ],
+                contextTokens: 100,
+              },
+            ],
+          },
+        ],
+      }),
+    ).toBe(13);
+    expect(
+      runtime.estimateStoredContextUsage({
+        model: reference,
+        instructions: 'Help.',
+        contextCheckpoint: {
+          version: 1,
+          anchorTurnId: 'earlier',
+          payload: {
+            kind: 'pi-durable-context-v1',
+            messages: [{ role: 'user', content: 'Summary', timestamp: 1 }],
+          },
+        },
+        history: [
+          {
+            turnId: 'tail',
+            messages: [
+              { role: 'user', parts: [{ type: 'text', text: 'Next...' }] },
+              {
+                role: 'assistant',
+                parts: [{ type: 'text', text: 'Answer.' }],
+                contextTokens: 100,
+              },
+            ],
+          },
+        ],
+      }),
+    ).toBe(8);
+    expect(state.requests).toHaveLength(0);
+    expect(state.ports.recordUsage).not.toHaveBeenCalled();
+  });
+
+  test('retained-tool retry has one quoted historical question and a plain continuation after reopen', async () => {
+    const f = fixture();
+    let runtime = f.create();
+    const quoted = formatMessageQuote('Explain', [
+      { id: 'q', sourceMessageId: '00000000-0000-7000-8000-000000000001', text: 'Snapshot' },
+    ]);
+    await runtime.initialize(f.database, f.ports);
+    try {
+      await runtime.ensureConversation({
+        ...seed,
+        history: {
+          history: [
+            {
+              turnId: 'question',
+              messages: [{ role: 'user', parts: [{ type: 'text', text: quoted }] }],
+            },
+          ],
+          contextCheckpoint: null,
+          referencedFileEntryIds: [],
+        },
+      });
+      await runtime.close();
+      runtime = f.create();
+      await runtime.initialize(f.database, f.ports);
+      await runtime.configure(lane, seed.configuration);
+      await submitAndWait(runtime, {
+        ...input('resume-quote'),
+        input: [{ type: 'text', text: quoted }],
+        resume: [
+          {
+            type: 'tool-call',
+            toolCallId: 'call',
+            toolRef: { source: 'builtin', capabilityId: 'read_file' },
+            providerName: 'read_file',
+            input: {},
+          },
+          {
+            type: 'tool-result',
+            toolCallId: 'call',
+            output: { value: 'Completed tool result', artifacts: [] },
+            isError: false,
+          },
+        ],
+      });
+      expect(JSON.stringify(f.requests.at(-1)).match(/> Snapshot/g)).toHaveLength(1);
+      expect(JSON.stringify(f.requests.at(-1))).toContain('Continue the interrupted answer');
+      expect(f.ports.resolveTool).not.toHaveBeenCalled();
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  test('reply edits survive reopening and native forks without another model call or provider identity change', async () => {
+    const f = fixture();
+    let runtime = f.create();
+    await runtime.initialize(f.database, f.ports);
+    await runtime.ensureConversation(seed);
+    runtime.resume();
+    try {
+      await submitAndWait(runtime, input('one'));
+      const original = (await runtime.message(lane, 'answer-one'))!.turn;
+      const parts = original.parts.flatMap((part) =>
+        part.type === 'text' ? [{ id: part.id, text: part.text }] : [],
+      );
+      expect(
+        await runtime.editReply(lane, {
+          messageId: 'answer-one',
+          revision: 0,
+          parts: [{ id: parts[0]!.id, expectedText: parts[0]!.text, text: 'Corrected' }],
+        }),
+      ).toEqual({ contextCheckpoint: null });
+      expect(f.requests).toHaveLength(1);
+      expect(await runtime.revision(lane)).toBe(1);
+      const edited = (await runtime.message(lane, 'answer-one'))!.turn;
+      expect(edited.parts).toContainEqual({
+        ...parts[0],
+        type: 'text',
+        text: 'Corrected',
+        state: 'done',
+      });
+      expect(edited.usage).toEqual(original.usage);
+      expect(edited.answerBoundary).not.toBe(original.answerBoundary);
+      await runtime.close();
+      runtime = f.create();
+      await runtime.initialize(f.database, f.ports);
+      runtime.resume();
+      const reopened = (await runtime.message(lane, 'answer-one'))!.turn;
+      expect(reopened.parts).toEqual(edited.parts);
+      const again = await runtime.editReply(lane, {
+        messageId: 'answer-one',
+        revision: 1,
+        parts: [{ id: parts[0]!.id, expectedText: 'Corrected', text: 'Corrected twice' }],
+      });
+      expect(again).toBeDefined();
+      // The Host reinstalls configuration before continuing a reopened copy.
+      await runtime.configure(lane, seed.configuration);
+      await submitAndWait(runtime, input('two'));
+      expect(
+        f.requests[1]!.messages.some(
+          (message) =>
+            message.role === 'assistant' &&
+            message.content.some(
+              (block) => block.type === 'text' && block.text === 'Corrected twice',
+            ),
+        ),
+      ).toBe(true);
+      expect(f.providerSessions[0]).toEqual(expect.any(String));
+      expect(f.providerSessions[1]).toBe(f.providerSessions[0]);
+      const boundary = (await runtime.message(lane, 'answer-one'))!.turn.answerBoundary!;
+      const fork = runtimeLane('session', 1);
+      await runtime.forkConversation({
+        ...seed,
+        lane: fork,
+        revision: 2,
+        from: { lane, boundary },
+        referencedFileEntryIds: [],
+      });
+      expect((await runtime.message(fork, 'answer-one'))!.turn.parts).toContainEqual({
+        id: parts[0]!.id,
+        type: 'text',
+        text: 'Corrected twice',
+        state: 'done',
+      });
+      expect(await runtime.message(fork, 'answer-two')).toBeUndefined();
+    } finally {
+      await runtime.close();
+    }
+  });
+  test('an earlier answer edit reaches later requests while forks before it fall back to rebuilding', async () => {
+    const f = fixture();
+    const runtime = f.create();
+    await runtime.initialize(f.database, f.ports);
+    await runtime.ensureConversation(seed);
+    runtime.resume();
+    try {
+      await submitAndWait(runtime, input('one'));
+      await submitAndWait(runtime, input('two'));
+      const original = (await runtime.message(lane, 'answer-one'))!.turn;
+      const [text] = original.parts.flatMap((part) =>
+        part.type === 'text' ? [{ id: part.id, text: part.text }] : [],
+      );
+      expect(
+        await runtime.editReply(lane, {
+          messageId: 'answer-one',
+          revision: 0,
+          parts: [{ id: text!.id, expectedText: text!.text, text: 'Corrected' }],
+        }),
+      ).toEqual({ contextCheckpoint: null });
+      expect(await runtime.revision(lane)).toBe(1);
+      // A fork through the first answer could not see the edit appended after the second.
+      expect((await runtime.message(lane, 'answer-one'))!.turn.answerBoundary).toBeNull();
+      const boundary = (await runtime.message(lane, 'answer-two'))!.turn.answerBoundary!;
+      const fork = runtimeLane('session', 1);
+      await runtime.forkConversation({
+        ...seed,
+        lane: fork,
+        revision: 1,
+        from: { lane, boundary },
+        referencedFileEntryIds: [],
+      });
+      const answers = () =>
+        f.requests
+          .at(-1)!
+          .messages.flatMap((message) =>
+            message.role === 'assistant'
+              ? message.content.flatMap((block) => (block.type === 'text' ? [block.text] : []))
+              : [],
+          );
+      await submitAndWait(runtime, input('three'));
+      expect(answers()).toEqual(['Corrected', 'Response 2']);
+      expect(f.providerSessions[2]).toBe(f.providerSessions[0]);
+      // The fork inherits the edit natively, and can edit that inherited answer again.
+      await submitAndWait(runtime, input('fork-one'), 'completed', fork);
+      expect(answers()).toEqual(['Corrected', 'Response 2']);
+      expect(
+        await runtime.editReply(fork, {
+          messageId: 'answer-one',
+          revision: 1,
+          parts: [{ id: text!.id, expectedText: 'Corrected', text: 'Inherited edit' }],
+        }),
+      ).toBeDefined();
+      await submitAndWait(runtime, input('fork-two'), 'completed', fork);
+      expect(answers()).toEqual(['Inherited edit', 'Response 2', 'Response 4']);
+      // The source copy keeps its own history.
+      await submitAndWait(runtime, input('four'));
+      expect(answers()).toEqual(['Corrected', 'Response 2', 'Response 3']);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  test('releases late startup storage without opening the engine after cancellation', async () => {
+    const f = fixture();
+    const storage = deferred<ReopenableMemoryStorage>();
+    const close = jest.spyOn(f.storage, 'close');
+    const open = jest.spyOn(PiDurableRuntime, 'open');
+    const runtime = new PiDurableAgentRuntime(f.dependencies, () => storage.promise);
+    const controller = new AbortController();
+    const initializing = runtime.initialize(f.database, f.ports, controller.signal);
+    controller.abort(new Error('Host replaced'));
+    storage.resolve(f.storage);
+
+    try {
+      await expect(initializing).rejects.toThrow('Host replaced');
+      await runtime.close();
+      expect(close).toHaveBeenCalledTimes(1);
+      expect(open).not.toHaveBeenCalled();
+      expect(f.ports.recordUsage).not.toHaveBeenCalled();
+    } finally {
+      open.mockRestore();
+      close.mockRestore();
+    }
+  });
+
+  test('migrates an unfinished v1 conversation across midnight without resetting loaded instructions', async () => {
+    const state = fixture();
+    const now = jest.spyOn(Date, 'now').mockReturnValue(new Date(2026, 11, 31, 23, 59).getTime());
+    const tools: RuntimeTool[] = [
+      {
+        ref: { source: 'builtin', capabilityId: 'find_skills' },
+        providerName: 'find_skills',
+        displayName: 'Find skills',
+        description: 'Find available skills.',
+        inputSchema: { type: 'object', properties: {} },
+        approval: 'auto',
+        deferred: true,
+        execute: async () => {
+          throw new Error('Recovery must not replay tools.');
+        },
+      },
+    ];
+    const instructions = buildAgentSystemPrompt({
+      agentInstructions: 'Help.',
+      appLanguage: 'en-US',
+      tools,
+    });
+    const legacyInstructions = instructions.replace(
+      '\n\n## Response Language\n',
+      '\n\n## Current Date\n\nThe current local date is `2026-12-31`.\n\n## Response Language\n',
+    );
+    const initial = { key: 'skill:selected', text: 'Selected skill body.' };
+    const loaded = { key: 'plugin:loaded', text: 'Guide loaded during the unfinished turn.' };
+    const legacy = await PiDurableRuntime.open(state.storage, {
+      models: createModels({
+        authContext: { env: async () => undefined, fileExists: async () => false },
+      }),
+      registry: createRegistry(),
+    });
+    const runtime = state.create();
+    try {
+      const conversation = await legacy.ensureConversation({
+        sessionId: 'session',
+        revision: seed.revision,
+        agent: {
+          model: { provider: reference.providerId, modelId: reference.modelId },
+          extensions: [{ name: 'cherry.capabilities:session' }],
+          instructions: legacyInstructions,
+        },
+        configuration: {
+          ...seed.configuration,
+          version: 1,
+          instructions: legacyInstructions,
+          initialInstructions: [initial],
+          tools: tools.map(piToolBlueprint),
+        },
+        initialInstructions: [initial],
+      });
+      // Seed a persisted run without scheduling it, as if the previous process closed before prepare.
+      const submission = input('unfinished');
+      const metadata = piSubmissionMetadata(submission, tools);
+      const submissionMetadata = defineDocFamily<{ value: JsonObject }, JsonObject>({
+        kind: 'cherry.submission',
+        version: 1,
+        scope: 'session',
+        checkpointWhen: () => false,
+        family: true,
+        initial: (value) => ({ value }),
+      });
+      await conversation.commit(async (tx) => {
+        const agent = await tx.doc(AgentDoc, conversation.id);
+        agent.modelTools = { add: ['find_skills'] };
+        const live = await tx.doc(LiveDoc, conversation.id);
+        const retained = await tx.doc(ToolInstructions, conversation.id);
+        retained.sections.push(loaded);
+        await tx.doc(submissionMetadata, `${conversation.id}:${submission.requestId}`, metadata);
+        const entry = await tx.appendEntry(UserEntry, conversation.id, {
+          model: [{ role: 'user', content: 'Question unfinished', timestamp: Date.now() }],
+        });
+        await tx.appendEntry(SystemEntry, conversation.id, {
+          model: [
+            {
+              role: 'system',
+              content: '',
+              sections: { instructions: `<instructions>\n${legacyInstructions}\n</instructions>` },
+              timestamp: Date.now(),
+            },
+          ],
+        });
+        const record = await tx.createSubmission({
+          conversationId: conversation.id,
+          type: 'input',
+          status: 'placed',
+          requestId: submission.requestId,
+          entry: entry.id,
+        });
+        const taskId = await tx.createTask(
+          GenerationTask,
+          {},
+          {
+            ownership: { kind: 'conversation' },
+            conversationId: conversation.id,
+          },
+        );
+        live.run = { taskId, inputs: [record.id], turns: 0 };
+      }, BACKGROUND_CONTEXT);
+      await legacy.close();
+
+      now.mockReturnValue(new Date(2027, 0, 1, 0, 1).getTime());
+      await runtime.initialize(state.database, state.ports);
+      expect((await runtime.configuration(lane)).instructions).toBe(instructions);
+      expect(await runtime.unfinishedLanes()).toEqual([lane]);
+      expect(state.requests).toHaveLength(0);
+      await runtime.close();
+
+      // The migration is durable; reopening again must retain loaded content and tool selection.
+      const inspection = await PiDurableRuntime.open(state.storage, {
+        models: createModels({
+          authContext: { env: async () => undefined, fileExists: async () => false },
+        }),
+        registry: createRegistry(),
+      });
+      try {
+        expect(await inspection.configuration('session')).toMatchObject({
+          version: 2,
+          instructions,
+        });
+        const restored = (await inspection.conversation('session'))!;
+        await restored.commit(async (tx) => {
+          const agent = await tx.doc(AgentDoc, restored.id);
+          expect(agent.instructions).toBeUndefined();
+          expect(agent.modelTools).toEqual({ add: ['find_skills'] });
+          expect((await tx.doc(ToolInstructions, restored.id)).sections).toEqual([initial, loaded]);
+        }, BACKGROUND_CONTEXT);
+      } finally {
+        await inspection.close();
+      }
+
+      await runtime.initialize(state.database, state.ports);
+      const completed = deferred<void>();
+      const observation = await runtime.observe(lane, (event) => {
+        if (event.type === 'turn.updated' && event.turn.status === 'completed') completed.resolve();
+      });
+      try {
+        runtime.resume();
+        await completed.promise;
+        expect(state.requests).toHaveLength(1);
+        const prompt = getCurrentSystemPrompt(state.requests[0]!.messages);
+        expect(prompt.match(/# Cherry Studio Mobile Runtime/g)).toHaveLength(1);
+        expect(prompt).toContain('2027-01-01');
+        expect(prompt).not.toContain('2026-12-31');
+        expect(prompt).toContain(initial.text);
+        expect(prompt).toContain(loaded.text);
+        expect(getCurrentTools(state.requests[0]!.messages).map((tool) => tool.name)).toContain(
+          'find_skills',
+        );
+      } finally {
+        await observation.unsubscribe();
+      }
+    } finally {
+      await legacy.close();
+      await runtime.close();
+      now.mockRestore();
+    }
+  });
+
+  test('replays an interrupted prepared request unchanged, then refreshes the date for new input', async () => {
+    const state = fixture();
+    const now = jest.spyOn(Date, 'now').mockReturnValue(new Date(2026, 11, 31, 23, 59).getTime());
+    const started = deferred<void>();
+    const resolveModel = state.dependencies.resolveModel;
+    let interrupt = true;
+    state.dependencies.resolveModel = async (...args) => {
+      const resolved = await resolveModel(...args);
+      return {
+        ...resolved,
+        streamFn: withPiStreamIdleTimeout((model, context, options) => {
+          if (!interrupt) return resolved.streamFn(model, context, options);
+          interrupt = false;
+          state.requests.push(context);
+          started.resolve();
+          return new AssistantMessageEventStream();
+        }),
+      };
+    };
+    let runtime = state.create();
+    try {
+      await runtime.initialize(state.database, state.ports);
+      await runtime.ensureConversation(seed);
+      await runtime.submit(lane, input('interrupted'));
+      await started.promise;
+      expect(getCurrentSystemPrompt(state.requests[0]!.messages)).toContain('2026-12-31');
+      await runtime.close();
+
+      now.mockReturnValue(new Date(2027, 0, 1, 0, 1).getTime());
+      runtime = state.create();
+      await runtime.initialize(state.database, state.ports);
+      const completed = deferred<void>();
+      const observation = await runtime.observe(lane, (event) => {
+        if (event.type === 'turn.updated' && event.turn.status === 'completed') completed.resolve();
+      });
+      try {
+        runtime.resume();
+        await completed.promise;
+        expect(state.requests).toHaveLength(2);
+        expect(state.requests[1]!.messages).toEqual(state.requests[0]!.messages);
+      } finally {
+        await observation.unsubscribe();
+      }
+
+      await submitAndWait(runtime, input('next'));
+      const prompt = getCurrentSystemPrompt(state.requests[2]!.messages);
+      expect(prompt).toContain('2027-01-01');
+      expect(prompt).not.toContain('2026-12-31');
+    } finally {
+      await runtime.close();
+      now.mockRestore();
+    }
+  });
+
+  test.each(['openai-responses', 'openai-completions'] as const)(
+    'preserves the %s request prefix across midnight and reopen, updating only the date',
+    async (api) => {
+      const state = fixture();
+      const now = jest.spyOn(Date, 'now').mockReturnValue(new Date(2026, 11, 31, 23, 59).getTime());
+      type Payload = { input?: unknown[]; messages?: unknown[] };
+      const payloads: unknown[] = [];
+      const stream = (
+        api === 'openai-responses' ? streamResponses : streamCompletions
+      ) as PiStreamFn;
+      const resolveModel = state.dependencies.resolveModel;
+      state.dependencies.resolveModel = async (...args) => {
+        const resolved = await resolveModel(...args);
+        return {
+          ...resolved,
+          model: {
+            ...wire,
+            api,
+            baseUrl: 'https://provider.example.test/v1',
+            compat: { supportsDeveloperRole: false, supportsMidConvoSystemMessages: true },
+          },
+          streamFn: async (model, context, options) => {
+            const serialized = await stream(model, context, {
+              ...options,
+              apiKey: 'test-key',
+              maxRetries: 0,
+              fetch: async () => {
+                throw new Error('This test must not contact a provider.');
+              },
+              onPayload: (payload) => {
+                payloads.push(payload);
+                throw new Error('Request captured before transport.');
+              },
+            });
+            await serialized.result();
+            return resolved.streamFn(model, context, options);
+          },
+        };
+      };
+      let runtime = state.create();
+      try {
+        await runtime.initialize(state.database, state.ports);
+        await runtime.ensureConversation(seed);
+        await submitAndWait(runtime, input('first'));
+        const first = payloads[0] as Payload;
+        expect(JSON.stringify(first)).toContain('2026-12-31');
+        expect(JSON.stringify(first).indexOf('Help.')).toBeLessThan(
+          JSON.stringify(first).indexOf('<current-date>'),
+        );
+
+        await runtime.close();
+        now.mockReturnValue(new Date(2027, 0, 1, 0, 1).getTime());
+        runtime = state.create();
+        await runtime.initialize(state.database, state.ports);
+        await runtime.configure(lane, seed.configuration);
+        await submitAndWait(runtime, input('second'));
+        const firstItems = first.input ?? first.messages!;
+        const second = payloads[1] as Payload;
+        expect((second.input ?? second.messages!).slice(0, firstItems.length)).toEqual(firstItems);
+        const updates = state.requests[1]!.messages.filter((message) => message.role === 'system');
+        expect(updates).toHaveLength(2);
+        expect(updates[1]!.sections).toEqual({
+          'current-date':
+            '<current-date>\nThe current local date is `2027-01-01`.\n</current-date>',
+        });
+
+        await submitAndWait(runtime, input('third'));
+        expect(state.requests[2]!.messages.filter((message) => message.role === 'system')).toEqual(
+          updates,
+        );
+      } finally {
+        await runtime.close();
+        now.mockRestore();
+      }
+    },
+  );
+
+  test('keeps tool return contracts in the stored configuration across reopen', async () => {
+    const state = fixture();
+    const outputSchema = { type: 'object', required: ['fileEntryId'] };
+    const tool: RuntimeTool = {
+      ref: { source: 'builtin', capabilityId: 'create_document' },
+      providerName: 'create_document',
+      displayName: 'Create document',
+      description: '',
+      inputSchema: { type: 'object' },
+      outputSchema,
+      approval: 'auto',
+      execute: async () => ({ value: null, artifacts: [] }),
+    };
+    const first = state.create();
+    await first.initialize(state.database, state.ports);
+    await first.ensureConversation({
+      ...seed,
+      configuration: { ...seed.configuration, tools: [tool] },
+    });
+    // The Host compares this contract before queueing input behind a running turn.
+    expect((await first.configuration(lane)).tools[0]).toMatchObject({ outputSchema });
+    await first.close();
+    const reopened = state.create();
+    await reopened.initialize(state.database, state.ports);
+    try {
+      expect((await reopened.configuration(lane)).tools[0]).toMatchObject({ outputSchema });
+    } finally {
+      await reopened.close();
+    }
+  });
+
+  test('starts the next queued input after a terminal provider failure without resubmission', async () => {
+    const state = fixture();
+    const resolveModel = state.dependencies.resolveModel;
+    const firstStream = new AssistantMessageEventStream();
+    const started = deferred<void>();
+    let calls = 0;
+    const contexts: TranscriptContext[] = [];
+    const quoted = (name: string) =>
+      formatMessageQuote(`Request ${name}`, [
+        {
+          id: name,
+          sourceMessageId: '00000000-0000-7000-8000-000000000001',
+          text: `Snapshot ${name}`,
+        },
+      ]);
+    state.dependencies.resolveModel = async (...args) => ({
+      ...(await resolveModel(...args)),
+      streamFn: (_model, context) => {
+        contexts.push(context);
+        calls++;
+        if (calls === 1) {
+          started.resolve();
+          return firstStream;
+        }
+        const stream = new AssistantMessageEventStream();
+        stream.push({
+          type: 'done',
+          reason: 'stop',
+          message: {
+            ...emptyAssistantMessage(wire),
+            stopReason: 'stop',
+            content: [{ type: 'text', text: 'Second answer' }],
+          },
+        });
+        return stream;
+      },
+    });
+    const runtime = state.create();
+    await runtime.initialize(state.database, state.ports);
+    await runtime.ensureConversation(seed);
+    runtime.resume();
+    const completed = deferred<void>();
+    const observed = await runtime.observe(seed.lane, (event) => {
+      if (
+        event.type === 'turn.updated' &&
+        event.turn.identity.requestId === 'second' &&
+        event.turn.status === 'completed'
+      )
+        completed.resolve();
+    });
+    try {
+      await runtime.submit(seed.lane, {
+        ...input('first'),
+        input: [{ type: 'text', text: quoted('first') }],
+      });
+      await started.promise;
+      await runtime.submit(seed.lane, {
+        ...input('second'),
+        input: [{ type: 'text', text: quoted('second') }],
+      });
+      firstStream.push(
+        providerErrorEvent(emptyAssistantMessage(wire), {
+          message: 'Invalid request',
+          retryable: false,
+        }),
+      );
+      await completed.promise;
+      const history = await runtime.history(seed.lane, { limit: 10 });
+      expect(history.turns.map((turn) => [turn.identity.requestId, turn.status])).toEqual([
+        ['second', 'completed'],
+        ['first', 'failed'],
+      ]);
+      expect(calls).toBe(2);
+      expect(JSON.stringify(contexts[0]).match(/> Snapshot /g)).toHaveLength(1);
+      expect(JSON.stringify(contexts[1]).match(/> Snapshot /g)).toHaveLength(2);
+      expect(JSON.stringify(contexts[1])).toContain('Snapshot second');
+    } finally {
+      await observed.unsubscribe();
+      await runtime.close();
+    }
+  });
+
+  test.each(['openai-completions', 'openai-responses'] as const)(
+    'retains explicit Skill instructions, built-in tools, MCP discovery and user input in the serialized %s request',
+    async (api) => {
+      const state = fixture();
+      const execute = jest.fn(async () => ({ value: null, artifacts: [] }));
+      const selectedSkill: SkillTurnEntry = {
+        id: '12345678-1234-4234-8234-123456789abc',
+        name: 'grill-me',
+        description: 'Interview the user about a plan.',
+        invocation: { modelInvocable: true, userInvocable: true },
+        contentHash: 'abcdef0123456789',
+        folderName: 'grill-me',
+        files: ['SKILL.md'],
+        limitations: { scripts: [], unavailableTools: [] },
+      };
+      const selectedInstructions =
+        'Ask one question at a time. Recommend an answer for each question.';
+      const availableInstructions = 'Write a detailed launch checklist before answering.';
+      const scope: SkillTurnScope = {
+        entries: [
+          selectedSkill,
+          {
+            ...selectedSkill,
+            id: '23456789-2345-4345-8345-23456789abcd',
+            name: 'launch-checklist',
+          },
+        ],
+        readInstructions: async (id) =>
+          id === selectedSkill.id ? selectedInstructions : availableInstructions,
+        readFile: async () => null,
+      };
+      const tools: RuntimeTool[] = [
+        {
+          ref: { source: 'builtin', capabilityId: 'read_file' },
+          providerName: 'read_file',
+          displayName: 'Read file',
+          description: 'Read a local file.',
+          inputSchema: { type: 'object', properties: {} },
+          approval: 'auto',
+          execute,
+        },
+        ...createSkillTools(scope, { loadedSkillIds: [selectedSkill.id] }),
+        {
+          ref: { source: 'mcp', serverId: 'github', rawToolName: 'get_me' },
+          providerName: 'mcp_github_get_me',
+          displayName: 'GitHub account',
+          description: 'GitHub: Get the authenticated account.',
+          inputSchema: { type: 'object', properties: {} },
+          approval: 'ask',
+          execute,
+        },
+      ];
+      const skills = {
+        scope,
+        selected: [{ entry: selectedSkill, instructions: selectedInstructions }],
+      };
+      const pluginGuides = [
+        {
+          pluginId: 'github',
+          revision: 3,
+          serverId: 'github',
+          content: '# GitHub\nUse get_me for account context.',
+          overview: 'GitHub repository and PR context; honor the requested branch.',
+        },
+      ];
+      tools.push(createLoadWorkflowTool(getPluginWorkflows(pluginGuides)));
+      const instructions = buildAgentSystemPrompt({
+        agentInstructions: 'Help me inspect my GitHub repositories.',
+        appLanguage: 'zh-CN',
+        tools,
+        skills,
+        pluginGuides,
+      });
+      const adapter = resolvePiApiAdapter(
+        api === 'openai-completions' ? 'openai-chat-completions' : 'openai-responses',
+      );
+      const { streamSimple } = jest.requireActual<{ streamSimple: PiStreamFn }>(
+        `${process.cwd()}/node_modules/@earendil-works/pi-ai/dist/api/${api}.js`,
+      );
+      // Jest loads the same installed adapter through CommonJS; Metro uses its import entry.
+      const loadStream = jest.spyOn(adapter, 'loadStreamSimple').mockResolvedValue(streamSimple);
+      const capture = await bindPiStream(adapter, {
+        apiKey: 'test-key',
+        fetch: async () => {
+          throw new Error('This test must not contact a provider.');
+        },
+        headers: {},
+        maxRetries: 0,
+        maxTokens: 4096,
+      });
+      let payload: unknown;
+      const resolveModel = state.dependencies.resolveModel;
+      state.dependencies.resolveModel = async (...args) => {
+        const resolved = await resolveModel(...args);
+        return {
+          ...resolved,
+          model: { ...wire, api, compat: { supportsDeveloperRole: false } },
+          streamFn: async (model, context, options) => {
+            const serialized = await capture(model, context, {
+              ...options,
+              onPayload: (request) => {
+                payload = request;
+                throw new Error('Request captured before transport.');
+              },
+            });
+            await serialized.result();
+            return resolved.streamFn(model, context, options);
+          },
+        };
+      };
+      const runtime = state.create();
+      await runtime.initialize(state.database, state.ports);
+      try {
+        await runtime.ensureConversation({
+          ...seed,
+          configuration: {
+            ...seed.configuration,
+            instructions,
+            initialInstructions: buildInitialSkillInstructions(skills),
+            tools,
+          },
+        });
+        const text = '你看看我的 github 的 skenora 项目';
+        await submitAndWait(runtime, { ...input('first'), input: [{ type: 'text', text }] });
+        const serialized = JSON.stringify(payload);
+        expect(serialized).toContain(text);
+        expect(serialized).toContain('# Cherry Studio Mobile Runtime');
+        expect(serialized).toContain('<current-date>');
+        expect(serialized).toContain('zh-CN');
+        expect(serialized).toContain('Help me inspect my GitHub repositories.');
+        expect(serialized).toContain('## Reading Attachments');
+        expect(serialized).toContain('plugin:github: github workflows');
+        expect(serialized).toContain('honor the requested branch');
+        expect(serialized).not.toContain('Use get_me for account context.');
+        expect(serialized).toContain('# Tool discovery');
+        expect(serialized).toContain('grill-me');
+        expect(serialized).toContain(selectedInstructions);
+        expect(serialized).toContain('launch-checklist');
+        expect(serialized).not.toContain(availableInstructions);
+        const request = payload as {
+          tools: { name?: string; function?: { name: string } }[];
+          messages?: { role: string }[];
+          input?: { role?: string }[];
+        };
+        expect(request.tools.map((tool) => tool.name ?? tool.function?.name)).toEqual([
+          'read_file',
+          'list_local_skills',
+          'load_skill',
+          'list_skill_files',
+          'read_skill_file',
+          'load_workflow',
+          'tool_search',
+        ]);
+        expect((request.messages ?? request.input)?.map((message) => message.role)).toEqual([
+          'system',
+          'user',
+        ]);
+        expect(execute).not.toHaveBeenCalled();
+      } finally {
+        await runtime.close();
+        loadStream.mockRestore();
+      }
+    },
+  );
+
+  test('completes more than 64 tool rounds and 256 calls without a forced final response', async () => {
+    const state = fixture();
+    const execute = jest.fn(async () => ({ value: 'Read.', artifacts: [] }));
+    const tool: RuntimeTool = {
+      ref: { source: 'builtin', capabilityId: 'read_file' },
+      providerName: 'read_file',
+      displayName: 'Read file',
+      description: 'Read a file.',
+      inputSchema: { type: 'object', properties: {} },
+      approval: 'auto',
+      execute,
+    };
+    state.ports.resolveTool = async () => tool;
+    const resolveModel = state.dependencies.resolveModel;
+    let requests = 0;
+    state.dependencies.resolveModel = async (...args) => ({
+      ...(await resolveModel(...args)),
+      streamFn: (_model, context) => {
+        requests += 1;
+        state.requests.push(context);
+        const stream = new AssistantMessageEventStream();
+        const reason = requests <= 65 ? 'toolUse' : 'stop';
+        stream.push({
+          type: 'done',
+          reason,
+          message: {
+            ...emptyAssistantMessage(wire),
+            stopReason: reason,
+            content:
+              reason === 'toolUse'
+                ? Array.from({ length: 4 }, (_, index) => ({
+                    type: 'toolCall' as const,
+                    id: `read-${requests}-${index}`,
+                    name: 'read_file',
+                    arguments: {},
+                  }))
+                : [{ type: 'text', text: 'Read all 260 files.' }],
+          },
+        });
+        stream.end();
+        return stream;
+      },
+    });
+    const runtime = state.create();
+    await runtime.initialize(state.database, state.ports);
+    await runtime.ensureConversation({
+      ...seed,
+      configuration: { ...seed.configuration, tools: [tool] },
+    });
+    const terminal = deferred<string>();
+    const observation = await runtime.observe(lane, (event) => {
+      if (event.type === 'turn.updated' && ['completed', 'failed'].includes(event.turn.status))
+        terminal.resolve(event.turn.status);
+    });
+    try {
+      await runtime.submit(lane, input('long'));
+      expect(await terminal.promise).toBe('completed');
+      expect(requests).toBe(66);
+      expect(execute).toHaveBeenCalledTimes(260);
+      expect(JSON.stringify(state.requests)).not.toContain('tool budget');
+      expect((await runtime.message(lane, 'answer-long'))?.turn.parts).toContainEqual(
+        expect.objectContaining({ type: 'text', text: 'Read all 260 files.' }),
+      );
+    } finally {
+      await observation.unsubscribe();
+      await runtime.close();
+    }
+  });
+
+  test('persists failed groups and resets them for the next input after reopening', async () => {
+    const state = fixture();
+    const executed: string[] = [];
+    const tools: RuntimeTool[] = ['web', 'files'].map((group) => ({
+      ref: { source: 'builtin', capabilityId: group },
+      providerName: group,
+      displayName: group,
+      description: `Call ${group}.`,
+      inputSchema: { type: 'object', properties: {} },
+      approval: 'auto',
+      failureGroup: group,
+      execute: async () => {
+        executed.push(group);
+        return {
+          value: null,
+          artifacts: [],
+          failure: {
+            scope: 'tool',
+            error: {
+              code: 'tool_execution_error',
+              message: `${group} unavailable.`,
+              retryable: false,
+              origin: 'tool',
+            },
+          },
+        };
+      },
+    }));
+    state.ports.resolveTool = async (_identity, ref) =>
+      tools.find(
+        (tool) =>
+          tool.ref.source === 'builtin' &&
+          ref.source === 'builtin' &&
+          tool.ref.capabilityId === ref.capabilityId,
+      )!;
+    const resolveModel = state.dependencies.resolveModel;
+    // Each repeated call must be denied. In the second input, a files failure must not retain
+    // the previous input's web failure when the stored document switches to the new input.
+    const calls = ['web', 'web', undefined, 'files', 'web', 'web', undefined];
+    let requests = 0;
+    state.dependencies.resolveModel = async (...args) => ({
+      ...(await resolveModel(...args)),
+      streamFn: () => {
+        const name = calls[requests++];
+        const reason = name ? 'toolUse' : 'stop';
+        const stream = new AssistantMessageEventStream();
+        stream.push({
+          type: 'done',
+          reason,
+          message: {
+            ...emptyAssistantMessage(wire),
+            stopReason: reason,
+            content: name
+              ? [{ type: 'toolCall', id: `call-${requests}`, name, arguments: {} }]
+              : [{ type: 'text', text: 'Tools unavailable.' }],
+          },
+        });
+        stream.end();
+        return stream;
+      },
+    });
+    let runtime = state.create();
+    await runtime.initialize(state.database, state.ports);
+    try {
+      await runtime.ensureConversation({
+        ...seed,
+        configuration: { ...seed.configuration, tools },
+      });
+      for (const [requestId, failedGroups] of [
+        ['first', ['web']],
+        ['second', ['files', 'web']],
+      ] as const) {
+        if (requestId === 'second') {
+          runtime = state.create();
+          await runtime.initialize(state.database, state.ports);
+          await runtime.configure(lane, { ...seed.configuration, tools });
+        }
+        await submitAndWait(runtime, input(requestId));
+        expect((await runtime.message(lane, `answer-${requestId}`))?.turn.parts).toContainEqual(
+          expect.objectContaining({ type: 'tool', providerName: 'web', state: 'denied' }),
+        );
+        await runtime.close();
+        const inspection = await PiDurableRuntime.open(state.storage, {
+          models: createModels({
+            authContext: { env: async () => undefined, fileExists: async () => false },
+          }),
+          registry: createRegistry(),
+        });
+        try {
+          const conversation = (await inspection.conversation('session'))!;
+          const record = (await inspection.inputRecord('session', requestId))!;
+          await conversation.commit(async (tx) => {
+            expect(await tx.doc(PiToolBudget, conversation.id)).toMatchObject({
+              inputId: record.id,
+              failedGroups,
+            });
+          }, BACKGROUND_CONTEXT);
+        } finally {
+          await inspection.close();
+        }
+      }
+      expect(executed).toEqual(['web', 'files', 'web']);
+      expect(requests).toBe(7);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  test('recovers a structured transient failure after a tool without repeating its action', async () => {
+    const state = fixture();
+    const execute = jest.fn(async () => ({ value: { saved: true }, artifacts: [] }));
+    const tool: RuntimeTool = {
+      ref: { source: 'builtin', capabilityId: 'write_file' },
+      providerName: 'write_file',
+      displayName: 'Write file',
+      description: 'Save a file.',
+      inputSchema: { type: 'object', properties: {} },
+      approval: 'auto',
+      execute,
+    };
+    state.ports.resolveTool = async () => tool;
+    const resolveModel = state.dependencies.resolveModel;
+    let requests = 0;
+    state.dependencies.resolveModel = async (...args) => ({
+      ...(await resolveModel(...args)),
+      streamFn: () => {
+        const stream = new AssistantMessageEventStream();
+        requests += 1;
+        if (requests === 2) {
+          stream.push(
+            providerErrorEvent(emptyAssistantMessage(wire), {
+              message: '网络连接已中断',
+              retryable: true,
+            }),
+          );
+        } else {
+          const reason = requests === 1 ? 'toolUse' : 'stop';
+          stream.push({
+            type: 'done',
+            reason,
+            message: {
+              ...emptyAssistantMessage(wire),
+              stopReason: reason,
+              content:
+                requests === 1
+                  ? [{ type: 'toolCall', id: 'save', name: 'write_file', arguments: {} }]
+                  : [{ type: 'text', text: 'Saved.' }],
+            },
+          });
+        }
+        stream.end();
+        return stream;
+      },
+    });
+    const runtime = state.create();
+    await runtime.initialize(state.database, state.ports);
+    await runtime.ensureConversation({
+      ...seed,
+      configuration: { ...seed.configuration, tools: [tool] },
+    });
+    const terminal = deferred<string>();
+    const observation = await runtime.observe(lane, (event) => {
+      if (event.type === 'turn.updated' && ['completed', 'failed'].includes(event.turn.status))
+        terminal.resolve(event.turn.status);
+    });
+    try {
+      await runtime.submit(lane, input('recovery'));
+      expect(await terminal.promise).toBe('completed');
+      expect(requests).toBe(3);
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect((await runtime.message(lane, 'answer-recovery'))?.turn.error).toBeNull();
+    } finally {
+      await observation.unsubscribe();
+      await runtime.close();
+    }
+  });
+
+  test('stopping a streamed partial settles the task and preserves the answer across reopen', async () => {
+    const state = fixture();
+    const resolveModel = state.dependencies.resolveModel;
+    let signal: AbortSignal | undefined;
+    state.dependencies.resolveModel = async (...args) => ({
+      ...(await resolveModel(...args)),
+      streamFn: withPiStreamIdleTimeout((_model, _context, options) => {
+        signal = options?.signal;
+        const stream = new AssistantMessageEventStream();
+        const partial = {
+          ...emptyAssistantMessage(wire),
+          content: [{ type: 'text' as const, text: 'Partial answer' }],
+        };
+        stream.push({ type: 'text_delta', contentIndex: 0, delta: 'Partial answer', partial });
+        // The provider deliberately ignores abort; the app adapter still owns terminal delivery.
+        return stream;
+      }),
+    });
+    let runtime = state.create();
+    await runtime.initialize(state.database, state.ports);
+    await runtime.ensureConversation(seed);
+    const partial = deferred<void>();
+    const stopped = deferred<void>();
+    const observation = await runtime.observe(lane, (event) => {
+      if (event.type !== 'turn.updated') return;
+      if (event.turn.parts.some((part) => part.type === 'text' && part.text === 'Partial answer'))
+        partial.resolve();
+      if (event.turn.status === 'cancelled') stopped.resolve();
+    });
+    try {
+      await runtime.submit(lane, input('stopped'));
+      await partial.promise;
+      await runtime.abort(lane);
+      await stopped.promise;
+      expect(signal?.aborted).toBe(true);
+      expect(await runtime.hasUnfinishedWork()).toBe(false);
+      await observation.unsubscribe();
+      await runtime.close();
+      runtime = state.create();
+      await runtime.initialize(state.database, state.ports);
+      expect((await runtime.message(lane, 'answer-stopped'))?.turn).toMatchObject({
+        status: 'cancelled',
+        parts: [{ type: 'text', text: 'Partial answer', state: 'done' }],
+      });
+      expect(await runtime.hasUnfinishedWork()).toBe(false);
+    } finally {
+      await observation.unsubscribe();
+      await runtime.close();
+    }
+  });
+  test('attributes generation to its invocation even when the request ID differs from message aliases', async () => {
+    const state = fixture();
+    const runtime = state.create();
+    await runtime.initialize(state.database, state.ports);
+    try {
+      await runtime.ensureConversation(seed);
+      await submitAndWait(runtime, input('owning-request'));
+      await runtime.drainUsage();
+      expect(state.ports.recordUsage).toHaveBeenCalledWith(
+        {
+          sessionId: 'session',
+          slot: 0,
+          turnId: 'turn-owning-request',
+          requestId: 'owning-request',
+        },
+        expect.objectContaining({ usage: expect.objectContaining({ totalTokens: 5 }) }),
+      );
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  test('opening completed history does not reconstruct old model registrations or execute requests', async () => {
+    const state = fixture();
+    let runtime = state.create();
+    await runtime.initialize(state.database, state.ports);
+    await runtime.ensureConversation(seed);
+    await submitAndWait(runtime, input('finished'));
+    await runtime.close();
+    const preflight = jest.spyOn(state.dependencies, 'preflightModel');
+    runtime = state.create();
+    await runtime.initialize(state.database, state.ports);
+    try {
+      expect((await runtime.history(lane, { limit: 1 })).turns).toHaveLength(1);
+      expect(preflight).not.toHaveBeenCalled();
+      expect(state.requests).toHaveLength(1);
+    } finally {
+      await runtime.close();
+      preflight.mockRestore();
+    }
+  });
+  test('reopens an existing working copy and continues without replaying tools', async () => {
+    const fixtureState = fixture();
+    let runtime = fixtureState.create();
+    await runtime.initialize(fixtureState.database, fixtureState.ports);
+    try {
+      await runtime.ensureConversation(seed);
+      expect(await runtime.sessions()).toEqual([{ lane, revision: 0 }]);
+      await submitAndWait(runtime, input('first'));
+      expect(await runtime.sessions()).toEqual([{ lane, revision: 0 }]);
+      await runtime.close();
+      runtime = fixtureState.create();
+      await runtime.initialize(fixtureState.database, fixtureState.ports);
+      expect(fixtureState.requests).toHaveLength(1);
+      // The Host reconstructs the current configuration before each idle submission.
+      await runtime.configure(lane, seed.configuration);
+      await submitAndWait(runtime, input('second'));
+      expect(
+        fixtureState.requests[1]?.messages
+          .filter((message) => message.role === 'user')
+          .map((message) => message.content),
+      ).toEqual(['Question first', 'Question second']);
+      expect(await runtime.message(lane, 'answer-first')).toMatchObject({
+        role: 'assistant',
+        turn: { status: 'completed', parts: [{ text: 'Response 1' }] },
+      });
+      expect(fixtureState.ports.recordUsage).toHaveBeenCalledWith(
+        { sessionId: 'session', slot: 0, turnId: 'turn-first', requestId: 'first' },
+        expect.objectContaining({
+          usage: {
+            inputTokens: 3,
+            outputTokens: 2,
+            totalTokens: 5,
+            noCacheTokens: 3,
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
+          },
+        }),
+      );
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  test.each([false, true])(
+    'rebuilds independent history with the system baseline first (compacted: %s)',
+    async (compacted) => {
+      const state = fixture();
+      const runtime = state.create();
+      await runtime.initialize(state.database, state.ports);
+      try {
+        await runtime.ensureConversation(seed);
+        await submitAndWait(runtime, input('first'));
+        expect(await runtime.exportTurn(lane, 'first')).toEqual({ contextCheckpoint: null });
+        await runtime.discardConversation(lane);
+        expect(await runtime.hasConversation(lane)).toBe(false);
+        await runtime.ensureConversation({
+          ...seed,
+          revision: 1,
+          history: {
+            history: [
+              {
+                turnId: 'first',
+                messages: [
+                  { role: 'user', parts: [{ type: 'text', text: 'Question first' }] },
+                  {
+                    role: 'assistant',
+                    parts: [
+                      { type: 'reasoning', text: 'Unsigned thought, never resent.' },
+                      { type: 'text', text: 'Response 1' },
+                    ],
+                  },
+                ],
+              },
+            ],
+            contextCheckpoint: compacted
+              ? {
+                  version: 1,
+                  anchorTurnId: 'earlier',
+                  payload: {
+                    kind: 'pi-context-compaction',
+                    summary: 'Earlier user preferences.',
+                    tokensBefore: 8000,
+                  },
+                }
+              : null,
+            referencedFileEntryIds: ['retained-file'],
+          },
+        });
+        expect(state.requests).toHaveLength(1);
+        expect(await runtime.resourceFileEntryIds(lane)).toEqual(['retained-file']);
+        await submitAndWait(runtime, input('next'));
+        expect(state.requests[1]?.messages[0]?.role).toBe('system');
+        expect(JSON.stringify(state.requests[1]?.messages[0])).toContain('Help.');
+        expect(JSON.stringify(state.requests[1]?.messages[0])).toContain('<current-date>');
+        expect(state.requests[1]?.messages).toContainEqual(
+          expect.objectContaining({
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Response 1' }],
+          }),
+        );
+        expect(JSON.stringify(state.requests[1]?.messages)).not.toContain('Unsigned thought');
+      } finally {
+        await runtime.close();
+      }
+    },
+  );
+
+  test('another lane forks a rebuilt history at the boundary the rebuild returns', async () => {
+    const state = fixture();
+    const runtime = state.create();
+    await runtime.initialize(state.database, state.ports);
+    const fork = runtimeLane('session', 1);
+    try {
+      const boundary = await runtime.ensureConversation({
+        ...seed,
+        history: {
+          history: [
+            {
+              turnId: 'earlier',
+              messages: [
+                { role: 'user', parts: [{ type: 'text', text: 'Question earlier' }] },
+                { role: 'assistant', parts: [{ type: 'text', text: 'Imported answer' }] },
+              ],
+            },
+          ],
+          contextCheckpoint: null,
+          referencedFileEntryIds: ['retained-file'],
+        },
+      });
+      expect(boundary).toMatch(/^pi:\d+$/);
+      await runtime.forkConversation({
+        ...seed,
+        lane: fork,
+        from: { lane, boundary: boundary! },
+        referencedFileEntryIds: ['retained-file'],
+      });
+      expect(await runtime.resourceFileEntryIds(fork)).toEqual(['retained-file']);
+      const complete = deferred<void>();
+      const observation = await runtime.observe(fork, (event) => {
+        if (event.type === 'turn.updated' && event.turn.status === 'completed') complete.resolve();
+      });
+      await runtime.submit(fork, input('forked'));
+      await complete.promise;
+      await observation.unsubscribe();
+      expect(
+        state.requests[0]?.messages
+          .filter((message) => message.role !== 'system')
+          .map((message) => JSON.stringify(message.content)),
+      ).toEqual([
+        expect.stringContaining('Question earlier'),
+        expect.stringContaining('Imported answer'),
+        expect.stringContaining('Question forked'),
+      ]);
+      // A copy without history offers no boundary.
+      expect(await runtime.ensureConversation({ ...seed, lane: runtimeLane('empty') })).toBe(
+        undefined,
+      );
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  test('reads a Session slot bindings once until a binding changes', async () => {
+    const state = fixture();
+    const runtime = state.create();
+    await runtime.initialize(state.database, state.ports);
+    const binding = jest.spyOn(PiDurableRuntime.prototype, 'binding');
+    try {
+      await runtime.ensureConversation(seed);
+      binding.mockClear();
+      expect(await runtime.lanes('session')).toEqual([{ lane, revision: 0 }]);
+      expect(binding).toHaveBeenCalledTimes(8);
+      binding.mockClear();
+      expect(await runtime.lanes('session')).toEqual([{ lane, revision: 0 }]);
+      expect(binding).not.toHaveBeenCalled();
+      const second = runtimeLane('session', 2);
+      await runtime.ensureConversation({ ...seed, lane: second });
+      expect(await runtime.lanes('session')).toEqual([
+        { lane, revision: 0 },
+        { lane: second, revision: 0 },
+      ]);
+      await runtime.discardConversation(lane);
+      expect(await runtime.lanes('session')).toEqual([{ lane: second, revision: 0 }]);
+      // A reopened file is read again.
+      await runtime.close();
+      await runtime.initialize(state.database, state.ports);
+      binding.mockClear();
+      expect(await runtime.lanes('session')).toEqual([{ lane: second, revision: 0 }]);
+      expect(binding).toHaveBeenCalledTimes(8);
+    } finally {
+      binding.mockRestore();
+      await runtime.close();
+    }
+  });
+
+  test('detaching a UI observer preserves the active native execution', async () => {
+    const state = fixture();
+    const runtime = state.create();
+    await runtime.initialize(state.database, state.ports);
+    try {
+      await runtime.ensureConversation(seed);
+      const events: RuntimeConversationEvent[] = [];
+      const observation = await runtime.observe(lane, (event) => events.push(event));
+      await observation.unsubscribe();
+      await submitAndWait(runtime, input('first'));
+      expect(events).toEqual([]);
+      expect(await runtime.message(lane, 'answer-first')).toMatchObject({
+        turn: { status: 'completed' },
+      });
+    } finally {
+      await runtime.close();
+    }
+  });
+});
+
+describe('Native web tools', () => {
+  const webTool = (name: string): RuntimeTool => ({
+    ref: { source: 'builtin', capabilityId: name },
+    providerName: name,
+    displayName: name,
+    description: name,
+    inputSchema: { type: 'object', properties: {} },
+    approval: 'auto',
+    ...(name.startsWith('web_') ? { failureGroup: 'web' } : {}),
+    execute: jest.fn(async () => ({ value: null, artifacts: [] })),
+  });
+  const tools = [webTool('web_search'), webTool('web_fetch'), webTool('read_file')];
+  const configuration = {
+    ...seed.configuration,
+    tools,
+    webTools: {
+      modelToolsPreferred: true,
+      clientSearchAvailable: true,
+      clientFetchAvailable: true,
+    },
+  };
+  const sse = (events: readonly Record<string, unknown>[]) =>
+    events
+      .map((event) => `event: ${String(event.type)}\ndata: ${JSON.stringify(event)}\n\n`)
+      .join('');
+  const item = (output_index: number, value: Record<string, unknown>) => [
+    { type: 'response.output_item.added', output_index, item: value },
+    { type: 'response.output_item.done', output_index, item: value },
+  ];
+  const completed = {
+    type: 'response.completed',
+    response: {
+      id: 'response',
+      status: 'completed',
+      usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+    },
+  };
+  const search = (status: string) => ({
+    type: 'web_search_call',
+    id: 'ws_1',
+    status,
+    action: { type: 'search', query: 'cherry' },
+  });
+  const answer = {
+    type: 'message',
+    id: 'msg_1',
+    role: 'assistant',
+    status: 'completed',
+    content: [
+      {
+        type: 'output_text',
+        text: 'Cherries are red [1]',
+        annotations: [
+          {
+            type: 'url_citation',
+            url: 'https://example.com/cherry',
+            title: 'Cherry',
+            start_index: 17,
+            end_index: 20,
+          },
+        ],
+      },
+    ],
+  };
+
+  type Payload = Record<string, unknown> & {
+    tools: Record<string, unknown>[];
+    input: Record<string, unknown>[];
+    messages: Record<string, unknown>[];
+    contents: { role: string; parts: Record<string, unknown>[] }[];
+    config: Record<string, unknown>;
+  };
+
+  /** An installed provider adapter over a scripted transport: real payloads, real parsing. */
+  function nativeFixture(
+    responses: readonly string[],
+    native: PiNativeWebTools = {
+      search: true,
+      fetch: false,
+      functionToolMixing: true,
+      dialect: 'openai-responses',
+    },
+    api: Api = 'openai-responses',
+    adapter: PiStreamFn = streamResponses as PiStreamFn,
+  ) {
+    const state = fixture();
+    const payloads: Payload[] = [];
+    const resolveModel = state.dependencies.resolveModel;
+    const model = { ...wire, api, reasoning: true, baseUrl: 'https://provider.example.test/v1' };
+    const fetch = async (_url: unknown, init?: { body?: unknown }) => {
+      payloads.push(JSON.parse(String(init?.body)));
+      return new Response(responses[payloads.length - 1], {
+        headers: { 'Content-Type': 'text/event-stream' },
+      });
+    };
+    state.dependencies.nativeWebTools = async () => native;
+    state.dependencies.resolveModel = async (...args) => ({
+      ...(await resolveModel(...args)),
+      model,
+      nativeWebTools: native,
+      streamFn: (wireModel, context, options) =>
+        adapter(wireModel, context, {
+          ...options,
+          apiKey: 'test-key',
+          maxRetries: 0,
+          fetch,
+        }),
+    });
+    return { ...state, payloads, fetch };
+  }
+  const toolNames = (payload: Payload) => payload.tools.map((tool) => tool.name ?? tool.type);
+  const anthropicResponse = (blocks: Record<string, unknown>[], reason = 'end_turn') =>
+    sse([
+      {
+        type: 'message_start',
+        message: { id: 'msg', model: 'wire-model', usage: { input_tokens: 10, output_tokens: 0 } },
+      },
+      ...blocks.flatMap((content_block, index) => [
+        { type: 'content_block_start', index, content_block },
+        { type: 'content_block_stop', index },
+      ]),
+      { type: 'message_delta', delta: { stop_reason: reason }, usage: { output_tokens: 5 } },
+      { type: 'message_stop' },
+    ]);
+  const nativeAnthropic: PiNativeWebTools = {
+    search: true,
+    fetch: true,
+    functionToolMixing: true,
+    dialect: 'anthropic',
+  };
+
+  test('continues an Anthropic pause with intact content and tools, retaining text and usage', async () => {
+    const paused = [
+      { type: 'text', text: 'Searching. ' },
+      {
+        type: 'server_tool_use',
+        id: 'srvtoolu_pause',
+        name: 'web_search',
+        input: { query: 'cherry' },
+      },
+    ];
+    const state = nativeFixture(
+      [
+        anthropicResponse(paused, 'pause_turn'),
+        anthropicResponse([
+          {
+            type: 'web_search_tool_result',
+            tool_use_id: 'srvtoolu_pause',
+            content: [
+              {
+                type: 'web_search_result',
+                url: 'https://example.com/cherry',
+                title: 'Cherry',
+                encrypted_content: 'sealed',
+              },
+            ],
+          },
+          { type: 'text', text: 'Cherries are red.' },
+        ]),
+      ],
+      nativeAnthropic,
+      'anthropic-messages',
+      streamAnthropic as PiStreamFn,
+    );
+    const runtime = state.create();
+    await runtime.initialize(state.database, state.ports);
+    try {
+      await runtime.ensureConversation({ ...seed, configuration });
+      await submitAndWait(runtime, input('first'));
+      expect(state.payloads).toHaveLength(2);
+      expect(state.payloads[1]!.messages.at(-1)).toEqual({ role: 'assistant', content: paused });
+      expect(state.payloads[1]!.tools).toEqual(state.payloads[0]!.tools);
+      const result = (await runtime.message(lane, 'answer-first'))!;
+      expect(result.turn.status).toBe('completed');
+      expect(result.turn.contextTokens).toBe(10);
+      expect(result.turn.usage).toMatchObject({
+        inputTokens: 20,
+        outputTokens: 10,
+        totalTokens: 30,
+      });
+      expect(result.turn.parts.filter((part) => part.type === 'text')).toEqual([
+        expect.objectContaining({ text: 'Searching. Cherries are red.' }),
+      ]);
+      expect(result.turn.parts).toContainEqual(
+        expect.objectContaining({ type: 'source-url', url: 'https://example.com/cherry' }),
+      );
+      await runtime.drainUsage();
+      expect(state.ports.recordUsage).toHaveBeenCalledTimes(2);
+      expect(state.ports.recordUsage).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          usage: expect.objectContaining({ inputTokens: 10, outputTokens: 5, totalTokens: 15 }),
+        }),
+      );
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  test('resumes a server fetch deferred behind a client tool and preserves the document after reopen', async () => {
+    const pending = [
+      {
+        type: 'server_tool_use',
+        id: 'srvtoolu_fetch',
+        name: 'web_fetch',
+        input: { url: 'https://example.com/page' },
+      },
+      { type: 'tool_use', id: 'toolu_js', name: 'read_file', input: {} },
+    ];
+    const fetched = {
+      type: 'web_fetch_tool_result',
+      tool_use_id: 'srvtoolu_fetch',
+      content: {
+        type: 'web_fetch_result',
+        url: 'https://example.com/page',
+        content: {
+          type: 'document',
+          title: 'Page',
+          source: { type: 'text', media_type: 'text/plain', data: 'Full document body' },
+        },
+      },
+    };
+    const state = nativeFixture(
+      [
+        anthropicResponse(pending, 'tool_use'),
+        anthropicResponse([fetched, { type: 'text', text: 'Read the page.' }]),
+        anthropicResponse([{ type: 'text', text: 'Follow-up.' }]),
+      ],
+      nativeAnthropic,
+      'anthropic-messages',
+      streamAnthropic as PiStreamFn,
+    );
+    state.ports.resolveTool = jest.fn(async () => tools[2]!);
+    let runtime = state.create();
+    await runtime.initialize(state.database, state.ports);
+    try {
+      await runtime.ensureConversation({ ...seed, configuration });
+      await submitAndWait(runtime, input('first'));
+      expect(state.payloads).toHaveLength(2);
+      expect(state.payloads[1]!.messages.find((entry) => entry.role === 'assistant')).toMatchObject(
+        { content: pending },
+      );
+      expect(state.payloads[1]!.messages.at(-1)).toMatchObject({
+        role: 'user',
+        content: [expect.objectContaining({ type: 'tool_result', tool_use_id: 'toolu_js' })],
+      });
+      expect((await runtime.message(lane, 'answer-first'))!.turn.status).toBe('completed');
+      await runtime.close();
+      runtime = state.create();
+      await runtime.initialize(state.database, state.ports);
+      await runtime.configure(lane, configuration);
+      await submitAndWait(runtime, input('second'));
+      const history = state.payloads[2]!.messages;
+      expect(
+        history.some(
+          (entry) =>
+            Array.isArray(entry.content) &&
+            entry.content.some(
+              (block) => (block as { type?: string }).type === 'web_fetch_tool_result',
+            ),
+        ),
+      ).toBe(true);
+      expect(JSON.stringify(history)).toContain('Full document body');
+      expect(tools[2]!.execute).toHaveBeenCalledTimes(1);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  test('fails a repeatedly paused search at the continuation limit without discarding its prefix', async () => {
+    const paused = anthropicResponse([{ type: 'text', text: 'Searching. ' }], 'pause_turn');
+    const state = nativeFixture(
+      Array(6).fill(paused),
+      nativeAnthropic,
+      'anthropic-messages',
+      streamAnthropic as PiStreamFn,
+    );
+    const runtime = state.create();
+    await runtime.initialize(state.database, state.ports);
+    try {
+      await runtime.ensureConversation({ ...seed, configuration });
+      await submitAndWait(runtime, input('first'), 'failed');
+      expect(state.payloads).toHaveLength(6);
+      const result = (await runtime.message(lane, 'answer-first'))!;
+      expect(result.turn.status).toBe('failed');
+      expect(result.turn.parts.filter((part) => part.type === 'text')).toEqual([
+        expect.objectContaining({ text: 'Searching. '.repeat(6) }),
+      ]);
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  test('routes search to the provider and keeps its sources and replay state across reopen', async () => {
+    const state = nativeFixture([
+      sse([
+        ...item(0, { type: 'reasoning', id: 'rs_1', summary: [], encrypted_content: 'sealed' }),
+        ...item(1, search('completed')),
+        ...item(2, answer),
+        completed,
+      ]),
+      sse([...item(0, { ...answer, id: 'msg_2' }), completed]),
+    ]);
+    let runtime = state.create();
+    await runtime.initialize(state.database, state.ports);
+    try {
+      await runtime.ensureConversation({ ...seed, configuration });
+      await submitAndWait(runtime, input('first'));
+      // The external search function and the native tool never reach the model together.
+      expect(toolNames(state.payloads[0]!)).toEqual(['web_fetch', 'read_file', 'web_search']);
+      await runtime.close();
+      runtime = state.create();
+      await runtime.initialize(state.database, state.ports);
+      const parts = (await runtime.message(lane, 'answer-first'))!.turn.parts;
+      const source = parts.find((part) => part.type === 'source-url');
+      expect(source).toMatchObject({ url: 'https://example.com/cherry', title: 'Cherry' });
+      // The appended source facts are model context, never a second visible answer.
+      expect(parts.filter((part) => part.type === 'text')).toEqual([
+        expect.objectContaining({
+          text: `Cherries are red [cite:${source?.type === 'source-url' ? source.sourceId : ''}]`,
+        }),
+      ]);
+
+      await runtime.configure(lane, configuration);
+      await submitAndWait(runtime, input('second'));
+      const replayed = state.payloads[1]!.input;
+      const reasoning = replayed.findIndex((entry) => entry.id === 'rs_1');
+      expect(replayed[reasoning + 1]).toEqual(search('completed'));
+      expect(JSON.stringify(replayed)).toContain('Web sources from this response');
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  test('a failed native lookup stops both web routes for the rest of the turn', async () => {
+    const state = nativeFixture([
+      sse([
+        ...item(0, search('failed')),
+        ...item(1, {
+          type: 'function_call',
+          id: 'fc_1',
+          call_id: 'call_1',
+          name: 'web_fetch',
+          arguments: '{}',
+        }),
+        completed,
+      ]),
+      sse([...item(0, answer), completed]),
+    ]);
+    state.ports.resolveTool = jest.fn(async (_identity, ref) =>
+      tools.find(
+        (tool) =>
+          tool.ref.source === 'builtin' &&
+          ref.source === 'builtin' &&
+          tool.ref.capabilityId === ref.capabilityId,
+      )!,
+    );
+    const runtime = state.create();
+    await runtime.initialize(state.database, state.ports);
+    try {
+      await runtime.ensureConversation({ ...seed, configuration });
+      await submitAndWait(runtime, input('first'));
+      expect(state.payloads).toHaveLength(2);
+      expect(toolNames(state.payloads[1]!)).toEqual(['web_fetch', 'read_file']);
+      expect(tools[1]!.execute).not.toHaveBeenCalled();
+      const parts = (await runtime.message(lane, 'answer-first'))!.turn.parts;
+      expect(parts).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: 'error',
+            error: expect.objectContaining({ code: 'web_lookup_failed' }),
+          }),
+          expect.objectContaining({ type: 'tool', providerName: 'web_fetch', state: 'denied' }),
+        ]),
+      );
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  test('keeps the external tools when the Host supplies no web policy', async () => {
+    const state = nativeFixture([sse([...item(0, answer), completed])]);
+    const runtime = state.create();
+    await runtime.initialize(state.database, state.ports);
+    try {
+      await runtime.ensureConversation({
+        ...seed,
+        configuration: { ...configuration, webTools: undefined },
+      });
+      await submitAndWait(runtime, input('first'));
+      expect(toolNames(state.payloads[0]!)).toEqual(['web_search', 'web_fetch', 'read_file']);
+    } finally {
+      await runtime.close();
+    }
+  });
+  test('Anthropic server search shows one cited answer and replays its complete blocks', async () => {
+    const block = (index: number, content_block: Record<string, unknown>, text?: string) => [
+      { type: 'content_block_start', index, content_block },
+      ...(text
+        ? [{ type: 'content_block_delta', index, delta: { type: 'text_delta', text } }]
+        : []),
+    ];
+    const stop = (index: number) => ({ type: 'content_block_stop', index });
+    const anthropicAnswer = sse([
+      {
+        type: 'message_start',
+        message: {
+          id: 'msg_1',
+          model: 'wire-model',
+          usage: { input_tokens: 10, output_tokens: 0 },
+        },
+      },
+      ...block(0, { type: 'text', text: '' }, 'Searching. '),
+      stop(0),
+      ...block(1, { type: 'server_tool_use', id: 'srvtoolu_1', name: 'web_search', input: {} }),
+      stop(1),
+      ...block(2, {
+        type: 'web_search_tool_result',
+        tool_use_id: 'srvtoolu_1',
+        content: [
+          {
+            type: 'web_search_result',
+            url: 'https://example.com/cherry',
+            title: 'Cherry',
+            encrypted_content: 'sealed',
+          },
+        ],
+      }),
+      stop(2),
+      ...block(3, { type: 'text', text: '' }, 'Cherries are red'),
+      {
+        type: 'content_block_delta',
+        index: 3,
+        delta: {
+          type: 'citations_delta',
+          citation: {
+            type: 'web_search_result_location',
+            url: 'https://example.com/cherry',
+            title: 'Cherry',
+            encrypted_index: 'sealed',
+            cited_text: 'red',
+          },
+        },
+      },
+      stop(3),
+      ...block(4, { type: 'text', text: '' }, '.'),
+      stop(4),
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 5 } },
+      { type: 'message_stop' },
+    ]);
+    const state = nativeFixture(
+      [anthropicAnswer, anthropicAnswer],
+      { search: true, fetch: true, functionToolMixing: true, dialect: 'anthropic' },
+      'anthropic-messages',
+      streamAnthropic as PiStreamFn,
+    );
+    const runtime = state.create();
+    await runtime.initialize(state.database, state.ports);
+    try {
+      await runtime.ensureConversation({ ...seed, configuration });
+      await submitAndWait(runtime, input('first'));
+      expect(toolNames(state.payloads[0]!)).toEqual(['read_file', 'web_search', 'web_fetch']);
+      expect(state.payloads[0]!.tools.slice(1).map((tool) => tool.type)).toEqual([
+        'web_search_20250305',
+        'web_fetch_20250910',
+      ]);
+      const parts = (await runtime.message(lane, 'answer-first'))!.turn.parts;
+      const source = parts.find((part) => part.type === 'source-url');
+      const sourceId = source?.type === 'source-url' ? source.sourceId : '';
+      expect(parts.filter((part) => part.type === 'text')).toEqual([
+        expect.objectContaining({ text: `Searching. Cherries are red[cite:${sourceId}].` }),
+      ]);
+
+      await runtime.configure(lane, configuration);
+      await submitAndWait(runtime, input('second'));
+      const history = JSON.stringify(state.payloads[1]!.messages);
+      expect(history).not.toContain('Web sources from this response');
+      expect(history).toContain('server_tool_use');
+      expect(history).toContain('web_search_tool_result');
+      expect(history).toContain('encrypted_content');
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  test('Gemini 3 searches beside functions and gets its server tool parts back', async () => {
+    const call = {
+      toolCall: { toolType: 'GOOGLE_SEARCH_WEB', args: { queries: ['q'] }, id: 'a1' },
+    };
+    const result = { toolResponse: { toolType: 'GOOGLE_SEARCH_WEB', response: {}, id: 'a1' } };
+    const chunk = {
+      candidates: [
+        {
+          content: {
+            role: 'model',
+            parts: [
+              { ...call, thoughtSignature: 'c2lnLTE=' },
+              { ...result, thoughtSignature: 'c2lnLTI=' },
+              { text: 'Cherries are red.', thoughtSignature: 'c2lnLTM=' },
+            ],
+          },
+          finishReason: 'STOP',
+          groundingMetadata: {
+            groundingChunks: [{ web: { uri: 'https://example.com/cherry', title: 'Cherry' } }],
+          },
+        },
+      ],
+      usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5, totalTokenCount: 15 },
+    };
+    const body = `data: ${JSON.stringify(chunk)}\r\n\r\n`;
+    const state = nativeFixture(
+      [body, body],
+      { search: true, fetch: false, functionToolMixing: true, dialect: 'google' },
+      'google-generative-ai',
+      streamGoogle as PiStreamFn,
+    );
+    const globalFetch = jest
+      .spyOn(globalThis, 'fetch')
+      .mockRejectedValue(new Error('Gemini must use its injected transport.'));
+    const runtime = state.create();
+    await runtime.initialize(state.database, state.ports);
+    try {
+      await runtime.ensureConversation({ ...seed, configuration });
+      await submitAndWait(runtime, input('first'));
+      const request = state.payloads[0] as unknown as {
+        tools: Record<string, unknown>[];
+        toolConfig: Record<string, unknown>;
+      };
+      expect(request.tools.at(-1)).toEqual({ googleSearch: {} });
+      expect(request.toolConfig.includeServerSideToolInvocations).toBe(true);
+      expect(
+        (await runtime.message(lane, 'answer-first'))!.turn.parts.map((part) => part.type),
+      ).toEqual(['text', 'source-url']);
+
+      await runtime.configure(lane, configuration);
+      await submitAndWait(runtime, input('second'));
+      const model = state.payloads[1]!.contents.find((content) => content.role === 'model')!;
+      expect(model.parts.slice(0, 3)).toEqual([
+        { ...call, thoughtSignature: 'c2lnLTE=' },
+        { ...result, thoughtSignature: 'c2lnLTI=' },
+        expect.objectContaining({ text: 'Cherries are red.' }),
+      ]);
+    } finally {
+      await runtime.close();
+      globalFetch.mockRestore();
+    }
+  });
+
+  test.each([
+    { kind: 'text', thought: false },
+    { kind: 'thinking', thought: true },
+  ])('keeps signed Gemini $kind around native tools after reopen', async ({ thought }) => {
+    const signed = (text: string, thoughtSignature?: string) => ({
+      text,
+      ...(thought ? { thought: true } : {}),
+      ...(thoughtSignature ? { thoughtSignature } : {}),
+    });
+    const call = (id: string) => ({
+      toolCall: { toolType: 'GOOGLE_SEARCH_WEB', args: { queries: ['q'] }, id },
+      thoughtSignature: 'Y2FsbA==',
+    });
+    const result = (id: string) => ({
+      toolResponse: { toolType: 'GOOGLE_SEARCH_WEB', response: {}, id },
+      thoughtSignature: 'cmVzdWx0',
+    });
+    const chunk = (parts: Record<string, unknown>[], finishReason?: string) => ({
+      candidates: [
+        { content: { role: 'model', parts }, ...(finishReason ? { finishReason } : {}) },
+      ],
+    });
+    const body = [
+      chunk([signed('Before ', 'YmVmb3Jl')]),
+      chunk([signed('🍒')]),
+      chunk([call('a1'), result('a1'), signed('After', 'YWZ0ZXI=')]),
+      chunk([call('a2'), result('a2'), signed('Last', 'bGFzdA==')], 'STOP'),
+    ]
+      .map((value) => `data: ${JSON.stringify(value)}\r\n\r\n`)
+      .join('');
+    const state = nativeFixture(
+      [body, body],
+      { search: true, fetch: false, functionToolMixing: true, dialect: 'google' },
+      'google-generative-ai',
+      streamGoogle as PiStreamFn,
+    );
+    const globalFetch = jest
+      .spyOn(globalThis, 'fetch')
+      .mockRejectedValue(new Error('Gemini must use its injected transport.'));
+    let runtime = state.create();
+    await runtime.initialize(state.database, state.ports);
+    try {
+      await runtime.ensureConversation({ ...seed, configuration });
+      await submitAndWait(runtime, input('first'));
+      await runtime.close();
+      runtime = state.create();
+      await runtime.initialize(state.database, state.ports);
+      await runtime.configure(lane, configuration);
+      await submitAndWait(runtime, input('second'));
+      const history = state.payloads[1]!.contents.find((content) => content.role === 'model')!;
+      expect(history.parts.slice(0, 7)).toEqual([
+        signed('Before 🍒', 'YmVmb3Jl'),
+        call('a1'),
+        result('a1'),
+        signed('After', 'YWZ0ZXI='),
+        call('a2'),
+        result('a2'),
+        signed('Last', 'bGFzdA=='),
+      ]);
+    } finally {
+      await runtime.close();
+      globalFetch.mockRestore();
+    }
+  });
+
+  test('a Chat Completions host searches through its own switch and reports sources', async () => {
+    const chunk = (delta: Record<string, unknown>, extra: Record<string, unknown> = {}) =>
+      `data: ${JSON.stringify({
+        id: 'chat',
+        object: 'chat.completion.chunk',
+        choices: [{ index: 0, delta, finish_reason: null }],
+        ...extra,
+      })}\n\n`;
+    const state = nativeFixture(
+      [
+        chunk({ role: 'assistant', content: 'Cherries are red.' }) +
+          `data: ${JSON.stringify({
+            id: 'chat',
+            object: 'chat.completion.chunk',
+            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+            web_search: [{ title: 'Cherry', link: 'https://example.com/cherry', refer: 'ref_1' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          })}\n\ndata: [DONE]\n\n`,
+      ],
+      { search: true, fetch: false, functionToolMixing: true, dialect: 'zhipu' },
+      'openai-completions',
+      streamCompletions as PiStreamFn,
+    );
+    const runtime = state.create();
+    await runtime.initialize(state.database, state.ports);
+    try {
+      await runtime.ensureConversation({ ...seed, configuration });
+      await submitAndWait(runtime, input('first'));
+      expect(state.payloads[0]!.tools.at(-1)).toEqual({
+        type: 'web_search',
+        web_search: { enable: true, search_engine: 'search_pro', search_result: true },
+      });
+      expect(
+        state.payloads[0]!.tools.map((tool) => (tool.function as { name?: string })?.name),
+      ).not.toContain('web_search');
+      expect((await runtime.message(lane, 'answer-first'))!.turn.parts).toEqual([
+        expect.objectContaining({ type: 'text', text: 'Cherries are red.' }),
+        expect.objectContaining({ type: 'source-url', url: 'https://example.com/cherry' }),
+      ]);
+    } finally {
+      await runtime.close();
+    }
+  });
+});

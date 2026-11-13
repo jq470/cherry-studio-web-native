@@ -1,0 +1,194 @@
+import { installTestHost, uninstallTestHost } from '@/backend/core/application/testHost';
+import { FileEntrySchema } from '@/shared/data/types/file';
+
+import { createServiceTestDatabase } from '../../serviceTestDatabase';
+import { FileEntryService } from '../FileEntryService';
+
+const HOUR = 60 * 60 * 1000;
+const id = (suffix: number) => `00000000-0000-7000-8000-${suffix.toString().padStart(12, '0')}`;
+
+describe('FileEntryService integration', () => {
+  const now = 10 * HOUR;
+  let testDatabase: ReturnType<typeof createServiceTestDatabase>;
+  let service: FileEntryService;
+  // Cases below are about identity, paging, and deletion. They still have to
+  // state an origin, so this keeps the one they do not care about out of view.
+  const createImported = (input: Omit<Parameters<FileEntryService['create']>[0], 'provenance'>) =>
+    service.create({ ...input, provenance: 'imported' });
+
+  beforeEach(async () => {
+    jest.spyOn(Date, 'now').mockReturnValue(now);
+    testDatabase = createServiceTestDatabase();
+    await installTestHost({ DbService: testDatabase.dbService });
+    service = new FileEntryService();
+  });
+
+  afterEach(async () => {
+    await uninstallTestHost();
+    testDatabase.sqlite.close();
+    jest.restoreAllMocks();
+  });
+
+  it('creates a validated entry and reads it back through every lookup', async () => {
+    const entry = await createImported({
+      filename: 'report.pdf',
+      id: id(1),
+      mediaType: 'application/pdf',
+      size: 12,
+    });
+
+    expect(entry).toEqual(
+      FileEntrySchema.parse({
+        createdAt: now,
+        filename: 'report.pdf',
+        id: id(1),
+        mediaType: 'application/pdf',
+        provenance: 'imported',
+        size: 12,
+        updatedAt: now,
+      }),
+    );
+    await expect(service.findById(id(1))).resolves.toEqual(entry);
+    await expect(service.get(id(1))).resolves.toEqual(entry);
+    await expect(service.getById(id(1))).resolves.toEqual(entry);
+    // Newly created files are active.
+    expect(testDatabase.sqlite.prepare('SELECT * FROM file_entry').get()).toEqual({
+      created_at: now,
+      deleted_at: null,
+      filename: 'report.pdf',
+      id: id(1),
+      media_type: 'application/pdf',
+      library_file_id: id(1),
+      trashed_with: null,
+      provenance: 'imported',
+      size: 12,
+      updated_at: now,
+    });
+  });
+
+  it('preserves an export source through creation, listing and reads', async () => {
+    const entry = await service.create({
+      id: id(99),
+      filename: 'conversation.html',
+      mediaType: 'text/html',
+      size: 12,
+      provenance: 'document-export',
+    });
+    expect(entry.provenance).toBe('document-export');
+    expect((await service.getById(entry.id)).provenance).toBe('document-export');
+    await expect(service.findAvailableByIds([entry.id])).resolves.toEqual([entry]);
+    expect(testDatabase.sqlite.prepare('SELECT provenance FROM file_entry').get()).toEqual({
+      provenance: 'document-export',
+    });
+  });
+
+  it('rejects an unsafe filename without writing a row', async () => {
+    await expect(
+      createImported({
+        filename: 'nested/escape.pdf',
+        id: id(2),
+        mediaType: 'application/pdf',
+        size: 1,
+      }),
+    ).rejects.toThrow();
+
+    expect(testDatabase.sqlite.prepare('SELECT COUNT(*) AS count FROM file_entry').get()).toEqual({
+      count: 0,
+    });
+  });
+
+  it('does not insert an entry cancelled while waiting for its write transaction', async () => {
+    const controller = new AbortController();
+    const cancelled = new Error('cancelled');
+    let releaseQueue!: () => void;
+    const queued = new Promise<void>((resolve) => {
+      releaseQueue = resolve;
+    });
+    const withWriteTx = testDatabase.dbService.withWriteTx.bind(testDatabase.dbService);
+    jest.spyOn(testDatabase.dbService, 'withWriteTx').mockImplementation(async (callback) => {
+      await queued;
+      return withWriteTx(callback);
+    });
+    const insert = jest.spyOn(service, 'createTx');
+    const creating = service.create(
+      {
+        filename: 'draft.txt',
+        id: id(4),
+        mediaType: 'text/plain',
+        provenance: 'generated',
+        size: 5,
+      },
+      controller.signal,
+    );
+
+    controller.abort(cancelled);
+    releaseQueue();
+
+    await expect(creating).rejects.toBe(cancelled);
+    expect(insert).not.toHaveBeenCalled();
+    await expect(service.findById(id(4))).resolves.toBeNull();
+  });
+
+  it('rolls back a new entry when cancellation arrives during its insert', async () => {
+    const controller = new AbortController();
+    const cancelled = new Error('cancelled');
+    const createTx = service.createTx.bind(service);
+    jest.spyOn(service, 'createTx').mockImplementation(async (tx, values) => {
+      const entry = await createTx(tx, values);
+      controller.abort(cancelled);
+      return entry;
+    });
+
+    await expect(
+      service.create(
+        {
+          filename: 'draft.txt',
+          id: id(4),
+          mediaType: 'text/plain',
+          provenance: 'generated',
+          size: 5,
+        },
+        controller.signal,
+      ),
+    ).rejects.toBe(cancelled);
+    await expect(service.findById(id(4))).resolves.toBeNull();
+  });
+
+  it('distinguishes the nullable lookup from the throwing lookup for a missing id', async () => {
+    await expect(service.findById(id(9))).resolves.toBeNull();
+    await expect(service.getById(id(9))).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
+
+  it('batch-resolves only live file entries for submission-time validation', async () => {
+    const available = await createImported({
+      filename: 'available.png',
+      id: id(1),
+      mediaType: 'image/png',
+      size: 12,
+    });
+    await createImported({
+      filename: 'deleted.png',
+      id: id(2),
+      mediaType: 'image/png',
+      size: 24,
+    });
+    testDatabase.sqlite
+      .prepare('UPDATE file_entry SET deleted_at = ? WHERE id = ?')
+      .run(now + HOUR, id(2));
+
+    await expect(service.findAvailableByIds([id(2), id(1), id(1), id(9)])).resolves.toEqual([
+      available,
+    ]);
+    await expect(service.findById(id(2))).resolves.toBeNull();
+    await expect(service.getById(id(2))).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    await expect(service.findAvailableByIds([])).resolves.toEqual([]);
+  });
+
+  it('deletes an entry idempotently', async () => {
+    await createImported({ filename: 'note.txt', id: id(3), mediaType: 'text/plain', size: 1 });
+
+    await service.delete(id(3));
+    await expect(service.findById(id(3))).resolves.toBeNull();
+    await expect(service.delete(id(3))).resolves.toBeUndefined();
+  });
+});

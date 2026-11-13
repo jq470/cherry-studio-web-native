@@ -1,0 +1,287 @@
+import { traceErrorAttributes } from '@/backend/utils/diagnosticTrace';
+import { AiFailureReasonSchema } from '@/shared/contracts/aiFailure';
+import { TraceSpanRecordSchema } from '@/shared/data/types/trace';
+import { readKnownAiFinishReason } from '@/shared/utils/aiFailure';
+import { diagnosticIdentifier } from '@/shared/utils/diagnosticIdentifier';
+
+const LOG_MESSAGES = new Set([
+  'Startup stage',
+  'Office stage',
+  'Service promoted to startup gate',
+  'Initial content did not report readiness before the startup timeout',
+  'Skill storage reconciliation failed',
+  'Uncaught JavaScript exception',
+  'Unhandled promise rejection',
+  'Promise rejection handled',
+  'HTTP request failed.',
+  'HTTP transport failed unexpectedly.',
+  'MCP tools() failed, reconnecting once',
+  'Trace storage operation failed',
+  'Device tool failed',
+  'Agent operation failed',
+  'Agent listener failed',
+  'Agent status listener failed',
+  'Agent projection failed',
+  'Agent result remains in Pi until Cherry settlement can be retried',
+  'Agent reservation recovered as interrupted',
+  'Pi durable extension failed',
+  'Pi durable runtime reported a failure',
+  'Pi durable usage delivery failed',
+  'Pi durable task failed',
+  'Pi durable task blocked',
+  'Pi durable generation retry scheduled',
+  'Pi durable tool execution interrupted',
+  'Pi durable context compaction',
+]);
+const LOG_STRING_FIELDS = new Set([
+  'code',
+  'reasonCode',
+  'operation',
+  'capabilityId',
+  'modelId',
+  'providerId',
+  'sessionId',
+  'turnId',
+  'assistantMessageId',
+  'serverId',
+  'requestId',
+  'toolCallId',
+  'taskKind',
+  'extension',
+  'callback',
+  'serviceName',
+  'requiredBy',
+  'phase',
+  'fromPhase',
+  'toPhase',
+  'outcome',
+]);
+const LOG_NUMBER_FIELDS = new Set([
+  'status',
+  'statusCode',
+  'durationMs',
+  'totalTokens',
+  'writeFailures',
+  'droppedRecords',
+  'taskId',
+  'entryId',
+  'slot',
+  'retryAttempt',
+  'startupStartedAt',
+  'jsEntryStartMs',
+  'elapsedMs',
+  'rnStartupStartMs',
+  'rnRuntimeStartMs',
+  'rnBundleEntryStartMs',
+]);
+const TRACE_NUMBER_FIELDS = new Set([
+  'gen_ai.model.context_window',
+  'gen_ai.model.max_input_tokens',
+  'gen_ai.model.max_output_tokens',
+  'gen_ai.request.output_budget_tokens',
+  'gen_ai.request.estimated_input_tokens',
+  'gen_ai.request.message_count',
+  'gen_ai.request.tool_count',
+  'gen_ai.request.max_tokens',
+]);
+const TRACE_FIELDS = new Set([
+  ...TRACE_NUMBER_FIELDS,
+  'error.type',
+  'error.code',
+  'error.source.code',
+  'error.product_reason',
+  'error.origin',
+  'error.retryable',
+  'error.retry_scope',
+  'error.category',
+  'error.stage',
+  'http.status_code',
+  'plugin.error.reason',
+  'plugin.error.code',
+  'plugin.id',
+  'plugin.auth.method',
+  'plugin.stage',
+  'plugin.state',
+  'gen_ai.request.model',
+  'gen_ai.request.estimate_source',
+  'gen_ai.request.max_tokens_field',
+  'gen_ai.provider.id',
+  'gen_ai.provider.api',
+  'gen_ai.response.finish_reason',
+  'gen_ai.response.raw_finish_reason',
+  'mcp.server.id',
+  'mcp.connection.generation',
+  'mcp.connection.temporary',
+  'mcp.tools_count',
+  'tool.name',
+  'tool.call.id',
+  'tool.result.status',
+  'trace.dropped_spans',
+  'trace.attributes_truncated',
+  'runtime.name',
+  'agent.turn.status',
+  'agent.queue.length',
+  'agent.recovery.session_count',
+  'agent.recovery.unfinished_count',
+]);
+
+function metadataValue(key: string, value: unknown): string | number | boolean | undefined {
+  if (key === 'gen_ai.response.raw_finish_reason') return readKnownAiFinishReason(value);
+  if (TRACE_NUMBER_FIELDS.has(key))
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
+  if (key === 'error.product_reason') {
+    const reason = AiFailureReasonSchema.safeParse(value);
+    return reason.success ? reason.data : undefined;
+  }
+  if (key === 'error.retry_scope')
+    return value === 'automatic' || value === 'user' ? value : undefined;
+  if (key === 'gen_ai.request.estimate_source')
+    return value === 'pi_estimate' || value === 'pi_usage_and_estimate' ? value : undefined;
+  if (key === 'gen_ai.request.max_tokens_field')
+    return typeof value === 'string' &&
+      [
+        'max_tokens',
+        'max_completion_tokens',
+        'max_output_tokens',
+        'config.maxOutputTokens',
+        'omitted',
+      ].includes(value)
+      ? value
+      : undefined;
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
+  return diagnosticIdentifier(value);
+}
+
+function projectRepetition(value: unknown, timestamp: string) {
+  if (!value || typeof value !== 'object') return undefined;
+  const source = value as Record<string, unknown>;
+  if (
+    typeof source.count !== 'number' ||
+    !Number.isSafeInteger(source.count) ||
+    source.count < 1 ||
+    typeof source.firstSeenAt !== 'string' ||
+    typeof source.lastSeenAt !== 'string'
+  )
+    return undefined;
+  const first = Date.parse(source.firstSeenAt);
+  const last = Date.parse(source.lastSeenAt);
+  if (
+    !Number.isFinite(first) ||
+    !Number.isFinite(last) ||
+    first > last ||
+    last !== Date.parse(timestamp)
+  )
+    return undefined;
+  return {
+    count: source.count,
+    firstSeenAt: new Date(first).toISOString(),
+    lastSeenAt: new Date(last).toISOString(),
+  };
+}
+
+/** Drop arbitrary log messages and nested payloads before any persistent write. */
+export function projectDiagnosticLog(record: Record<string, unknown>) {
+  const isLifecycle =
+    (record.module === 'Startup' && record.message === 'Startup stage') ||
+    (record.module === 'Office' && record.message === 'Office stage') ||
+    (record.module === 'PiDurableObserver' && record.message === 'Pi durable context compaction');
+  if (
+    record.level !== 'warn' &&
+    record.level !== 'error' &&
+    !(record.level === 'info' && isLifecycle)
+  )
+    return undefined;
+  if (typeof record.timestamp !== 'string' || !Number.isFinite(Date.parse(record.timestamp)))
+    return undefined;
+  const facts: Record<string, string | number | boolean> = {};
+  const context = record.context && typeof record.context === 'object' ? record.context : {};
+  for (const [key, value] of Object.entries(
+    Object.assign(
+      {},
+      context,
+      ...(Array.isArray(record.data)
+        ? record.data.filter((value) => value && typeof value === 'object')
+        : []),
+      record,
+    ),
+  )) {
+    if (LOG_STRING_FIELDS.has(key)) {
+      const identifier = diagnosticIdentifier(value);
+      if (identifier) facts[key] = identifier;
+    } else if (LOG_NUMBER_FIELDS.has(key) && typeof value === 'number' && Number.isFinite(value)) {
+      facts[key] = value;
+    } else if (
+      (key === 'retryable' || key === 'isFatal' || key === 'blocking') &&
+      typeof value === 'boolean'
+    ) {
+      facts[key] = value;
+    }
+  }
+  // Re-project persisted facts too, so export never copies arbitrary JSON through this boundary.
+  const errorFacts =
+    record.capture === 'metadata' ? record.facts : traceErrorAttributes(record.error ?? record);
+  if (errorFacts && typeof errorFacts === 'object') {
+    for (const [key, value] of Object.entries(errorFacts)) {
+      if (
+        !TRACE_FIELDS.has(key) &&
+        !LOG_STRING_FIELDS.has(key) &&
+        !LOG_NUMBER_FIELDS.has(key) &&
+        key !== 'retryable' &&
+        key !== 'isFatal' &&
+        key !== 'blocking'
+      )
+        continue;
+      const safe = metadataValue(key, value);
+      if (safe !== undefined) facts[key] = safe;
+    }
+  }
+  return {
+    schemaVersion: 1,
+    capture: 'metadata' as const,
+    timestamp: new Date(record.timestamp).toISOString(),
+    level: record.level,
+    module: diagnosticIdentifier(record.module) ?? 'unknown',
+    message:
+      typeof record.message === 'string' && LOG_MESSAGES.has(record.message)
+        ? record.message
+        : record.level === 'error'
+          ? 'Application error'
+          : 'Application warning',
+    facts,
+    repetition:
+      record.capture === 'metadata'
+        ? projectRepetition(record.repetition, record.timestamp)
+        : undefined,
+  };
+}
+
+/** Only the documented request metadata crosses the archive boundary. */
+export function projectDiagnosticTrace(value: unknown) {
+  const parsed = TraceSpanRecordSchema.safeParse(value);
+  if (!parsed.success) return undefined;
+  const record = parsed.data;
+  if (
+    !/^(?:ai\.(?:turn|turn_state|queue|admission|recovery|suspend|prepare|observe|settlement|checkpoint)|pi\.(?:generate_content|execute_tool)|mcp\.(?:connect|list_tools|call_tool)|plugin\.[a-z_]+)$/.test(
+      record.name,
+    )
+  )
+    return undefined;
+  const attributes: Record<string, string | number | boolean> = {};
+  for (const [key, value] of Object.entries(record.attributes)) {
+    if (!TRACE_FIELDS.has(key)) continue;
+    const safe = metadataValue(key, value);
+    if (safe !== undefined) attributes[key] = safe;
+  }
+  return {
+    ...record,
+    processId: diagnosticIdentifier(record.processId) ?? 'unknown',
+    context: Object.fromEntries(
+      Object.entries(record.context).flatMap(([key, value]) => {
+        const safe = diagnosticIdentifier(value);
+        return safe ? [[key, safe]] : [];
+      }),
+    ),
+    attributes,
+  };
+}

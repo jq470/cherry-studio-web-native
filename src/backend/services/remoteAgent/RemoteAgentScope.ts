@@ -1,0 +1,1338 @@
+import {
+  agentMethods,
+  questionInputSchema,
+  interactionResponseSchema,
+  type AgentMethod,
+  type AgentParams,
+  type AgentResult,
+  type AgentMessageListItem,
+  type ContentRef,
+  type AgentPart,
+  type AgentProjection,
+  type AgentSession,
+} from '@cherrystudio/remote-protocol/agent';
+import { randomUUID } from 'expo-crypto';
+import * as z from 'zod';
+
+import type { RemoteAgentCommandJournal } from '@/backend/data/services/RemoteAgentCommandJournal';
+import type {
+  BackgroundReplyLifecycle,
+  BackgroundReplyTurn,
+} from '@/backend/services/backgroundReply';
+import type { DesktopConnections, DesktopDomainLease } from '@/backend/services/desktopConnections';
+import type {
+  DesktopSession,
+  DesktopParams,
+} from '@/backend/services/desktopConnections/DesktopSession';
+import {
+  DesktopUnreachableError,
+  RemoteFailureError,
+  RemoteTransportError,
+} from '@/backend/services/desktopConnections/remoteErrors';
+import type { KeepAliveSource } from '@/backend/services/keepAlive/KeepAliveCoordinator';
+import { linkAbortSignals } from '@/backend/utils/linkAbortSignals';
+import type {
+  RemoteAgentSource,
+  RemoteSessionSnapshot,
+  RemoteSourceState,
+  RemoteResourceValue,
+  RemoteTaskQueries,
+} from '@/shared/contracts/remoteAgent';
+
+import { RemoteAgentActions } from './RemoteAgentActions';
+import { RemoteAgentError } from './RemoteAgentError';
+import {
+  createMessageViewCache,
+  projectMessage,
+  projectSession,
+  projectSnapshot,
+  type MessageViewCache,
+  type RemoteResourceDescriptor,
+} from './remoteAgentViews';
+import { RemoteAttachmentDrafts } from './RemoteAttachmentDrafts';
+import { decodeContent, integrity, readContent, type AgentRequest } from './remoteContent';
+import { createAttachmentDownloader } from './remoteDownloads';
+import { RemoteReadCoordinator } from './RemoteReadCoordinator';
+import type { RemoteSessionReadCache } from './RemoteSessionReadCache';
+import { RemoteTaskCatalog } from './RemoteTaskCatalog';
+import {
+  uploadAttachments,
+  type RemoteUploadFiles,
+  type GetUploadTransport,
+} from './remoteUploads';
+import { SessionSync } from './SessionSync';
+
+export type RemoteBackgroundExecution = {
+  replies: BackgroundReplyLifecycle;
+  keepAlive: KeepAliveSource;
+  translate(key: string): string;
+};
+
+type Observation = {
+  tracking?: boolean;
+  awaitingCheckpoint?: boolean;
+  pendingSubmission?: boolean;
+  pendingCommandId?: string;
+  reply?: BackgroundReplyTurn;
+  executionId?: string;
+  backgroundInteractionKey?: string;
+  listeners: Set<(snapshot: RemoteSessionSnapshot) => void>;
+  sync?: SessionSync;
+  snapshot?: RemoteSessionSnapshot;
+  projection?: AgentProjection;
+  /** Session summary read from desktop storage by a conflict resync. */
+  stored?: AgentSession;
+  retryTimer?: ReturnType<typeof setTimeout>;
+  retries?: number;
+};
+/**
+ * The desktop can serve a checkpoint from a cached session that missed an out-of-run change, such
+ * as an automatic title, while send admission checks storage. A newer idle summary read from
+ * storage therefore supplies the idle revision and metadata; history revision stays with the stream.
+ */
+function withStoredSession(session: AgentSession, stored: AgentSession | undefined) {
+  if (
+    !stored?.idleRevision ||
+    !session.idleRevision ||
+    stored.sessionId !== session.sessionId ||
+    Date.parse(stored.updatedAt) <= Date.parse(session.updatedAt)
+  )
+    return session;
+  return {
+    ...session,
+    title: stored.title,
+    updatedAt: stored.updatedAt,
+    idleRevision: stored.idleRevision,
+  };
+}
+const targetSchema = z.object({
+  scope: z.string(),
+  kind: z.string(),
+  params: z.record(z.string(), z.string()),
+});
+
+/** Agent-domain observation and command owner. The manager alone owns channel lifecycle. */
+export class RemoteAgentScope implements RemoteAgentSource {
+  readonly scope: string;
+  readonly draftScope: string;
+  readonly tasks: RemoteTaskQueries;
+  private readonly reads = new RemoteReadCoordinator();
+  private readonly taskCatalog: RemoteTaskCatalog;
+  private state: RemoteSourceState;
+  private readonly stateListeners = new Set<() => void>();
+  private readonly observations = new Map<string, Observation>();
+  private readonly resources = new Map<
+    string,
+    { sessionId: string; value: RemoteResourceDescriptor }
+  >();
+  private readonly messageViews: MessageViewCache = createMessageViewCache();
+  private readonly partResources = new WeakMap<AgentPart, { sessionId: string; id: string }>();
+  private readonly work = new Set<Promise<unknown>>();
+  private readonly actions: RemoteAgentActions;
+  private readonly attachmentDrafts?: RemoteAttachmentDrafts;
+  private readonly unsubscribe: () => void;
+  private stopped = false;
+  private preparing = 0;
+  private readonly downloadAttachment = createAttachmentDownloader();
+  private uploadAbort?: { id: string; controller: AbortController };
+  private backgroundBlocked = false;
+  private pendingCommandLease?: ReturnType<KeepAliveSource['acquire']>;
+  private readonly pendingStarts = new Set<string>();
+  private readonly pendingSends = new Set<string>();
+  private readonly unoperations: () => void;
+  private readonly executionListeners = new Set<() => void>();
+  private recoveryTimer?: ReturnType<typeof setTimeout>;
+  private getUploadTransport: GetUploadTransport = async (signal) => {
+    const session = await this.ready(signal);
+    if (session.agentUploadsVersion !== 1) throw new RemoteAgentError('UPGRADE_REQUIRED');
+    return {
+      checksumAlgorithm: session.agentUploadChecksum,
+      write: async (input, caller) => {
+        try {
+          return await session.sendUploadChunk(input, caller);
+        } catch (error) {
+          if (error instanceof RemoteFailureError) {
+            if (error.reason === 'FORBIDDEN' || error.reason === 'GRANT_REVOKED')
+              await this.connections.revoke(this.lease.connectionId, 'agent', this.lease.grantId);
+            throw new RemoteAgentError(
+              error.reason,
+              ['TOKEN_EXPIRED', 'RESOURCE_EXHAUSTED'].includes(error.reason),
+              error.message,
+            );
+          }
+          if (error instanceof RemoteTransportError || error instanceof DesktopUnreachableError)
+            throw new RemoteAgentError('CONNECTION_LOST', true);
+          throw error;
+        }
+      },
+    };
+  };
+
+  constructor(
+    private readonly lease: DesktopDomainLease,
+    private readonly connections: DesktopConnections,
+    journal: RemoteAgentCommandJournal,
+    private readonly readCache: RemoteSessionReadCache,
+    private readonly background?: RemoteBackgroundExecution,
+    private readonly files?: RemoteUploadFiles,
+  ) {
+    this.scope = `${lease.scope}:${randomUUID()}`;
+    this.draftScope = lease.scope;
+    this.state = lease.getSnapshot();
+    this.taskCatalog = new RemoteTaskCatalog(this.reads, this.request);
+    this.tasks = this.taskCatalog;
+    this.actions = new RemoteAgentActions(
+      `${lease.connectionId}:${lease.scope}`,
+      journal,
+      async (method, params) => {
+        if (!Object.hasOwn(agentMethods, method)) throw new RemoteAgentError('PROTOCOL_ERROR');
+        const key = method as AgentMethod;
+        return this.request(key, agentMethods[key].params.parse(params));
+      },
+      () => this.scheduleRecovery(),
+      async (attachments, saved, save, owner) => {
+        if (this.uploadAbort) throw new RemoteAgentError('CONFLICT', true);
+        if (!this.files) throw new RemoteAgentError('UPGRADE_REQUIRED');
+        const abort = new AbortController();
+        this.uploadAbort = { id: owner.id, controller: abort };
+        const linked = linkAbortSignals([abort.signal, this.lease.signal]);
+        try {
+          const signal = linked.signal;
+          return await uploadAttachments(
+            attachments,
+            this.files,
+            this.request,
+            signal,
+            (sent, total) => {
+              this.state = { ...this.state, upload: { sent, total, ...owner } };
+              for (const listener of this.stateListeners) listener();
+            },
+            saved,
+            save,
+            this.getUploadTransport,
+          );
+        } catch (error) {
+          if (abort.signal.aborted) throw new RemoteAgentError('UPLOAD_CANCELLED');
+          if (error instanceof RemoteAgentError) throw error;
+          throw new RemoteAgentError('RESOURCE_UNAVAILABLE');
+        } finally {
+          linked.dispose();
+          this.uploadAbort = undefined;
+          this.publishUpload();
+        }
+      },
+    );
+    this.unoperations = this.actions.subscribe(() => {
+      this.attachmentDrafts?.reconcile(this.actions.admittedAttachmentDrafts());
+      this.publishUpload();
+      for (const [id, observation] of this.observations) {
+        if (!observation.pendingCommandId) continue;
+        const command = this.actions
+          .get()
+          .find((command) => command.id === observation.pendingCommandId);
+        if (command?.status === 'pending') continue;
+        observation.pendingCommandId = undefined;
+        observation.pendingSubmission = false;
+        if (command?.status === 'applied') this.refreshExecutionCheckpoint(id);
+        else this.settleUnadmittedSend(id, observation);
+      }
+      this.reconcileCommandProtection();
+    });
+    if (files)
+      this.attachmentDrafts = new RemoteAttachmentDrafts(
+        `${lease.connectionId}:${lease.scope}:attachment-drafts`,
+        journal,
+        files,
+        this.request,
+        lease.signal,
+        () => {
+          this.state = { ...this.state, attachmentDrafts: this.attachmentDrafts?.get() };
+          for (const listener of this.stateListeners) listener();
+          this.reconcileCommandProtection();
+          this.scheduleRecovery();
+        },
+        this.getUploadTransport,
+      );
+    this.attachmentDrafts?.reconcile(this.actions.admittedAttachmentDrafts());
+    this.state = { ...this.state, attachmentDrafts: this.attachmentDrafts?.get() };
+    this.publishUpload();
+    this.reconcileCommandProtection();
+    this.unsubscribe = lease.subscribe(() => this.onConnectionChanged());
+    if (this.state.status === 'ready') {
+      void this.actions.recover();
+      this.attachmentDrafts?.recover();
+    }
+  }
+  hasPendingExecution = () =>
+    this.preparing > 0 ||
+    Boolean(this.attachmentDrafts?.hasPending()) ||
+    this.hasPendingCommands() ||
+    [...this.observations.values()].some((observation) => observation.tracking);
+  subscribeExecution = (listener: () => void) => {
+    this.executionListeners.add(listener);
+    return () => {
+      this.executionListeners.delete(listener);
+    };
+  };
+  private hasPendingCommands(): boolean {
+    return (
+      Boolean(this.attachmentDrafts?.hasPending()) ||
+      this.actions.get().some((command) => command.status === 'pending') ||
+      this.actions.getStarts().some((start) => start.status === 'pending')
+    );
+  }
+  private reconcileCommandProtection(): void {
+    for (const command of this.actions.get()) {
+      if (command.kind !== 'send' || !command.sessionId) continue;
+      if (command.status === 'pending') this.pendingSends.add(command.id);
+      else if (
+        this.pendingSends.delete(command.id) &&
+        command.status === 'applied' &&
+        !this.observations.get(command.sessionId)?.tracking
+      )
+        this.refreshExecutionCheckpoint(command.sessionId);
+    }
+    // Recovery may confirm the first send after its route has gone away. Hand
+    // protection to the session before releasing the uncertain-command lease.
+    for (const start of this.actions.getStarts()) {
+      if (start.status === 'pending') this.pendingStarts.add(start.id);
+      else if (
+        this.pendingStarts.delete(start.id) &&
+        start.status === 'applied' &&
+        start.sessionId &&
+        !this.observations.get(start.sessionId)?.tracking
+      )
+        this.refreshExecutionCheckpoint(start.sessionId);
+    }
+    if (this.hasPendingCommands() && !this.pendingCommandLease && !this.backgroundBlocked) {
+      this.pendingCommandLease = this.background?.keepAlive.acquire('remote.chat.command', () => {
+        this.backgroundBlocked = true;
+        this.pendingCommandLease = undefined;
+        this.publishExecution();
+      });
+    } else if (!this.hasPendingCommands() || this.backgroundBlocked) {
+      this.pendingCommandLease?.release();
+      this.pendingCommandLease = undefined;
+    }
+    this.publishExecution();
+  }
+  private releaseBackgroundProtection(): void {
+    this.backgroundBlocked = true;
+    this.pendingCommandLease?.release();
+    this.pendingCommandLease = undefined;
+    // The desktop still owns execution. Retire only the phone's surfaces, without a terminal card.
+    for (const observation of this.observations.values()) {
+      observation.reply?.retire();
+      observation.reply = undefined;
+    }
+    this.publishExecution();
+  }
+  private publishExecution(): void {
+    this.lease.setBackgroundRequired?.(this.hasPendingExecution() && !this.backgroundBlocked);
+    for (const listener of this.executionListeners) listener();
+  }
+
+  private publishUpload() {
+    const pending = this.actions.pendingUploads();
+    const current = pending.find((entry) => entry.id === this.state.upload?.id) ?? pending[0];
+    const upload = current
+      ? this.state.upload?.id === current.id
+        ? this.state.upload
+        : {
+            id: current.id,
+            sessionId: current.sessionId,
+            draftId: current.draftId,
+            sent: 0,
+            total: current.uploads.reduce((sum, entry) => sum + entry.metadata.byteLength, 0),
+          }
+      : undefined;
+    this.state = { ...this.state, upload };
+    for (const listener of this.stateListeners) listener();
+  }
+  cancelUpload = (id: string) => {
+    const active = this.uploadAbort;
+    const uploads = this.actions.cancelUpload(id);
+    if (!uploads) return;
+    if (active?.id === id) active.controller.abort();
+    this.track(
+      Promise.allSettled(
+        uploads.map((entry) =>
+          this.request(
+            'agent.uploads.cancel',
+            { uploadId: entry.metadata.uploadId },
+            AbortSignal.timeout(3000),
+          ),
+        ),
+      ),
+    );
+  };
+  getState = () => this.state;
+  subscribeState = (listener: () => void) => {
+    this.stateListeners.add(listener);
+    return () => {
+      this.stateListeners.delete(listener);
+    };
+  };
+  getCommands = () => this.actions.get();
+  getStarts = () => this.actions.getStarts();
+  subscribeOperations = (listener: () => void) => this.actions.subscribe(listener);
+  private track<T>(promise: Promise<T>): Promise<T> {
+    this.work.add(promise);
+    void promise.finally(() => this.work.delete(promise)).catch(() => undefined);
+    return promise;
+  }
+  private assertActive() {
+    if (this.stopped || this.lease.signal.aborted) throw new RemoteAgentError('CLOSED');
+  }
+  private onConnectionChanged() {
+    this.state = { ...this.state, ...this.lease.getSnapshot() };
+    for (const observation of this.observations.values()) {
+      this.stopObservation(observation);
+      this.withdrawTargets(observation);
+    }
+    clearTimeout(this.recoveryTimer);
+    if (this.state.status === 'retired') this.actions.stop();
+    for (const listener of this.stateListeners) listener();
+    // The connection manager suspends background demand once the desktop stays
+    // unreachable. Protection ends with it; foreground readiness resumes tracking.
+    if (this.state.status === 'suspended' && !this.backgroundBlocked && this.hasPendingExecution())
+      this.releaseBackgroundProtection();
+    if (this.state.status === 'ready') {
+      this.backgroundBlocked = false;
+      this.taskCatalog.reset();
+      this.reconcileCommandProtection();
+      for (const [id, observation] of this.observations) this.startObservation(id, observation);
+      void this.actions.recover();
+      this.attachmentDrafts?.recover();
+    }
+  }
+  private withdrawTargets(observation: Observation) {
+    if (!observation.snapshot) return;
+    observation.snapshot = {
+      ...observation.snapshot,
+      current: false,
+      sendTarget: undefined,
+      executions: observation.snapshot.executions.map(
+        ({ cancelTarget: _target, ...execution }) => execution,
+      ),
+      interactions: observation.snapshot.interactions.map(
+        ({ respondTarget: _target, ...interaction }) => interaction,
+      ),
+    };
+    for (const listener of observation.listeners) listener(observation.snapshot);
+  }
+  private publishObservation(
+    sessionId: string,
+    observation: Observation,
+    projection: AgentProjection,
+    current: boolean,
+  ) {
+    const session = withStoredSession(projection.session, observation.stored);
+    const view = session === projection.session ? projection : { ...projection, session };
+    const entry = this.cacheEntry(sessionId);
+    this.readCache.setEpoch(entry, projection.cursor.streamEpoch);
+    // Streamed batches keep the session object; rewriting it would re-project every history preview.
+    if (this.readCache.get(entry, 'session') !== session)
+      this.readCache.put(entry, entry.generation, 'session', session);
+    observation.projection = projection;
+    observation.snapshot = projectSnapshot(
+      this.scope,
+      view,
+      current,
+      this.issueResource,
+      this.messageViews,
+    );
+    if (current && observation.reply)
+      this.background?.replies.updateSessionTitle(
+        sessionId,
+        session.title,
+        this.lease.connectionId,
+      );
+    this.updateExecution(sessionId, observation);
+    for (const listener of observation.listeners) listener(observation.snapshot);
+  }
+  /**
+   * A desktop CONFLICT proves this projection missed a session change: rebuild it from a checkpoint
+   * and read the stored session summary, which admission checks even when the checkpoint is stale.
+   */
+  private async resync(sessionId: string) {
+    this.assertActive();
+    const observation = this.observations.get(sessionId);
+    if (!observation || this.stopped || this.state.status !== 'ready') return;
+    this.stopObservation(observation);
+    this.withdrawTargets(observation);
+    this.startObservation(sessionId, observation);
+    const { session } = await this.track(this.request('agent.sessions.get', { sessionId }));
+    if (this.stopped || this.observations.get(sessionId) !== observation) return;
+    observation.stored = session;
+    if (observation.projection && observation.snapshot?.current)
+      this.publishObservation(sessionId, observation, observation.projection, true);
+  }
+  private async ready(signal: AbortSignal) {
+    try {
+      return await this.lease.ready(signal);
+    } catch (error) {
+      if (error instanceof DesktopUnreachableError)
+        throw new RemoteAgentError('CONNECTION_LOST', true, error.message);
+      throw error;
+    }
+  }
+  private request = async <M extends AgentMethod>(
+    method: M,
+    params: AgentParams<M>,
+    caller?: AbortSignal,
+  ): Promise<AgentResult<M>> => {
+    this.assertActive();
+    const linked = caller ? linkAbortSignals([caller, this.lease.signal]) : undefined;
+    const signal = linked?.signal ?? this.lease.signal;
+    try {
+      const session = await this.ready(signal);
+      const preupload = session.agentAttachmentSelections === true;
+      const attachments = preupload && session.agentUploadsVersion === 1;
+      if (this.state.attachments !== attachments || this.state.preupload !== preupload) {
+        this.state = { ...this.state, attachments, preupload };
+        for (const listener of this.stateListeners) listener();
+      }
+      const negotiatedParams =
+        method === 'agent.messages.list' && session.agentMessageSummariesVersion === 1
+          ? { ...params, partsMode: 'paged' as const }
+          : params;
+      return await this.call(session, method, negotiatedParams as AgentParams<M>, signal);
+    } finally {
+      linked?.dispose();
+    }
+  };
+  private async call<M extends AgentMethod>(
+    session: DesktopSession,
+    method: M,
+    params: AgentParams<M>,
+    signal: AbortSignal,
+  ) {
+    this.assertActive();
+    signal.throwIfAborted();
+    try {
+      const value = await this.track(session.request(method, params as DesktopParams<M>, signal));
+      this.assertActive();
+      signal.throwIfAborted();
+      return value;
+    } catch (error) {
+      // A lost reply is not a desktop verdict: the command stays uncertain and is recovered by receipt.
+      if (error instanceof RemoteTransportError || error instanceof DesktopUnreachableError)
+        throw new RemoteAgentError('CONNECTION_LOST', true, error.message);
+      if (error instanceof RemoteFailureError) {
+        if (
+          error.reason === 'NOT_FOUND' &&
+          (method === 'agent.sessions.get' || method === 'agent.messages.list') &&
+          'sessionId' in params &&
+          typeof params.sessionId === 'string'
+        )
+          this.readCache.remove(this.cacheEntry(params.sessionId));
+        if (error.reason === 'UPGRADE_REQUIRED' && method !== 'agent.tasks.list') {
+          this.state = { ...this.state, reason: 'upgrade-required' };
+          for (const listener of this.stateListeners) listener();
+        }
+        if (error.reason === 'FORBIDDEN' || error.reason === 'GRANT_REVOKED')
+          await this.connections.revoke(this.lease.connectionId, 'agent', this.lease.grantId);
+        throw new RemoteAgentError(
+          error.reason,
+          error.failure.details?.retryable !== false &&
+            ['RATE_LIMITED', 'TOKEN_EXPIRED', 'RESOURCE_EXHAUSTED'].includes(error.reason),
+          error.message,
+        );
+      }
+      throw error;
+    }
+  }
+  async listAgents(cursor: string | undefined, signal: AbortSignal) {
+    const page = await this.request('agent.agents.list', { cursor }, signal);
+    return {
+      items: page.items.map((item) => ({
+        id: item.agentId,
+        name: item.name,
+        emoji: item.emoji,
+        ...(item.model !== undefined ? { model: item.model } : {}),
+      })),
+      next: page.nextCursor ?? undefined,
+    };
+  }
+  async listWorkspaces(agentId: string, cursor: string | undefined, signal: AbortSignal) {
+    const page = await this.request('agent.workspaces.list', { agentId, cursor }, signal);
+    return {
+      items: page.items.map((item) => ({ id: item.workspaceId, name: item.name })),
+      systemWorkspace: page.systemWorkspace === true,
+      next: page.nextCursor ?? undefined,
+    };
+  }
+  async listSessions(agentId: string | undefined, cursor: string | undefined, signal: AbortSignal) {
+    const visited = new Set<string>();
+    while (true) {
+      if (cursor && visited.has(cursor)) throw new RemoteAgentError('PROTOCOL_ERROR');
+      if (cursor) visited.add(cursor);
+      const page = await this.request('agent.sessions.list', { agentId, cursor }, signal);
+      const tasks = await this.taskCatalog.identify(
+        agentId,
+        page.items.map((session) => session.sessionId),
+        signal,
+      );
+      const items = page.items
+        .filter((session) => !tasks.has(session.sessionId))
+        .map(projectSession);
+      if (items.length || !page.nextCursor) return { items, next: page.nextCursor ?? undefined };
+      cursor = page.nextCursor ?? undefined;
+    }
+  }
+  private cacheEntry(sessionId: string) {
+    return this.readCache.entry(
+      this.lease.connectionId,
+      this.lease.scope,
+      this.lease.grantId,
+      sessionId,
+    );
+  }
+  peekSession(sessionId: string) {
+    this.assertActive();
+    const entry = this.readCache.find(this.lease.scope, sessionId);
+    const preview = entry && this.readCache.preview(entry);
+    if (!preview) return;
+    return {
+      epoch: entry?.epoch,
+      session: projectSession(preview.session),
+      ...(preview.window
+        ? {
+            history: {
+              items: preview.window.rows.map(({ message, parts }) =>
+                projectMessage(sessionId, message, parts, this.issueResource),
+              ),
+              version: preview.window.version,
+              readAt: preview.window.readAt,
+              hasOlderMessages: preview.window.hasOlderMessages,
+              complete: preview.window.complete,
+            },
+          }
+        : {}),
+    };
+  }
+  subscribeReads(sessionId: string, listener: () => void) {
+    return this.readCache.subscribe(this.lease.scope, sessionId, listener);
+  }
+  async readSession(sessionId: string, signal: AbortSignal) {
+    return this.reads.share(JSON.stringify(['session', sessionId]), signal, async (signal) => {
+      const entry = this.cacheEntry(sessionId);
+      const generation = entry.generation;
+      const result = await this.request('agent.sessions.get', { sessionId }, signal);
+      this.readCache.put(entry, generation, 'session', result.session);
+      return projectSession(result.session);
+    });
+  }
+  private historyRequest: AgentRequest = (method, params, signal = this.lease.signal) =>
+    this.reads.run(signal, () => this.request(method, params, signal));
+  private content(sessionId: string, ref: ContentRef, signal: AbortSignal): Promise<Uint8Array> {
+    const entry = this.cacheEntry(sessionId);
+    const generation = entry.generation;
+    const key = JSON.stringify([
+      'content',
+      ref.contentId,
+      ref.revision,
+      ref.sha256,
+      ref.byteLength,
+    ]);
+    const cached = this.readCache.get<Uint8Array>(entry, key);
+    if (cached) return Promise.resolve(cached);
+    return this.reads.share(
+      JSON.stringify([sessionId, generation, key]),
+      signal,
+      async (signal) => {
+        const bytes = await readContent(this.historyRequest, sessionId, ref, signal);
+        this.readCache.put(entry, generation, key, bytes);
+        return bytes;
+      },
+    );
+  }
+  private messageParts(sessionId: string, message: AgentMessageListItem, signal: AbortSignal) {
+    const entry = this.cacheEntry(sessionId);
+    const generation = entry.generation;
+    const key = this.readCache.partsKey(message);
+    const cached = this.readCache.get<AgentPart[]>(entry, key);
+    if (cached) return Promise.resolve(cached);
+    return this.reads.share(
+      JSON.stringify([sessionId, generation, key]),
+      signal,
+      async (signal) => {
+        const parts: AgentPart[] = [];
+        let next: string | undefined;
+        const visited = new Set<string>();
+        do {
+          const page = await this.historyRequest(
+            'agent.parts.list',
+            {
+              sessionId,
+              messageId: message.messageId,
+              messageRevision: message.revision,
+              cursor: next,
+            },
+            signal,
+          );
+          parts.push(
+            ...(await Promise.all(
+              page.items.map(
+                async (part): Promise<AgentPart> =>
+                  (part.kind === 'text' || part.kind === 'reasoning') && 'ref' in part.content
+                    ? {
+                        ...part,
+                        content: {
+                          text: decodeContent(
+                            await this.content(sessionId, part.content.ref, signal),
+                          ),
+                        },
+                      }
+                    : part,
+              ),
+            )),
+          );
+          next = page.nextCursor ?? undefined;
+          if (next && visited.has(next)) throw new RemoteAgentError('PROTOCOL_ERROR');
+          if (next) visited.add(next);
+        } while (next);
+        this.readCache.put(entry, generation, key, parts);
+        return parts;
+      },
+    );
+  }
+  history(sessionId: string, version: string, cursor: string | undefined, signal: AbortSignal) {
+    return this.reads.share(
+      JSON.stringify(['history', sessionId, version, cursor]),
+      signal,
+      (signal) => this.readHistory(sessionId, version, cursor, signal),
+    );
+  }
+  private async readHistory(
+    sessionId: string,
+    version: string,
+    cursor: string | undefined,
+    signal: AbortSignal,
+  ) {
+    const entry = this.cacheEntry(sessionId);
+    if (!this.readCache.beginHistory(entry, version))
+      throw new RemoteAgentError('REVISION_EXPIRED');
+    const generation = entry.generation;
+    const page = await this.historyRequest(
+      'agent.messages.list',
+      { sessionId, historyRevision: version, cursor },
+      signal,
+    );
+    const window = {
+      messages: page.items,
+      version,
+      readAt: Date.now(),
+      hasOlderMessages: !!page.nextCursor,
+    };
+    // Cold history can reveal completed rows while slower bodies are still loading.
+    // A warm window remains intact until its replacement is fully validated.
+    if (!cursor && !this.readCache.get(entry, 'window'))
+      this.readCache.put(entry, generation, 'window', window);
+    const items = await Promise.all(
+      page.items.map(async (message) =>
+        projectMessage(
+          sessionId,
+          message,
+          await this.messageParts(sessionId, message, signal),
+          this.issueResource,
+        ),
+      ),
+    );
+    signal.throwIfAborted();
+    if (entry.invalidated || entry.generation !== generation)
+      throw new RemoteAgentError('REVISION_EXPIRED');
+    if (!cursor) this.readCache.put(entry, generation, 'window', window);
+    return { items, next: page.nextCursor ?? undefined };
+  }
+  private issueResource = (sessionId: string, value: RemoteResourceDescriptor): string => {
+    // Hashing a part serializes its whole payload; an unchanged part object keeps its id.
+    const part = value.kind === 'part' ? value.part : undefined;
+    const issued = part && this.partResources.get(part);
+    const id =
+      issued?.sessionId === sessionId
+        ? issued.id
+        : `${this.scope}:resource:${integrity.sha256(new TextEncoder().encode(JSON.stringify({ scope: this.scope, sessionId, value })))}`;
+    if (part && issued?.id !== id) this.partResources.set(part, { sessionId, id });
+    if (!this.resources.has(id)) {
+      this.resources.set(id, { sessionId, value });
+      // Old live-input revisions may expire; no payload is copied into frontend query keys.
+      if (this.resources.size > 2048) this.resources.delete(this.resources.keys().next().value!);
+    }
+    return id;
+  };
+  async readResource(ref: string, signal: AbortSignal): Promise<RemoteResourceValue> {
+    this.assertActive();
+    signal.throwIfAborted();
+    const resource = this.resources.get(ref);
+    if (!resource) throw new RemoteAgentError('RESOURCE_UNAVAILABLE');
+    const { value, sessionId } = resource;
+    if (value.kind === 'interaction') {
+      const { interaction } = await this.request(
+        'agent.interactions.get',
+        { sessionId, interactionId: value.id },
+        signal,
+      );
+      if (interaction.revision !== value.revision || interaction.inputDigest !== value.inputDigest)
+        throw new RemoteAgentError('REVISION_EXPIRED');
+      const text =
+        'text' in interaction.input
+          ? interaction.input.text
+          : decodeContent(await this.content(sessionId, interaction.input.ref, signal));
+      if (integrity.sha256(new TextEncoder().encode(text)) !== interaction.inputDigest)
+        throw new RemoteAgentError('PROTOCOL_ERROR');
+      if (interaction.kind === 'question') {
+        const parsed = questionInputSchema.parse(JSON.parse(text));
+        return {
+          kind: 'question',
+          questions: parsed.questions.map((question) => ({
+            question: question.question,
+            header: question.header,
+            options: question.options,
+            multiple: question.multiSelect ?? false,
+          })),
+        };
+      }
+      return { kind: 'text', text };
+    }
+    const part = value.part;
+    if (part.kind === 'data' && part.name === 'file') {
+      const text =
+        'text' in part.content
+          ? part.content.text
+          : decodeContent(await this.content(sessionId, part.content.ref, signal));
+      const metadata = z
+        .object({ filename: z.string().nullable().optional(), mediaType: z.string().optional() })
+        .parse(JSON.parse(text));
+      return { kind: 'metadata', name: metadata.filename || 'file', mediaType: metadata.mediaType };
+    }
+    if (part.kind === 'file') {
+      const linked = linkAbortSignals([signal, this.lease.signal]);
+      try {
+        return {
+          kind: 'file',
+          uri: await this.downloadAttachment(
+            this.lease.scope,
+            this.historyRequest,
+            sessionId,
+            part.ref,
+            part.name,
+            linked.signal,
+          ),
+          name: part.name,
+          mediaType: part.ref.mediaType,
+          byteLength: part.ref.byteLength,
+        };
+      } finally {
+        linked.dispose();
+      }
+    }
+    return {
+      kind: 'text',
+      text:
+        'text' in part.content
+          ? part.content.text
+          : decodeContent(await this.content(sessionId, part.content.ref, signal)),
+    };
+  }
+  observe(sessionId: string, listener: (value: RemoteSessionSnapshot) => void) {
+    this.assertActive();
+    let observation = this.observations.get(sessionId);
+    if (!observation) {
+      observation = { listeners: new Set() };
+      this.observations.set(sessionId, observation);
+    }
+    const retained = observation;
+    const releaseCache = this.readCache.retain(this.cacheEntry(sessionId));
+    retained.listeners.add(listener);
+    if (retained.snapshot) listener(retained.snapshot);
+    this.startObservation(sessionId, retained);
+    return () => {
+      releaseCache();
+      retained.listeners.delete(listener);
+      if (!retained.listeners.size && !retained.tracking) {
+        this.stopObservation(retained);
+        if (this.observations.get(sessionId) === retained) this.observations.delete(sessionId);
+      }
+    };
+  }
+  private trackExecution(sessionId: string): Observation {
+    let observation = this.observations.get(sessionId);
+    if (!observation) {
+      observation = { listeners: new Set() };
+      this.observations.set(sessionId, observation);
+    }
+    observation.tracking = true;
+    observation.awaitingCheckpoint = true;
+    if (!observation.reply && this.background && !this.backgroundBlocked) {
+      observation.reply = this.background.replies.startTurn({
+        connectionId: this.lease.connectionId,
+        agentId: observation.snapshot?.session.agentId ?? '',
+        agentName: '',
+        sessionId,
+        sessionTitle: observation.snapshot?.session.title ?? '',
+        onInterrupt: () => {
+          this.backgroundBlocked = true;
+          // The desktop still owns execution. Retire only the phone's surface, without a terminal card.
+          observation!.reply?.retire();
+          observation!.reply = undefined;
+          this.publishExecution();
+        },
+      });
+    }
+    this.publishExecution();
+    return observation;
+  }
+
+  private updateExecution(sessionId: string, observation: Observation): void {
+    const snapshot = observation.snapshot;
+    if (!snapshot?.current || this.backgroundBlocked) return;
+    const execution = snapshot.executions.find((execution) =>
+      ['running', 'awaiting-approval', 'finalizing'].includes(execution.state),
+    );
+    if (execution) {
+      if (observation.executionId && observation.executionId !== execution.id) {
+        observation.reply?.finish('completed');
+        observation.reply = undefined;
+      }
+      if (!observation.tracking || !observation.reply) this.trackExecution(sessionId);
+      observation.awaitingCheckpoint = false;
+      observation.executionId = execution.id;
+      const message = snapshot.messages.find((message) => message.id === execution.messageId);
+      const pending = snapshot.interactions.find((interaction) => interaction.state === 'pending');
+      const tool = message?.parts.find(
+        (part) => part.kind === 'tool' && ['streaming', 'input-ready'].includes(part.state),
+      );
+      const text = message?.parts
+        .flatMap((part) => (part.kind === 'text' ? [part.text] : []))
+        .join('\n');
+      const phase =
+        pending?.kind === 'question'
+          ? 'awaiting-answer'
+          : pending || execution.state === 'awaiting-approval'
+            ? 'awaiting-approval'
+            : tool
+              ? 'using-tool'
+              : text
+                ? 'responding'
+                : 'thinking';
+      this.updateBackgroundInteraction(observation, pending);
+      const detail =
+        this.background?.translate(
+          execution.state === 'finalizing'
+            ? 'remoteAgent.finalizing'
+            : pending?.kind === 'question'
+              ? 'chat.question.waiting'
+              : `chat.backgroundReply.${phase === 'awaiting-approval' ? 'awaitingApproval' : phase === 'using-tool' ? 'tool.generic' : phase}`,
+        ) ?? '';
+      observation.reply?.updateContent({
+        ...(pending ? { attentionId: pending.id } : {}),
+        phase,
+        detail,
+        ...(text ? { preview: text.slice(-160) } : {}),
+      });
+      this.publishExecution();
+    } else if (
+      observation.tracking &&
+      !observation.awaitingCheckpoint &&
+      !observation.pendingSubmission
+    ) {
+      const terminal =
+        snapshot.executions.find((execution) => execution.id === observation.executionId) ??
+        snapshot.executions.at(-1);
+      this.endTracking(
+        sessionId,
+        observation,
+        terminal?.state === 'cancelled'
+          ? 'cancelled'
+          : terminal?.state === 'failed' ||
+              terminal?.state === 'interrupted' ||
+              terminal?.persistenceFailure
+            ? 'failed'
+            : 'completed',
+      );
+    }
+  }
+
+  private updateBackgroundInteraction(
+    observation: Observation,
+    pending: RemoteSessionSnapshot['interactions'][number] | undefined,
+  ): void {
+    const key = pending?.respondTarget
+      ? JSON.stringify([observation.executionId, pending.id, pending.input])
+      : undefined;
+    if (key === observation.backgroundInteractionKey) return;
+    observation.backgroundInteractionKey = key;
+    observation.reply?.setInteraction(undefined);
+    if (!pending || !key) return;
+    const currentTarget = () => {
+      const current = observation.snapshot?.interactions.find(
+        (item) =>
+          item.id === pending.id && item.state === 'pending' && item.input === pending.input,
+      );
+      if (
+        !observation.snapshot?.current ||
+        !current?.respondTarget ||
+        observation.backgroundInteractionKey !== key
+      )
+        throw new RemoteAgentError('REVISION_EXPIRED');
+      return current.respondTarget;
+    };
+    if (pending.kind !== 'question') {
+      observation.reply?.setInteraction({
+        kind: 'approval',
+        id: pending.id,
+        title: pending.title,
+        respond: async (decision) => {
+          const result = await this.respond(currentTarget(), { kind: decision });
+          if (result.status === 'rejected' || result.status === 'interrupted')
+            throw new RemoteAgentError(result.error ?? 'COMMAND_INTERRUPTED');
+        },
+      });
+      return;
+    }
+    void this.readResource(pending.input, new AbortController().signal)
+      .then((value) => {
+        if (
+          observation.backgroundInteractionKey !== key ||
+          !observation.snapshot?.current ||
+          value.kind !== 'question' ||
+          value.questions.length !== 1
+        )
+          return;
+        const [question] = value.questions;
+        if (!question || question.multiple) return;
+        observation.reply?.setInteraction({
+          kind: 'question',
+          id: pending.id,
+          question: {
+            questions: [
+              {
+                id: 'question',
+                question: question.question,
+                selection: 'single',
+                options: question.options.map((option, index) => ({
+                  id: String(index),
+                  label: option.label,
+                })),
+              },
+            ],
+          },
+          respond: async ({ answers }) => {
+            const answer = answers[0]!;
+            const selected = answer.selectedOptionIds.map(
+              (id) => question.options[Number(id)]!.label,
+            );
+            const result = await this.respond(currentTarget(), {
+              kind: 'answer',
+              answers: {
+                [question.question]: [...selected, ...(answer.text ? [answer.text] : [])].join(
+                  ', ',
+                ),
+              },
+            });
+            if (result.status === 'rejected' || result.status === 'interrupted')
+              throw new RemoteAgentError(result.error ?? 'COMMAND_INTERRUPTED');
+          },
+        });
+      })
+      .catch(() => {
+        /* An unreadable or expired interaction retains the in-app recovery path. */
+      });
+  }
+
+  /** A send the desktop never admitted must not settle as the previous turn's outcome. */
+  private settleUnadmittedSend(sessionId: string, observation: Observation): void {
+    observation.awaitingCheckpoint = false;
+    if (observation.tracking && !observation.executionId && !observation.pendingSubmission)
+      this.endTracking(sessionId, observation, 'failed');
+    else this.updateExecution(sessionId, observation);
+  }
+
+  private endTracking(
+    sessionId: string,
+    observation: Observation,
+    outcome: 'completed' | 'failed' | 'cancelled',
+  ): void {
+    observation.reply?.finish(outcome);
+    observation.reply = undefined;
+    observation.tracking = false;
+    observation.awaitingCheckpoint = false;
+    observation.executionId = undefined;
+    this.publishExecution();
+    if (!observation.listeners.size) {
+      this.stopObservation(observation);
+      if (this.observations.get(sessionId) === observation) this.observations.delete(sessionId);
+    }
+  }
+
+  private async withPreparation<T>(work: () => Promise<T>): Promise<T> {
+    this.preparing++;
+    const lease = this.background?.keepAlive.acquire('remote.chat.preparation', () => {
+      this.backgroundBlocked = true;
+      this.publishExecution();
+    });
+    this.publishExecution();
+    try {
+      return await work();
+    } finally {
+      this.preparing--;
+      lease?.release();
+      this.publishExecution();
+    }
+  }
+
+  private refreshExecutionCheckpoint(sessionId: string): void {
+    const observation = this.trackExecution(sessionId);
+    this.stopObservation(observation);
+    this.startObservation(sessionId, observation);
+  }
+
+  private startObservation(sessionId: string, observation: Observation) {
+    if (this.stopped || observation.sync || this.state.status !== 'ready') return;
+    this.track(
+      this.lease.ready(this.lease.signal).then((session) => {
+        if (
+          this.stopped ||
+          observation.sync ||
+          this.observations.get(sessionId) !== observation ||
+          this.state.status !== 'ready'
+        )
+          return;
+        const sync = new SessionSync(
+          sessionId,
+          {
+            request: (method, params, signal) =>
+              this.call(session, method, params, signal ?? this.lease.signal),
+            onNotification: session.onNotification.bind(session),
+            readContent: (ref, signal) => this.content(sessionId, ref, signal),
+          },
+          (projection, current) => {
+            if (this.lease.signal.aborted || observation.sync !== sync) return;
+            if (current) observation.retries = 0;
+            if (current) observation.awaitingCheckpoint = false;
+            this.publishObservation(sessionId, observation, projection, current);
+          },
+          (error) => {
+            if (observation.sync !== sync) return;
+            this.stopObservation(observation);
+            // A deleted or forbidden session cannot report its execution again;
+            // stop holding background demand for it.
+            if (
+              observation.tracking &&
+              error instanceof RemoteAgentError &&
+              !error.retryable &&
+              error.code !== 'CLOSED'
+            ) {
+              this.endTracking(sessionId, observation, 'failed');
+              if (!observation.listeners.size) return;
+            }
+            if (observation.snapshot) {
+              observation.snapshot = {
+                ...observation.snapshot,
+                current: false,
+                sendTarget: undefined,
+              };
+              for (const listener of observation.listeners) listener(observation.snapshot);
+            }
+            if (!this.stopped && this.state.status === 'ready') {
+              const attempt = observation.retries ?? 0;
+              observation.retries = attempt + 1;
+              observation.retryTimer = setTimeout(
+                () => this.startObservation(sessionId, observation),
+                Math.min(20_000, 1000 * 2 ** Math.min(attempt, 5)),
+              );
+            }
+          },
+        );
+        observation.sync = sync;
+        return this.track(sync.start());
+      }),
+    ).catch(() => undefined);
+  }
+  private stopObservation(observation: Observation) {
+    clearTimeout(observation.retryTimer);
+    const sync = observation.sync;
+    observation.sync = undefined;
+    sync?.stop();
+    if (sync) this.track(sync.drain());
+  }
+  private target(value: string, kind: 'send' | 'cancel' | 'respond') {
+    this.assertActive();
+    const target = targetSchema.parse(JSON.parse(value));
+    const snapshot = this.observations.get(target.params.sessionId)?.snapshot;
+    const valid =
+      kind === 'send'
+        ? snapshot?.sendTarget === value
+        : kind === 'cancel'
+          ? snapshot?.executions.some((execution) => execution.cancelTarget === value)
+          : snapshot?.interactions.some((interaction) => interaction.respondTarget === value);
+    const pending = this.actions
+      .get()
+      .some(
+        (command) =>
+          command.status === 'pending' &&
+          command.kind === kind &&
+          command.sessionId === target.params.sessionId &&
+          (kind !== 'respond' || command.interactionId === target.params.interactionId),
+      );
+    if (
+      pending ||
+      target.scope !== this.scope ||
+      target.kind !== kind ||
+      !snapshot?.current ||
+      !valid ||
+      this.state.status !== 'ready'
+    )
+      throw new RemoteAgentError('CONFLICT');
+    return target.params;
+  }
+  stageAttachments: NonNullable<RemoteAgentSource['stageAttachments']> = (key, target, files) => {
+    this.assertActive();
+    if (!this.state.preupload || !this.attachmentDrafts)
+      throw new RemoteAgentError('UPGRADE_REQUIRED');
+    this.attachmentDrafts.stage(key, target, files);
+  };
+  start(input: Parameters<RemoteAgentSource['start']>[0]) {
+    this.assertActive();
+    return this.track(
+      this.withPreparation(async () => {
+        const prepared =
+          input.attachments?.length && this.state.preupload
+            ? await this.attachmentDrafts!.prepare(
+                `draft:${input.draftId}`,
+                {
+                  agentId: input.agentId,
+                  workspace: input.workspace ?? { kind: 'registered', id: input.workspaceId! },
+                },
+                input.attachments,
+              )
+            : undefined;
+        const result = await this.actions.start(input, prepared);
+        if (prepared) this.attachmentDrafts!.submitted(prepared.selectionId);
+        return result;
+      }),
+    );
+  }
+  send(target: string, text: string, attachments?: Parameters<RemoteAgentSource['send']>[2]) {
+    const params = this.target(target, 'send');
+    agentMethods['agent.messages.send'].params.parse({
+      ...params,
+      commandId: 'validation',
+      text,
+      ...(attachments?.length
+        ? { attachments: attachments.map((file) => ({ uploadId: file.fileEntryId })) }
+        : {}),
+    });
+    const observation = this.trackExecution(params.sessionId);
+    observation.pendingSubmission = true;
+    return this.track(
+      this.withPreparation(async () => {
+        try {
+          const prepared =
+            attachments?.length && this.state.preupload
+              ? await this.attachmentDrafts!.prepare(
+                  `session:${params.sessionId}`,
+                  { sessionId: params.sessionId },
+                  attachments,
+                )
+              : undefined;
+          const commandId = randomUUID();
+          const command = await this.actions.create(
+            'send',
+            'agent.messages.send',
+            {
+              ...params,
+              text,
+              ...(prepared
+                ? { attachments: prepared.uploaded, selectionId: prepared.selectionId }
+                : {}),
+            },
+            text,
+            commandId,
+            attachments,
+          );
+          if (prepared) this.attachmentDrafts!.submitted(prepared.selectionId);
+          if (command.status === 'pending') observation.pendingCommandId = command.id;
+          else observation.pendingSubmission = false;
+          if (command.status === 'applied') this.refreshExecutionCheckpoint(params.sessionId);
+          else if (command.status === 'rejected' || command.status === 'interrupted') {
+            this.settleUnadmittedSend(params.sessionId, observation);
+            if (command.error === 'CONFLICT')
+              void this.resync(params.sessionId).catch(() => undefined);
+          }
+          return command;
+        } catch (error) {
+          observation.pendingSubmission = false;
+          this.settleUnadmittedSend(params.sessionId, observation);
+          throw error;
+        }
+      }),
+    );
+  }
+
+  cancel(target: string) {
+    return this.track(
+      this.actions.create('cancel', 'agent.executions.cancel', this.target(target, 'cancel')),
+    );
+  }
+  respond(target: string, input: Parameters<RemoteAgentSource['respond']>[1]) {
+    const response = interactionResponseSchema.parse(input);
+    return this.track(
+      this.actions.create('respond', 'agent.interactions.respond', {
+        ...this.target(target, 'respond'),
+        ...(response.kind === 'approve' || (response.kind === 'deny' && !response.reason)
+          ? { decision: response.kind }
+          : { response }),
+      }),
+    );
+  }
+  discard(id: string) {
+    this.assertActive();
+    this.actions.discard(id);
+  }
+  release(id: string) {
+    this.assertActive();
+    this.actions.release(id);
+  }
+  private scheduleRecovery() {
+    clearTimeout(this.recoveryTimer);
+    if (
+      !this.stopped &&
+      this.state.status === 'ready' &&
+      (this.actions.get().some((action) => action.status === 'pending') ||
+        this.actions.getStarts().some((start) => start.status === 'pending') ||
+        this.attachmentDrafts?.hasPending())
+    )
+      this.recoveryTimer = setTimeout(() => {
+        void this.actions.recover();
+        this.attachmentDrafts?.recover();
+      }, 5000);
+  }
+  dispose() {
+    if (this.stopped) return;
+    this.stopped = true;
+    this.taskCatalog.reset();
+    clearTimeout(this.recoveryTimer);
+    this.unsubscribe();
+    this.unoperations();
+    this.pendingCommandLease?.release();
+    this.pendingCommandLease = undefined;
+    this.actions.stop();
+    this.attachmentDrafts?.stop();
+    for (const observation of this.observations.values()) {
+      observation.reply?.finish('cancelled');
+      this.stopObservation(observation);
+    }
+    this.lease.setBackgroundRequired?.(false);
+    this.observations.clear();
+    this.resources.clear();
+    this.lease.release();
+  }
+  async drain() {
+    while (this.work.size) await Promise.allSettled([...this.work]);
+    await this.actions.drain();
+    await this.attachmentDrafts?.drain();
+  }
+}

@@ -1,0 +1,530 @@
+import {
+  WEB_FETCH_TOOL_NAME,
+  WEB_SEARCH_TOOL_NAME,
+  webSearchOutputSchema,
+} from '@cherrystudio/universal/ai/builtinTools';
+
+import type { MessageListItem, ToolMessagePart } from '@/frontend/components/Message';
+import {
+  type AgentErrorView,
+  type AgentMessagePart,
+  type AgentMessageView,
+  type AgentSubmitMessageInput,
+  AgentToolResultSchema,
+} from '@/shared/contracts/agent';
+import { type FileEntryId, fileEntryUrl } from '@/shared/data/types/file';
+import type { CherryMessagePart, MessageStatus } from '@/shared/data/types/message';
+import { withCherryMeta } from '@/shared/data/types/uiParts';
+import { classifyAgentFailureReason } from '@/shared/utils/agentFailure';
+import { projectAgentMessageDisplay } from '@/shared/utils/agentMessageDisplay';
+
+type SourceUrlPart = Extract<CherryMessagePart, { type: 'source-url' }>;
+
+type AgentPartProjection = Readonly<{
+  part: CherryMessagePart;
+  sourceParts: readonly SourceUrlPart[];
+}>;
+
+type AgentMessageItemProjection = Readonly<{
+  item: MessageListItem;
+  source: AgentMessageView;
+}>;
+
+export type AgentMessageListProjectionCache = {
+  items: readonly MessageListItem[];
+  itemsByMessageId: Map<string, AgentMessageItemProjection>;
+  partsBySource: WeakMap<AgentMessagePart, AgentPartProjection>;
+};
+
+export function createAgentMessageListProjectionCache(): AgentMessageListProjectionCache {
+  return {
+    items: [],
+    itemsByMessageId: new Map(),
+    partsBySource: new WeakMap(),
+  };
+}
+
+function toDisplayStatus(status: AgentMessageView['status']): MessageStatus {
+  switch (status) {
+    case 'pending':
+    case 'streaming':
+      return 'pending';
+    case 'error':
+      return 'error';
+    case 'cancelled':
+    case 'interrupted':
+      return 'paused';
+    case 'success':
+      return 'success';
+  }
+}
+
+function toErrorPart(error: AgentErrorView): CherryMessagePart {
+  const failure =
+    error.failure ??
+    ({
+      version: 1,
+      reasonCode: classifyAgentFailureReason({ code: error.code, message: error.message }),
+      source: { layer: 'host', code: error.code },
+    } as const);
+
+  return {
+    type: 'data-error',
+    data: {
+      code: error.code,
+      message: error.message,
+      retryable: error.retryable,
+      ...failure,
+    },
+  } as CherryMessagePart;
+}
+
+function toToolPart(part: Extract<AgentMessagePart, { type: 'dynamic-tool' }>): CherryMessagePart {
+  const result = AgentToolResultSchema.safeParse(part.output);
+  const base = {
+    ...(part.toolRef.source === 'mcp'
+      ? {
+          toolMetadata: {
+            cherry: { tool: { type: 'mcp' as const, serverId: part.toolRef.serverId } },
+          },
+        }
+      : {}),
+    ...(part.toolRef.source === 'mcp' && result.success && result.data.mcpSource
+      ? { mcpSource: result.data.mcpSource }
+      : {}),
+    ...(part.toolRef.source === 'mcp' && result.success && result.data.mcpApp
+      ? { mcpApp: result.data.mcpApp }
+      : {}),
+    input: part.input,
+    ...(part.inputPreview ? { inputPreview: part.inputPreview } : {}),
+    ...(part.progress ? { progress: part.progress } : {}),
+    ...(part.state === 'running'
+      ? { executionState: 'running' as const }
+      : part.state === 'input-available'
+        ? { executionState: 'pending' as const }
+        : {}),
+    title: part.title,
+    toolCallId: part.toolCallId,
+    toolName: part.toolName,
+    type: 'dynamic-tool',
+  } as const;
+
+  switch (part.state) {
+    case 'input-streaming':
+      return { ...base, state: 'input-streaming' } as CherryMessagePart;
+    case 'input-available':
+    case 'running':
+      return { ...base, state: 'input-available' } as CherryMessagePart;
+    case 'awaiting-approval':
+      return part.approvalId
+        ? ({
+            ...base,
+            approval: { id: part.approvalId },
+            state: 'approval-requested',
+          } as CherryMessagePart)
+        : ({ ...base, state: 'input-available' } as CherryMessagePart);
+    case 'output-available':
+      return {
+        ...base,
+        output: unwrapToolOutput(part.output),
+        state: 'output-available',
+      } as CherryMessagePart;
+    case 'denied':
+      return {
+        ...base,
+        state: 'output-denied',
+      } as CherryMessagePart;
+    case 'error': {
+      // The tool's own error text is diagnostic detail; renderers translate
+      // the status and fall back to app copy when no detail exists.
+      const failedPart = {
+        ...base,
+        errorCode: part.error?.failure?.source.code ?? part.error?.code,
+        errorText: part.error?.message ?? '',
+        state: 'output-error',
+      } satisfies ToolMessagePart;
+      return failedPart;
+    }
+    case 'interrupted':
+      return withCherryMeta(
+        { ...base, errorText: '', state: 'output-error' } as Extract<
+          CherryMessagePart,
+          { type: 'dynamic-tool' }
+        >,
+        { settledByApp: true },
+      );
+  }
+}
+
+/** Shared tool renderers consume the capability value, not the Runtime envelope. */
+function unwrapToolOutput(output: Extract<AgentMessagePart, { type: 'dynamic-tool' }>['output']) {
+  const parsed = AgentToolResultSchema.safeParse(output);
+  return parsed.success ? parsed.data.value : output;
+}
+
+function toDisplayPart(part: AgentMessagePart): CherryMessagePart {
+  switch (part.type) {
+    case 'source-url':
+      return {
+        type: 'source-url',
+        sourceId: part.sourceId,
+        url: part.url,
+        providerMetadata: { cherry: { nativeWeb: true } },
+        ...(part.title ? { title: part.title } : {}),
+      };
+    case 'data-search-suggestions':
+    case 'data-compaction-anchor':
+      return part;
+    case 'text':
+      return part.pluginReferences?.length ||
+        part.skillReferences?.length ||
+        part.selectionReferences?.length ||
+        part.sshReferences?.length ||
+        part.skillSelections?.length ||
+        part.skillAction ||
+        part.quotes
+        ? withCherryMeta(
+            { type: 'text', text: part.text, state: part.state },
+            {
+              ...(part.quotes ? { quotes: part.quotes, quoteAuthor: part.quoteAuthor } : {}),
+              references: [
+                ...(part.pluginReferences ?? []),
+                ...(part.skillReferences ?? []),
+                ...(part.selectionReferences ?? []),
+                ...(part.sshReferences ?? []),
+                ...(part.skillAction ? [{ type: 'skill-action', action: part.skillAction }] : []),
+                ...(part.skillSelections ?? []).map((activation) => ({
+                  type: 'skill',
+                  ...activation,
+                })),
+              ],
+            },
+          )
+        : { type: 'text', text: part.text, state: part.state };
+    case 'reasoning':
+      return {
+        type: part.type,
+        text: part.text,
+        state: part.state,
+        ...(part.hasText !== undefined
+          ? { providerMetadata: { cherry: { hasText: part.hasText } } }
+          : {}),
+      } as CherryMessagePart;
+    case 'file':
+      return withCherryMeta(
+        {
+          type: 'file',
+          filename: part.filename ?? 'File',
+          mediaType: part.mediaType,
+          url: fileEntryUrl(part.fileEntryId as FileEntryId),
+        } as Extract<CherryMessagePart, { type: 'file' }>,
+        { fileEntryId: part.fileEntryId },
+      );
+    case 'dynamic-tool':
+      return toToolPart(part);
+    case 'data-error':
+      return toErrorPart(part.data);
+  }
+}
+
+function toSourceUrlParts(
+  part: Extract<AgentMessagePart, { type: 'dynamic-tool' }>,
+): SourceUrlPart[] {
+  if (
+    (part.state !== 'output-available' && part.state !== 'error') ||
+    part.toolRef.source !== 'builtin'
+  ) {
+    return [];
+  }
+
+  const capabilityId = part.toolRef.capabilityId;
+  if (capabilityId !== WEB_SEARCH_TOOL_NAME && capabilityId !== WEB_FETCH_TOOL_NAME) {
+    return [];
+  }
+
+  const result = AgentToolResultSchema.safeParse(part.output);
+  if (!result.success) {
+    return [];
+  }
+
+  const value = result.data.value;
+  const details =
+    part.state === 'error' && value !== null && typeof value === 'object' && !Array.isArray(value)
+      ? value.details
+      : undefined;
+  const sources =
+    details !== null && typeof details === 'object' && !Array.isArray(details)
+      ? details.results
+      : value;
+  const output = webSearchOutputSchema.safeParse(sources);
+  if (!output.success) {
+    return [];
+  }
+
+  return output.data.map((source) => ({
+    sourceId: String(source.id),
+    title: source.title,
+    type: 'source-url',
+    url: source.url,
+  }));
+}
+
+function projectAgentPart(
+  part: AgentMessagePart,
+  cache: AgentMessageListProjectionCache | undefined,
+): AgentPartProjection {
+  const cached = cache?.partsBySource.get(part);
+  if (cached) {
+    return cached;
+  }
+
+  const projection = {
+    part: toDisplayPart(part),
+    sourceParts: part.type === 'dynamic-tool' ? toSourceUrlParts(part) : [],
+  } satisfies AgentPartProjection;
+  cache?.partsBySource.set(part, projection);
+  return projection;
+}
+
+function toDisplayParts(
+  parts: readonly AgentMessagePart[],
+  cache?: AgentMessageListProjectionCache,
+): Pick<NonNullable<MessageListItem['data']>, 'partKeys' | 'parts' | 'attachmentReports'> {
+  const attachmentReports: Record<
+    string,
+    NonNullable<MessageListItem['data']['attachmentReports']>[string]
+  > = {};
+  const displayParts: CherryMessagePart[] = [];
+  const partKeys: string[] = [];
+  const sourceParts: SourceUrlPart[] = [];
+  const sourcePartKeys: string[] = [];
+
+  for (const sourcePart of parts) {
+    if (sourcePart.type === 'file' && sourcePart.attachmentReport) {
+      attachmentReports[sourcePart.id] = sourcePart.attachmentReport;
+    }
+    const projection = projectAgentPart(sourcePart, cache);
+    displayParts.push(projection.part);
+    partKeys.push(sourcePart.id);
+
+    projection.sourceParts.forEach((source, index) => {
+      sourceParts.push(source);
+      sourcePartKeys.push(`${sourcePart.id}:source:${source.sourceId ?? source.url}:${index}`);
+    });
+  }
+
+  // Synthetic sources stay at the tail, but their identity is derived from the
+  // tool part rather than from their changing array position.
+  return {
+    ...(Object.keys(attachmentReports).length > 0 ? { attachmentReports } : {}),
+    partKeys: [...partKeys, ...sourcePartKeys],
+    parts: [...displayParts, ...sourceParts],
+  };
+}
+
+export function resolveMessageModel(message: AgentMessageView): MessageListItem['model'] {
+  if (message.inferenceSnapshot?.status !== 'supported') {
+    return undefined;
+  }
+
+  const snapshot = message.inferenceSnapshot.snapshot.model;
+  const name = snapshot.name.trim();
+
+  if (!name) {
+    return undefined;
+  }
+
+  return {
+    id: snapshot.uniqueModelId,
+    modelId: snapshot.modelId,
+    name,
+    providerId: snapshot.providerId,
+  };
+}
+
+export function toAgentMessageListItem(
+  message: AgentMessageView,
+  cache?: AgentMessageListProjectionCache,
+): MessageListItem | undefined {
+  if (message.role !== 'user' && message.role !== 'assistant') {
+    return undefined;
+  }
+
+  const cached = cache?.itemsByMessageId.get(message.id);
+  if (cached?.source === message) {
+    return cached.item;
+  }
+
+  const model = resolveMessageModel(message);
+  const item = {
+    agentSessionId: message.sessionId,
+    createdAt: message.createdAt,
+    data: {
+      ...toDisplayParts(
+        message.status === 'cancelled'
+          ? projectAgentMessageDisplay(message).parts.filter(
+              (part) =>
+                part.type !== 'data-error' ||
+                (part.data.code !== 'CANCELLED' && part.data.failure?.source.code !== 'aborted'),
+            )
+          : projectAgentMessageDisplay(message).parts,
+        cache,
+      ),
+      ...(message.translations ? { translations: message.translations } : {}),
+    },
+    id: message.id,
+    ...(message.inferenceSnapshot?.status === 'supported' &&
+    message.inferenceSnapshot.snapshot.imageGeneration
+      ? { imageGeneration: message.inferenceSnapshot.snapshot.imageGeneration }
+      : {}),
+    ...(model ? { model } : {}),
+    // Only answers are switched in the transcript; a question has one answer path to follow.
+    ...(message.siblings && message.role === 'assistant'
+      ? {
+          branch: {
+            key: `answers:${message.parentId}`,
+            siblings: message.siblings.map((sibling) => ({
+              id: sibling.id,
+              status: toDisplayStatus(sibling.id === message.id ? message.status : sibling.status),
+              modelId: sibling.modelId,
+            })),
+          },
+        }
+      : {}),
+    // Editing a sent question adds a sibling question; the row offers those versions.
+    ...(message.siblings && message.role === 'user'
+      ? { questionBranch: { siblings: message.siblings.map((sibling) => sibling.id) } }
+      : {}),
+    role: message.role,
+    ...(message.stats ? { stats: message.stats } : {}),
+    status: toDisplayStatus(message.status),
+    ...(message.turnId ? { turnId: message.turnId } : {}),
+  } satisfies MessageListItem;
+  cache?.itemsByMessageId.set(message.id, { item, source: message });
+  return item;
+}
+
+/** Immediate display of a send, using the same row IDs that persistence will receive. */
+export function createPendingChatMessages(
+  input: Pick<
+    AgentSubmitMessageInput,
+    'parts' | 'userMessageId' | 'assistantMessageId' | 'imageGeneration'
+  >,
+): readonly [MessageListItem, MessageListItem] {
+  const createdAt = new Date().toISOString();
+  const inputFileEntryIds = input.parts.flatMap((part) =>
+    part.type === 'file' ? [part.fileEntryId] : [],
+  );
+  const parts = input.parts.map(
+    (part, index): AgentMessagePart =>
+      part.type === 'file'
+        ? { ...part, id: `input-${index}`, purpose: 'input-attachment' }
+        : { ...part, id: `input-${index}`, state: 'done' },
+  );
+  return [
+    {
+      createdAt,
+      data: toDisplayParts(parts),
+      id: input.userMessageId,
+      role: 'user',
+      status: 'pending',
+    },
+    {
+      createdAt,
+      data: { parts: [] },
+      id: input.assistantMessageId,
+      ...(input.imageGeneration ? { imageGeneration: input.imageGeneration } : {}),
+      ...(inputFileEntryIds.length > 0 ? { inputFileEntryIds } : {}),
+      role: 'assistant',
+      status: 'pending',
+    },
+  ];
+}
+
+export function mergeAgentMessageViews(
+  persisted: readonly AgentMessageView[],
+  live: readonly AgentMessageView[],
+): readonly AgentMessageView[] {
+  if (live.length === 0) {
+    return orderMessageParents(persisted);
+  }
+  if (persisted.length === 0) {
+    return orderMessageParents(live);
+  }
+
+  const liveById = new Map(live.map((message) => [message.id, message]));
+  const persistedIds = new Set(persisted.map((message) => message.id));
+  const compareMessages = (left: AgentMessageView, right: AgentMessageView) =>
+    Date.parse(left.createdAt) - Date.parse(right.createdAt) ||
+    // Use reservation order only to place detached live rows around a bounded history window.
+    (left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
+  // Arrival order also orders accepted steer questions whose intervening assistant has no output yet.
+  const newLive = live.filter((message) => !persistedIds.has(message.id));
+  const merged: AgentMessageView[] = [];
+  let liveIndex = 0;
+
+  // A bounded history window can omit older live rows. Insert them in transcript
+  // order instead of moving old questions after the latest saved answers.
+  for (const message of persisted) {
+    while (liveIndex < newLive.length && compareMessages(newLive[liveIndex], message) < 0) {
+      merged.push(newLive[liveIndex++]);
+    }
+    const active = liveById.get(message.id);
+    merged.push(
+      active &&
+        message.translations &&
+        active.translations !== message.translations &&
+        (!active.translations || message.updatedAt >= active.updatedAt)
+        ? { ...active, translations: message.translations }
+        : (active ?? message),
+    );
+  }
+  merged.push(...newLive.slice(liveIndex));
+  return orderMessageParents(merged);
+}
+
+function orderMessageParents(messages: readonly AgentMessageView[]): readonly AgentMessageView[] {
+  const byId = new Map(messages.map((message) => [message.id, message]));
+  const visited = new Set<string>();
+  const ordered: AgentMessageView[] = [];
+  function visit(message: AgentMessageView) {
+    if (visited.has(message.id)) return;
+    visited.add(message.id);
+    const parent = message.parentId ? byId.get(message.parentId) : undefined;
+    if (parent) visit(parent);
+    ordered.push(message);
+  }
+  for (const message of messages) visit(message);
+  return ordered.every((message, index) => message === messages[index]) ? messages : ordered;
+}
+
+export function toAgentMessageListItems(
+  messages: readonly AgentMessageView[],
+  cache?: AgentMessageListProjectionCache,
+): readonly MessageListItem[] {
+  const items = messages.flatMap((message) => {
+    const item = toAgentMessageListItem(message, cache);
+    return item ? [item] : [];
+  });
+
+  if (!cache) {
+    return items;
+  }
+
+  const activeMessageIds = new Set(messages.map((message) => message.id));
+  for (const messageId of cache.itemsByMessageId.keys()) {
+    if (!activeMessageIds.has(messageId)) {
+      cache.itemsByMessageId.delete(messageId);
+    }
+  }
+
+  if (
+    cache.items.length === items.length &&
+    cache.items.every((previousItem, index) => previousItem === items[index])
+  ) {
+    return cache.items;
+  }
+
+  cache.items = items;
+  return items;
+}

@@ -1,0 +1,84 @@
+# File Preview WebView
+
+The trusted page that renders `@cherrystudio/file-preview` (PDF, DOCX, PPTX, XLSX and RTF) inside the
+file viewer's WebView. The package owns rendering and in-document interaction; this page only wires
+it to the app: bytes, PDF resources, theme, locale, diagnostics, structural selections and the
+system-open request.
+The app side lives in [`src/frontend/features/files`](../../src/frontend/features/files/README.md).
+
+> Status: uses the published npm package `@cherrystudio/file-preview@0.2.7`.
+> Install scripts were skipped for this upgrade; regenerating `dist/` and native acceptance remain
+> pending.
+
+## Build
+
+`postinstall` runs `vite build`, so every `pnpm install` (development, CI and EAS) regenerates
+`dist/`. The output is not committed:
+
+| File | Content |
+| --- | --- |
+| `file-preview.html` | The page with all JavaScript, CSS and both worker sources inlined |
+| `pdf-resources.bin` | pdf.js CMaps and standard fonts, concatenated |
+| `pdf-resources.json` | `cmap/<name>` and `standard_font/<filename>` → `[offset, length]` |
+
+The app ships these as Metro assets (`bin` is registered in `metro.config.js`), reads the HTML into
+a string and loads it with `source={{ html, baseUrl: FILE_PREVIEW_BASE_URL }}`. Run
+`pnpm --filter @cherrystudio/file-preview-webview build` after changing this package.
+
+The worker sources are imported with `?raw` and started from blob URLs through
+`resources.createWorker`. The inline build escapes `</script`, `</style` and `<!--` as `\x3C`, and
+drops the package's fallback worker files because `createWorker` always takes precedence.
+
+## Page Contract
+
+- **Origin.** The page runs at `https://file-preview.local/`, which is never fetched. An opaque
+  `about:blank` origin cannot start module workers from blob URLs.
+- **CSP.** `default-src 'none'`; inline scripts and styles, and `blob:`/`data:` for workers, images,
+  fonts and media. Rendered documents cannot reach the network.
+- **Viewport.** `user-scalable=no`; the package owns pinch zoom inside its panes.
+
+## Preview Options
+
+`main.tsx` enables the package's opt-in host options: `bottomInset: 'content'`, DOCX
+`initialZoom: 'fit-width'` and `normalizeSymbolBullets`, and XLSX `opaqueHeaders`. The PDF
+outline uses `overlay` below 640 CSS pixels of page width and `panel` otherwise; a `resize`
+listener re-renders with the matching layout, so rotation needs no message from the app.
+
+The managed entry's `updatedAt` is passed as `refreshKey`. Refreshing the same entry reopens its
+bytes while retaining the package's valid reading state; Mobile clears any held structural selection.
+DOCX supports native text selection and copying. RTF is read-only, with a 10 MiB source limit and
+no structural selection references.
+
+## Bridge Protocol
+
+[`src/protocol.ts`](src/protocol.ts) is shared by the page and the app. The app validates every page
+message with `PageMessageSchema`.
+
+| Page → app | Meaning |
+| --- | --- |
+| `selection` | Captured `{ sourceId, revision, anchor, excerpt }`, or null; enabled only by host `captureSelection` |
+| `ready` | The page can receive `render` |
+| `open` | `PreviewSource.open()`; each call opens an independent document |
+| `read`, `resource` | Exact byte range of a document, or a bundled PDF resource |
+| `cancel`, `close` | Abort a request; release a document (idempotent) |
+| `diagnostic`, `error` | Routed to the app logger |
+| `requestOpen` | `unsupported` or `too_large`, handled by the app |
+
+The app answers through `window.__filePreviewPage.receive(message)`: `render` (source, locale,
+dark mode, CSS custom properties), `opened` (`size`, `revision`), and `chunk` (base64, at most
+1 MiB raw) followed by `done` or `failed` with a `PreviewErrorCode`. The page writes chunks into one
+buffer of the requested length and rejects a short total. Aborted reads reject immediately and send
+`cancel`; reads after `close` reject with `closed` on both sides. Document IDs use the page's
+monotonic open-request IDs, so late reads or closes cannot target a replacement bridge's document.
+
+## Office Selection Handoff
+
+The protocol reuses the published package's portable `DocumentAnchorSchema`; no DOM rendering
+module enters the native bundle. `captureSelection` arms structural picking. The app validates
+source identity and revision. The viewer's explicit reference action opens a new standard-Agent
+draft with the original managed attachment, structural anchor and excerpt; it never sends
+automatically. The Agent reads the referenced content and compares it with the excerpt before
+editing, following Desktop's workflow.
+
+Source changes here require regenerating the inline HTML with the existing package build. That
+build and native acceptance have not been run for this change.

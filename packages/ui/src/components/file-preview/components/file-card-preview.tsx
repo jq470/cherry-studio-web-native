@@ -1,0 +1,75 @@
+import type { ReactNode } from 'react';
+import { Text, View } from 'react-native';
+
+import { cn } from '../../../utils';
+import type { FilePreviewFile, FilePreviewVariant } from '../file-preview.types';
+import { fileDisplayStem, fileVisualPreset } from '../utils/file-presentation';
+
+/** Shared document artwork; FilePreview delegates the press to its caller. */
+export function FileCardPreview({
+  badge,
+  file,
+  iconSize = 24,
+  variant,
+}: {
+  badge?: ReactNode;
+  file: Pick<FilePreviewFile, 'displayName' | 'extensionLabel' | 'kind'>;
+  iconSize?: number;
+  variant: Exclude<FilePreviewVariant, 'thumbnail'>;
+}) {
+  const { icon: Icon, iconClassName } = fileVisualPreset(file);
+
+  if (variant === 'icon') {
+    return (
+      <View className="flex-1 items-center justify-center bg-secondary">
+        <Icon className={cn('shrink-0', iconClassName)} size={iconSize} />
+        {badge ? (
+          <View className="absolute right-1 bottom-1 max-w-3/4" pointerEvents="none">
+            {badge}
+          </View>
+        ) : null}
+      </View>
+    );
+  }
+
+  const filename = (
+    <Text
+      className={cn('w-full shrink text-foreground', variant === 'card' ? 'text-base' : 'text-sm')}
+      ellipsizeMode="tail"
+      numberOfLines={3}
+    >
+      {variant === 'card' ? file.displayName : fileDisplayStem(file.displayName)}
+    </Text>
+  );
+  const icon = (
+    <View className="w-full shrink-0 flex-row items-center justify-between gap-2">
+      <Icon className={cn('shrink-0', iconClassName, variant === 'card' ? 'size-7' : 'size-6')} />
+      {badge ? <View className="min-w-0 shrink">{badge}</View> : null}
+    </View>
+  );
+
+  return (
+    <View
+      className={cn(
+        'flex-1 items-start justify-between gap-1',
+        variant === 'card' ? 'bg-card p-4' : 'bg-secondary p-3',
+      )}
+    >
+      {variant === 'card' ? filename : icon}
+      {variant === 'card' ? (
+        icon
+      ) : file.kind === 'audio' ? (
+        <View className="w-full min-h-0 shrink gap-1">
+          {filename}
+          {file.extensionLabel ? (
+            <Text className="text-xs text-muted-foreground" numberOfLines={1}>
+              {file.extensionLabel}
+            </Text>
+          ) : null}
+        </View>
+      ) : (
+        filename
+      )}
+    </View>
+  );
+}

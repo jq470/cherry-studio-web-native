@@ -1,0 +1,73 @@
+import { agentTable } from './agent';
+import { agentGlobalSkillTable } from './agentGlobalSkill';
+import { agentSessionTable } from './agentSession';
+import { agentSessionMessageTable } from './agentSessionMessage';
+import { agentSkillTable } from './agentSkill';
+import { agentToolBindingTable } from './agentToolBinding';
+import { aiUsageRecordTable } from './aiUsageRecord';
+import { appStateTable } from './appState';
+import { desktopConnectionTable } from './desktopConnection';
+import { fileEntryTable } from './file';
+import { fileFolderTable, libraryFileTable } from './fileLibrary';
+import { jobTable } from './job';
+import { mcpServerTable } from './mcpServer';
+import { paintingTable } from './painting';
+import { paintingBoardTable } from './paintingBoard';
+import { pluginAuthorizationTable } from './pluginAuthorization';
+import { preferenceTable } from './preference';
+import { userModelTable } from './userModel';
+import { userProviderTable } from './userProvider';
+
+export * from './agent';
+export * from './agentGlobalSkill';
+export * from './agentSkill';
+export * from './agentToolBinding';
+export * from './agentSession';
+export * from './agentSessionMessage';
+export * from './aiUsageRecord';
+export * from './desktopConnection';
+export { monotonicUpdateTimestamp } from './_columnHelpers';
+export * from './job';
+export * from './mcpServer';
+export * from './painting';
+export * from './paintingBoard';
+export * from './pluginAuthorization';
+export * from './userModel';
+export * from './userProvider';
+
+export { appStateTable } from './appState';
+export { fileEntryTable } from './file';
+export * from './fileLibrary';
+export { DEFAULT_PREFERENCE_SCOPE, preferenceTable } from './preference';
+
+export type AppStateRow = typeof appStateTable.$inferSelect;
+export type InsertAppStateRow = typeof appStateTable.$inferInsert;
+export type FileEntryRow = typeof fileEntryTable.$inferSelect;
+export type InsertFileEntryRow = typeof fileEntryTable.$inferInsert;
+export type PreferenceRow = typeof preferenceTable.$inferSelect;
+export type InsertPreferenceRow = typeof preferenceTable.$inferInsert;
+
+export const schema = {
+  agentTable,
+  agentGlobalSkillTable,
+  agentSkillTable,
+  agentToolBindingTable,
+  agentSessionTable,
+  agentSessionMessageTable,
+  aiUsageRecordTable,
+  appStateTable,
+  desktopConnectionTable,
+  fileEntryTable,
+  fileFolderTable,
+  libraryFileTable,
+  jobTable,
+  mcpServerTable,
+  pluginAuthorizationTable,
+  paintingTable,
+  paintingBoardTable,
+  preferenceTable,
+  userModelTable,
+  userProviderTable,
+};
+
+export type DatabaseSchema = typeof schema;

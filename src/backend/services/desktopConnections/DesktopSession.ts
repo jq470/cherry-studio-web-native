@@ -1,0 +1,367 @@
+import {
+  connectionMethods,
+  pairingMethods,
+  remoteAuthorizationSchema,
+  remoteFailureSchema,
+  remoteLimits,
+  uploadTransferLimits,
+  uploadAckSchema,
+  type UploadChunk,
+  type UploadAck,
+  type RemoteAuthorization,
+} from '@cherrystudio/remote-protocol';
+import { agentMethods } from '@cherrystudio/remote-protocol/agent';
+import { configurationMethods } from '@cherrystudio/remote-protocol/configuration';
+import type { SecureChannel } from '@cherrystudio/remote-transport';
+import type { MessageStream } from '@libp2p/interface';
+import { randomUUID } from 'expo-crypto';
+import { createJSONRPCErrorResponse, JSONRPCClient, JSONRPCErrorException } from 'json-rpc-2.0';
+import type * as z from 'zod';
+
+import { DesktopUnreachableError, RemoteFailureError, RemoteTransportError } from './remoteErrors';
+import { transportLogger } from './transportLogger';
+
+export { DesktopUnreachableError, RemoteFailureError, RemoteTransportError } from './remoteErrors';
+
+const PROTOCOL_VERSIONS = [1];
+const REFRESH_MARGIN_MS = 60_000;
+// json-rpc-2.0 reports its own timeouts, send failures and rejectAllPendingRequests() as error
+// responses with this code and no `data`; a desktop verdict always carries protocol `data`.
+const LOCAL_ERROR_CODE = 0;
+const TIMEOUT_MESSAGE = 'Request timeout';
+const CLOSED_MESSAGE = 'Connection closed';
+// Desktop 2.1.5 and later close the connection above 512 content reads or 64 other requests a
+// second. Each margin covers the in-flight requests a network stall can deliver at once; the
+// heartbeat is never held back and fits in the margin too.
+const CONTENT_READS_PER_SECOND = 480;
+const REQUESTS_PER_SECOND = 40;
+type SendBudget = { readonly limit: number; readonly times: number[] };
+
+export const desktopMethods = {
+  ...connectionMethods(remoteAuthorizationSchema),
+  ...pairingMethods(remoteAuthorizationSchema),
+  ...configurationMethods,
+  ...agentMethods,
+};
+export type DesktopMethod = keyof typeof desktopMethods;
+export type DesktopParams<M extends DesktopMethod> = z.input<(typeof desktopMethods)[M]['params']>;
+export type DesktopResult<M extends DesktopMethod> = z.output<(typeof desktopMethods)[M]['result']>;
+export type DesktopNotification = { method: string; params?: unknown };
+
+export interface DesktopSessionOptions {
+  stream: MessageStream;
+  secure?: typeof import('@cherrystudio/remote-transport').connectSecureChannel;
+  address: string;
+  desktopIdentity: string;
+  identity: Uint8Array;
+  signal: AbortSignal;
+}
+
+function isNotification(value: unknown): value is DesktopNotification {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'method' in value &&
+    !('id' in value) &&
+    typeof value.method === 'string'
+  );
+}
+
+function withAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return promise;
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason ?? new DOMException('Aborted', 'AbortError'));
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) abort();
+    promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+  });
+}
+
+/** One pinned encrypted stream; address selection belongs to the connection manager. */
+export class DesktopSession {
+  agentFailureVersion?: number;
+  agentUploadsVersion?: number;
+  agentUploadChecksum?: 'sha256';
+  agentAttachmentSelections?: boolean;
+  agentMessageSummariesVersion?: number;
+  connectionEndpointsVersion?: number;
+  static async connect(options: DesktopSessionOptions): Promise<DesktopSession> {
+    let session: DesktopSession | undefined;
+    try {
+      const connectSecureChannel =
+        options.secure ?? (await import('@cherrystudio/remote-transport')).connectSecureChannel;
+      const channel = await connectSecureChannel(options.stream, {
+        ...(options.secure ? {} : { crypto: (await import('./remoteCrypto')).remoteCrypto }),
+        identity: options.identity,
+        remoteIdentity: options.desktopIdentity,
+        logger: transportLogger,
+        protocolVersions: PROTOCOL_VERSIONS,
+        signal: options.signal,
+      });
+      session = new DesktopSession(channel, options.address);
+      const hello = await session.request(
+        'connection.hello',
+        { protocolVersions: PROTOCOL_VERSIONS },
+        options.signal,
+      );
+      session.agentFailureVersion = hello.agentFailureVersion;
+      session.agentUploadsVersion = hello.agentUploadsVersion;
+      session.agentUploadChecksum = hello.agentUploadChecksum;
+      session.agentAttachmentSelections = hello.agentAttachmentSelections;
+      session.agentMessageSummariesVersion = hello.agentMessageSummariesVersion;
+      session.connectionEndpointsVersion = hello.connectionEndpointsVersion;
+      options.signal.throwIfAborted();
+      return session;
+    } catch (error) {
+      session?.close();
+      options.stream.abort(error instanceof Error ? error : new Error('Handshake failed'));
+      throw error;
+    }
+  }
+
+  private readonly uploads = new Map<
+    string,
+    { resolve(ack: UploadAck): void; reject(error: unknown): void }
+  >();
+  async sendUploadChunk(
+    input: Omit<UploadChunk, 'kind' | 'requestId'>,
+    signal: AbortSignal,
+  ): Promise<Extract<UploadAck, { ok: true }>> {
+    signal.throwIfAborted();
+    if (this.closed) throw new DesktopUnreachableError(['connection closed']);
+    if (this.agentUploadsVersion !== 1)
+      throw new RemoteFailureError({
+        reason: 'UPGRADE_REQUIRED',
+        message: 'Binary upload is unavailable',
+      });
+    if (this.uploads.size >= uploadTransferLimits.window)
+      throw new RemoteFailureError({
+        reason: 'RESOURCE_EXHAUSTED',
+        message: 'Upload window is full',
+      });
+    const requestId = randomUUID();
+    const pending = new Promise<UploadAck>((resolve, reject) => {
+      const finish = () => {
+        clearTimeout(timer);
+        this.uploads.delete(requestId);
+      };
+      const timer = setTimeout(() => {
+        this.close();
+      }, remoteLimits.idleMs);
+      const entry = {
+        resolve: (ack: UploadAck) => {
+          finish();
+          resolve(ack);
+        },
+        reject: (error: unknown) => {
+          finish();
+          reject(error);
+        },
+      };
+      this.uploads.set(requestId, entry);
+      void Promise.resolve()
+        .then(() => this.channel.write({ kind: 'upload', requestId, ...input }))
+        .catch(entry.reject);
+    });
+    const ack = await withAbort(pending, signal);
+    if (!ack.ok) throw new RemoteFailureError(ack.error);
+    return ack;
+  }
+
+  private readonly client: JSONRPCClient;
+  private readonly listeners = new Set<(notification: DesktopNotification) => void>();
+  private authorization: RemoteAuthorization | undefined;
+  private readonly authorizationListeners = new Set<(authorization: RemoteAuthorization) => void>();
+  private refreshTimer: ReturnType<typeof setTimeout> | undefined;
+  private readonly heartbeat: ReturnType<typeof setInterval>;
+  private closed = false;
+  private inFlight = 0;
+  private readonly contentReads: SendBudget = { limit: CONTENT_READS_PER_SECOND, times: [] };
+  private readonly requests: SendBudget = { limit: REQUESTS_PER_SECOND, times: [] };
+  readonly done: Promise<void>;
+
+  constructor(
+    private readonly channel: SecureChannel,
+    readonly address: string,
+  ) {
+    this.client = new JSONRPCClient((request) => this.channel.write(request));
+    this.heartbeat = setInterval(() => {
+      // Any desktop verdict, even a refusal, proves the channel is alive; only a lost reply ends it.
+      void this.request('connection.ping', { nonce: String(Date.now()) }).catch(
+        (error: unknown) => {
+          if (!(error instanceof RemoteFailureError)) this.close();
+        },
+      );
+    }, remoteLimits.heartbeatMs);
+    this.done = this.pump();
+  }
+
+  get currentAuthorization(): RemoteAuthorization | undefined {
+    return this.authorization;
+  }
+
+  get isOpen(): boolean {
+    return !this.closed;
+  }
+
+  async request<M extends DesktopMethod>(
+    method: M,
+    params: DesktopParams<M>,
+    signal?: AbortSignal,
+  ): Promise<DesktopResult<M>> {
+    if (this.closed) throw new DesktopUnreachableError(['connection closed']);
+    signal?.throwIfAborted();
+    if (
+      (method === 'agent.attachments.present' ||
+        (method === 'agent.messages.send' && 'attachmentDraft' in params)) &&
+      this.agentAttachmentSelections !== true
+    )
+      throw new RemoteFailureError({
+        reason: 'UPGRADE_REQUIRED',
+        message: 'Desktop does not support attachment drafts',
+      });
+    if (method.startsWith('agent.uploads.') && this.agentUploadsVersion !== 1)
+      throw new RemoteFailureError({
+        reason: 'UPGRADE_REQUIRED',
+        message: 'Desktop does not support attachments',
+      });
+    if (method === 'connection.endpoints' && this.connectionEndpointsVersion !== 1)
+      throw new RemoteFailureError({
+        reason: 'UPGRADE_REQUIRED',
+        message: 'Desktop connection settings are not supported',
+      });
+    if (method.startsWith('agent.') && this.agentFailureVersion !== 1)
+      throw new RemoteFailureError({
+        reason: 'UPGRADE_REQUIRED',
+        message: 'Desktop Agent failure contract is not supported',
+      });
+    // Local load must not stop the heartbeat from measuring liveness.
+    if (method !== 'connection.ping' && this.inFlight >= remoteLimits.inFlightRequests)
+      throw new RemoteFailureError({ reason: 'RESOURCE_EXHAUSTED', message: 'Too many requests' });
+    const schema = desktopMethods[method];
+    this.inFlight++;
+    try {
+      if (method !== 'connection.ping')
+        await this.pace(
+          method === 'agent.content.read' ? this.contentReads : this.requests,
+          signal,
+        );
+      const result = await withAbort(
+        Promise.resolve(
+          this.client
+            .timeout(remoteLimits.idleMs, (id) =>
+              createJSONRPCErrorResponse(id, LOCAL_ERROR_CODE, TIMEOUT_MESSAGE),
+            )
+            .request(method, schema.params.parse(params)),
+        ),
+        signal,
+      );
+      const parsed = schema.result.parse(result);
+      if (method === 'pairing.get') {
+        const decision = parsed as DesktopResult<'pairing.get'>;
+        if (decision.status === 'approved') this.adopt(decision.authorization, decision.expiresAt);
+      }
+      return parsed as DesktopResult<M>;
+    } catch (error) {
+      if (error instanceof JSONRPCErrorException) {
+        const failure = remoteFailureSchema.safeParse(error.data);
+        if (failure.success) throw new RemoteFailureError(failure.data);
+        if (error.code === -32601 && method === 'agent.tasks.list')
+          throw new RemoteFailureError({
+            reason: 'UPGRADE_REQUIRED',
+            message: 'Desktop does not support the task catalog',
+          });
+        // Without a verdict the outcome stays unknown; callers must not record it as rejected.
+        if (error.code === LOCAL_ERROR_CODE && error.data === undefined)
+          throw new RemoteTransportError(
+            this.closed || error.message === CLOSED_MESSAGE
+              ? 'closed'
+              : error.message === TIMEOUT_MESSAGE
+                ? 'timeout'
+                : 'send-failed',
+            error.message,
+          );
+        throw new RemoteFailureError({ reason: 'INTERNAL', message: error.message });
+      }
+      throw error;
+    } finally {
+      this.inFlight--;
+    }
+  }
+
+  /** Holds a send until its slot, so no one-second span carries more than its budget. */
+  private async pace({ limit, times }: SendBudget, signal: AbortSignal | undefined): Promise<void> {
+    const now = performance.now();
+    const at = times.length < limit ? now : Math.max(now, times[0] + 1000);
+    times.push(at);
+    if (times.length > limit) times.shift();
+    if (at > now) {
+      await withAbort(new Promise<void>((resolve) => setTimeout(resolve, at - now)), signal);
+      if (this.closed) throw new DesktopUnreachableError(['connection closed']);
+    }
+  }
+
+  /** Identity is the Noise key, so no stored token is needed; the desktop's current grants come back. */
+  async authenticate(deviceId: string, signal?: AbortSignal): Promise<RemoteAuthorization> {
+    const result = await this.request('connection.authenticate', { deviceId }, signal);
+    this.adopt(result.authorization, result.expiresAt);
+    return result.authorization;
+  }
+
+  onNotification(listener: (notification: DesktopNotification) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  onAuthorization(listener: (authorization: RemoteAuthorization) => void): () => void {
+    this.authorizationListeners.add(listener);
+    return () => this.authorizationListeners.delete(listener);
+  }
+
+  close(): void {
+    for (const entry of this.uploads.values())
+      entry.reject(new DesktopUnreachableError(['connection closed']));
+    if (this.closed) return;
+    this.closed = true;
+    this.client.rejectAllPendingRequests(CLOSED_MESSAGE);
+    clearInterval(this.heartbeat);
+    clearTimeout(this.refreshTimer);
+    void this.channel.close().catch(() => undefined);
+  }
+
+  private adopt(authorization: RemoteAuthorization, expiresAt: string): void {
+    this.authorization = authorization;
+    for (const listener of this.authorizationListeners) listener(authorization);
+    clearTimeout(this.refreshTimer);
+    const delay = Math.max(1_000, Date.parse(expiresAt) - Date.now() - REFRESH_MARGIN_MS);
+    this.refreshTimer = setTimeout(() => {
+      void this.request('connection.refresh', {})
+        .then((result) => this.adopt(result.authorization, result.expiresAt))
+        .catch(() => this.close());
+    }, delay);
+  }
+
+  private async pump(): Promise<void> {
+    try {
+      while (!this.closed) {
+        const message = await this.channel.read();
+        if (isNotification(message) && message.method === 'agent.uploads.ack') {
+          const ack = uploadAckSchema.parse(message).params;
+          this.uploads.get(ack.requestId)?.resolve(ack);
+        } else if (isNotification(message)) {
+          for (const listener of this.listeners) listener(message);
+          if (message.method === 'connection.closed') this.close();
+        } else {
+          this.client.receive(message as never);
+        }
+      }
+    } catch {
+      // The channel is gone; pending callers learn it below.
+    } finally {
+      this.close();
+      this.client.rejectAllPendingRequests(CLOSED_MESSAGE);
+      this.listeners.clear();
+      this.authorizationListeners.clear();
+    }
+  }
+}

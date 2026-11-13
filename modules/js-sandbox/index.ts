@@ -1,0 +1,46 @@
+import { requireOptionalNativeModule } from 'expo';
+
+/** Per-run budgets; the caller owns the policy. Sizes are in bytes. */
+export type JsSandboxLimits = {
+  /** 0 means no time limit; cancellation still stops the run. */
+  timeoutMs: number;
+  /** Cap on everything the script's runtime allocates. */
+  memoryBytes: number;
+  maxResultBytes: number;
+  maxLogBytes: number;
+};
+
+export type JsSandboxNativeModule = {
+  /** Resolves with the outcome JSON; script failures never reject. */
+  run(runId: string, code: string, limits: JsSandboxLimits): Promise<string>;
+  /**
+   * `run` with host-chosen local file URIs exposed to trusted host code as the global `__files`.
+   * Optional on older development clients. An empty `output` means the run writes no file.
+   */
+  runFiles?(
+    runId: string,
+    code: string,
+    limits: JsSandboxLimits,
+    files: { inputs: string[]; output: string },
+  ): Promise<string>;
+  /** Interrupts a run, including one that has not started yet. */
+  cancel(runId: string): void;
+  /** Optional on older development clients. The setup is trusted host code, never model code. */
+  runBridge?(
+    runId: string,
+    setup: string,
+    data: string,
+    clock: { startedAt: number; seed: number },
+    limits: JsSandboxLimits,
+  ): Promise<string>;
+  deliver?(runId: string, message: string): void;
+  addListener?(
+    event: 'onMessage',
+    listener: (event: { runId: string; message: string }) => void,
+  ): { remove(): void };
+};
+
+/** Null on web and on clients built before this module existed. */
+export function getJsSandbox(): JsSandboxNativeModule | null {
+  return requireOptionalNativeModule<JsSandboxNativeModule>('JsSandbox');
+}

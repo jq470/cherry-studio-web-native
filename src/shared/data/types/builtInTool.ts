@@ -1,0 +1,264 @@
+/**
+ * The built-in tool catalog.
+ *
+ * One list read by the Mobile Agent Host to resolve system capabilities into a
+ * per-turn `RuntimeTool[]` snapshot.
+ *
+ * A descriptor states only what is true everywhere. Whether a tool can actually
+ * run this turn depends on model support, platform, OS permission, and
+ * application configuration.
+ */
+
+import type { AgentToolRef } from '@/shared/contracts/agent';
+import { HEALTH_SUMMARY_METRICS } from '@/shared/contracts/health';
+import {
+  type DevicePermissionScope,
+  HEALTH_PERMISSION_SCOPES,
+} from '@/shared/contracts/permissions';
+import { healthPermissionScope } from '@/shared/contracts/permissions';
+import type { WebSearchCapability } from '@/shared/data/types/webSearch';
+
+import type { AgentToolApproval } from './agentToolBinding';
+
+export const BUILT_IN_TOOL_CAPABILITY_IDS = [
+  'agent_create',
+  'agent_get',
+  'agent_list',
+  'agent_update',
+  'ask_user_question',
+  'calendar_create_event',
+  'calendar_delete_event',
+  'calendar_list_collections',
+  'calendar_list_events',
+  'calendar_update_event',
+  'create_document',
+  'create_presentation',
+  'create_workbook',
+  'edit_document',
+  'edit_file',
+  'edit_presentation',
+  'edit_workbook',
+  'list_workspace',
+  'find_workspace_files',
+  'create_workspace_folder',
+  'library_search_files',
+  'library_read_file',
+  'library_list_folders',
+  'library_move_item',
+  'library_rename_item',
+  'library_trash_item',
+  'library_list_trash',
+  'library_restore_item',
+  'generate_image',
+  'health_get_summary',
+  'health_list_workouts',
+  'health_list_data_types',
+  'health_query_data',
+  'health_get_record',
+  'inspect_office_file',
+  'location_get_current',
+  'read_file',
+  'read_office_content',
+  'run_office_script',
+  'reminder_create_item',
+  'reminder_delete_item',
+  'reminder_list_collections',
+  'reminder_list_items',
+  'reminder_update_item',
+  'run_js',
+  'transcribe_audio',
+  'ssh_execute',
+  'ssh_list_files',
+  'ssh_read_file',
+  'ssh_write_file',
+  'ssh_download_file',
+  'ssh_upload_file',
+  'web_fetch',
+  'web_search',
+  'write_file',
+] as const;
+
+export type BuiltInToolCapabilityId = (typeof BUILT_IN_TOOL_CAPABILITY_IDS)[number];
+
+export type BuiltInToolDescriptor = {
+  capabilityId: BuiltInToolCapabilityId;
+  /** Application-owned approval policy shared by every Agent. */
+  defaultApproval: AgentToolApproval;
+  /**
+   * False keeps the Agent's global `auto` approval mode from promoting this
+   * tool's `ask`: enabling a capability is not consent to spend or destroy.
+   */
+  autoApprovalEligible: boolean;
+  /** OS scopes that must be usable or requestable before the tool is offered. */
+  permissionScopes: readonly DevicePermissionScope[];
+  /** Summaries can use independently authorized metrics; other tools require every scope. */
+  permissionMatch?: 'any';
+  /** `null` means every platform. */
+  platforms: readonly ('android' | 'ios')[] | null;
+  /** Needs a drawing model configured in Settings > Model. */
+  requiresPaintingModel: boolean;
+  /** Needs a default web search provider configured for this capability. */
+  requiresWebSearchCapability?: WebSearchCapability;
+  /** `read` marks a tool that changes nothing outside the conversation; absent is a write. */
+  effect?: 'read';
+};
+
+const DEFAULTS = {
+  autoApprovalEligible: true,
+  permissionScopes: [],
+  platforms: null,
+  requiresPaintingModel: false,
+} as const;
+
+function describe(
+  capabilityId: BuiltInToolCapabilityId,
+  defaultApproval: AgentToolApproval,
+  overrides: Partial<Omit<BuiltInToolDescriptor, 'capabilityId' | 'defaultApproval'>> = {},
+): BuiltInToolDescriptor {
+  return { ...DEFAULTS, capabilityId, defaultApproval, ...overrides };
+}
+
+/**
+ * Reads default to `auto` and mutations to `ask`: a wrong list query wastes a
+ * turn, a wrong delete loses the user's data. `generate_image` asks because it
+ * spends provider quota, and stays `ask` even under the Agent's global auto
+ * mode.
+ */
+export const BUILT_IN_TOOL_DESCRIPTORS: readonly BuiltInToolDescriptor[] = [
+  describe('ssh_execute', 'ask', { autoApprovalEligible: false, platforms: ['ios', 'android'] }),
+  describe('ssh_list_files', 'ask', {
+    effect: 'read',
+    autoApprovalEligible: false,
+    platforms: ['ios', 'android'],
+  }),
+  describe('ssh_read_file', 'ask', {
+    effect: 'read',
+    autoApprovalEligible: false,
+    platforms: ['ios', 'android'],
+  }),
+  describe('ssh_write_file', 'ask', { autoApprovalEligible: false, platforms: ['ios', 'android'] }),
+  describe('ssh_download_file', 'ask', {
+    autoApprovalEligible: false,
+    platforms: ['ios', 'android'],
+  }),
+  describe('ssh_upload_file', 'ask', {
+    autoApprovalEligible: false,
+    platforms: ['ios', 'android'],
+  }),
+  describe('agent_create', 'ask'),
+  describe('agent_get', 'auto', { effect: 'read' }),
+  describe('agent_list', 'auto', { effect: 'read' }),
+  describe('agent_update', 'ask'),
+  describe('ask_user_question', 'auto'),
+  describe('calendar_list_collections', 'auto', {
+    permissionScopes: ['calendar.read'],
+    effect: 'read',
+  }),
+  describe('calendar_list_events', 'auto', {
+    permissionScopes: ['calendar.read'],
+    effect: 'read',
+  }),
+  describe('calendar_create_event', 'ask', {
+    permissionScopes: ['calendar.write'],
+  }),
+  describe('calendar_update_event', 'ask', {
+    permissionScopes: ['calendar.read', 'calendar.write'],
+  }),
+  describe('calendar_delete_event', 'ask', {
+    permissionScopes: ['calendar.read', 'calendar.write'],
+  }),
+  describe('reminder_list_collections', 'auto', {
+    permissionScopes: ['reminders.read'],
+    platforms: ['ios'],
+    effect: 'read',
+  }),
+  describe('reminder_list_items', 'auto', {
+    permissionScopes: ['reminders.read'],
+    platforms: ['ios'],
+    effect: 'read',
+  }),
+  describe('reminder_create_item', 'ask', {
+    permissionScopes: ['reminders.write'],
+    platforms: ['ios'],
+  }),
+  describe('reminder_update_item', 'ask', {
+    permissionScopes: ['reminders.read', 'reminders.write'],
+    platforms: ['ios'],
+  }),
+  describe('reminder_delete_item', 'ask', {
+    permissionScopes: ['reminders.read', 'reminders.write'],
+    platforms: ['ios'],
+  }),
+  describe('health_get_summary', 'ask', {
+    autoApprovalEligible: false,
+    permissionScopes: HEALTH_SUMMARY_METRICS.map(healthPermissionScope),
+    permissionMatch: 'any',
+    platforms: ['ios'],
+  }),
+  describe('health_list_workouts', 'ask', {
+    autoApprovalEligible: false,
+    permissionScopes: ['health.workouts.read'],
+    platforms: ['ios'],
+  }),
+  describe('health_list_data_types', 'auto', {
+    platforms: ['ios'],
+  }),
+  ...(['health_query_data', 'health_get_record'] as const).map((id) =>
+    describe(id, 'ask', {
+      autoApprovalEligible: false,
+      permissionScopes: HEALTH_PERMISSION_SCOPES,
+      permissionMatch: 'any',
+      platforms: ['ios'],
+    }),
+  ),
+  describe('location_get_current', 'auto', {
+    permissionScopes: ['location.read'],
+    effect: 'read',
+  }),
+  describe('web_search', 'auto', {
+    requiresWebSearchCapability: 'searchKeywords',
+    effect: 'read',
+  }),
+  describe('web_fetch', 'auto', {
+    requiresWebSearchCapability: 'fetchUrls',
+    effect: 'read',
+  }),
+  describe('generate_image', 'ask', {
+    autoApprovalEligible: false,
+    requiresPaintingModel: true,
+  }),
+  describe('edit_file', 'auto'),
+  describe('inspect_office_file', 'auto', { effect: 'read' }),
+  describe('read_office_content', 'auto', { effect: 'read' }),
+  describe('edit_document', 'auto'),
+  describe('edit_workbook', 'auto'),
+  describe('edit_presentation', 'auto'),
+  describe('create_document', 'auto'),
+  describe('create_workbook', 'auto'),
+  describe('create_presentation', 'auto'),
+  describe('run_office_script', 'auto'),
+  describe('list_workspace', 'auto', { effect: 'read' }),
+  describe('find_workspace_files', 'auto', { effect: 'read' }),
+  describe('create_workspace_folder', 'auto'),
+  describe('library_search_files', 'auto', { effect: 'read' }),
+  describe('library_read_file', 'auto', { effect: 'read' }),
+  describe('library_list_folders', 'auto', { effect: 'read' }),
+  describe('library_move_item', 'ask'),
+  describe('library_rename_item', 'ask'),
+  describe('library_trash_item', 'ask'),
+  describe('library_list_trash', 'auto', { effect: 'read' }),
+  describe('library_restore_item', 'ask'),
+  describe('read_file', 'auto', { effect: 'read' }),
+  describe('transcribe_audio', 'auto', { platforms: ['android', 'ios'] }),
+  describe('write_file', 'auto'),
+  describe('run_js', 'auto'),
+];
+
+const HEALTH_TOOL_IDS = new Set<string>(
+  BUILT_IN_TOOL_CAPABILITY_IDS.filter((id) => id.startsWith('health_')),
+);
+
+/** Approvals for these tools must disclose the receiving model service in the app. */
+export function isHealthToolRef(toolRef: AgentToolRef): boolean {
+  return toolRef.source === 'builtin' && HEALTH_TOOL_IDS.has(toolRef.capabilityId);
+}

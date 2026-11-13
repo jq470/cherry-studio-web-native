@@ -1,0 +1,140 @@
+/**
+ * Cherry Agent Protocol: the application contract between the Agent Client and
+ * the Mobile Agent Host, per `docs/references/agent/agent-protocol.md`.
+ *
+ * Operation inputs, results, snapshots, and events are JSON-safe values
+ * validated at this boundary (invariant 9: every protocol value survives a
+ * JSON round trip and re-validates against its schema). Subscription callbacks
+ * and unsubscribe handles are process-local transport mechanics, not protocol
+ * data. Runtime objects and provider SDK payloads never appear in protocol
+ * values; failure snapshots retain only allowlisted source identity strings.
+ *
+ * Types are inferred from the zod schemas so the validated shape and the
+ * static shape cannot drift.
+ *
+ * The contract is split by what changes it: `views` are the persisted and
+ * projected values, `events` is what an observer receives, `inputs` is what
+ * an operation accepts, and `protocol` is the interface that ties them
+ * together. Callers import this root; a module may import one leaf to state
+ * which side of the protocol it depends on.
+ */
+
+export {
+  AgentContextUsageSchema,
+  type AgentContextUsage,
+  AgentMessageDeltaSchema,
+  AgentEventSchema,
+  AgentSessionSnapshotSchema,
+  AgentQueuedInputSchema,
+  type AgentQueuedInput,
+  type AgentEvent,
+  type AgentMessageDelta,
+  type AgentSessionObservation,
+  type AgentSessionSnapshot,
+} from './events';
+export {
+  AgentAdditionalRepliesSchema,
+  AgentAdditionalReplySchema,
+  AgentCancelSubmissionInputSchema,
+  AgentCancelTurnInputSchema,
+  AgentDeleteSessionInputSchema,
+  AgentDeleteTurnInputSchema,
+  AgentEditUserMessageInputSchema,
+  AgentEditMessageInputSchema,
+  AgentForkSessionInputSchema,
+  AgentRetryMessageInputSchema,
+  AgentRenameSessionInputSchema,
+  AgentReadReasoningInputSchema,
+  AgentRespondApprovalInputSchema,
+  AgentSelectMessageInputSchema,
+  AgentStartSessionInputSchema,
+  AgentSubmitMessageInputSchema,
+  MAX_PARALLEL_ANSWERS,
+  type AgentAdditionalReply,
+  type AgentDeleteTurnInput,
+  type AgentEditUserMessageInput,
+  type AgentEditMessageInput,
+  type AgentReplyPartEdit,
+  type AgentReadReasoningInput,
+  type AgentForkSessionInput,
+  type AgentRetryMessageInput,
+  type AgentSelectMessageInput,
+  type AgentStartSessionInput,
+  type AgentSubmitMessageInput,
+} from './inputs';
+export { AgentProtocolError, type AgentProtocol } from './protocol';
+export {
+  AgentApprovalViewSchema,
+  AgentCapabilitiesSchema,
+  AgentErrorViewSchema,
+  AgentFailureReasonSchema,
+  AgentFailureSnapshotSchema,
+  AgentImageGenerationSchema,
+  type AgentImageGeneration,
+  AgentInferenceSnapshotSchema,
+  AgentInferenceSnapshotV1Schema,
+  AgentInferenceSnapshotViewSchema,
+  AgentInputPartSchema,
+  AgentInputPartsSchema,
+  AgentUserPartsSchema,
+  AgentMessagePartSchema,
+  AgentMessageSiblingSchema,
+  AgentMessageToolRefSchema,
+  AgentMessageViewSchema,
+  AgentReasoningDetailSchema,
+  AgentSessionViewSchema,
+  AgentSessionStatusSchema,
+  AgentToolRefSchema,
+  AgentToolInputPreviewSchema,
+  AgentToolResultSchema,
+  AgentTurnViewSchema,
+  AgentViewSchema,
+  JsonValueSchema,
+  readAgentInferenceSnapshot,
+  type AgentApprovalView,
+  type AgentCapabilities,
+  type AgentErrorView,
+  type AgentFailureReason,
+  type AgentFailureSnapshot,
+  type AgentInferenceSnapshot,
+  type AgentInferenceSnapshotV1,
+  type AgentInferenceSnapshotView,
+  type AgentInputPart,
+  type AgentMessagePart,
+  type AgentMessageToolRef,
+  type AgentMessageSibling,
+  type AgentMessageView,
+  type AgentReasoningDetail,
+  type AgentSessionView,
+  type AgentSessionStatus,
+  type AgentToolRef,
+  type AgentToolInputPreview,
+  type AgentToolProgress,
+  type AgentTurnView,
+  type AgentView,
+  type JsonValue,
+} from './views';
+
+export {
+  AgentPendingQuestionSchema,
+  type AgentPendingQuestion,
+  AgentUserQuestionsSchema,
+  AgentUserAnswerSchema,
+  AgentUserAnswersSchema,
+  AgentRespondQuestionSchema,
+  validateUserAnswers,
+  type AgentUserQuestion,
+  type AgentUserQuestions,
+  type AgentUserAnswer,
+  type AgentUserAnswers,
+  type AgentRespondQuestionInput,
+} from './userQuestion';
+
+export {
+  MessageQuoteSchema,
+  QuoteAuthorSchema,
+  invalidQuoteCarriers,
+  type MessageQuote,
+  type QuoteAuthor,
+  type QuoteFields,
+} from './messageQuote';

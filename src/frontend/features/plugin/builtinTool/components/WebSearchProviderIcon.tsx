@@ -1,0 +1,26 @@
+import GlobeIcon from '@cherrystudio/app-icons/icons/globe';
+import { Image } from '@cherrystudio/ui/components';
+import { useUniwind } from 'uniwind';
+
+import type { WebSearchProviderId } from '@/shared/data/types/webSearch';
+
+import { resolveWebSearchProviderIcon } from '../utils/providerIcons';
+
+export function WebSearchProviderIcon({ providerId }: { providerId: WebSearchProviderId }) {
+  const { theme } = useUniwind();
+  const providerIcon =
+    resolveWebSearchProviderIcon(providerId)?.[theme === 'dark' ? 'dark' : 'light'];
+
+  return providerIcon ? (
+    <Image
+      cachePolicy="memory-disk"
+      className={providerId === 'fetch' ? 'size-5 shrink-0 rounded-sm' : 'size-5 shrink-0'}
+      contentFit="contain"
+      recyclingKey={providerId}
+      source={providerIcon}
+    />
+  ) : (
+    // Keeps provider rows aligned when a provider ships no logo.
+    <GlobeIcon className="size-5 shrink-0 text-muted-foreground" />
+  );
+}

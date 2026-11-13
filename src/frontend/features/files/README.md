@@ -1,0 +1,84 @@
+# File Viewer
+
+`/files/[fileEntryId]` is the shared page for managed images, Markdown, text, HTML, PDF, and Office
+Open XML documents, and RTF. `FileViewerPane` renders the same viewer in the file pane beside chat;
+only the route sets native screen options, and Office references go to the chat beside the pane.
+Image, document and text previews opened from a chat, or from the file library opened beside one,
+offer Add to current chat: `useAddFileToChat` hands the whole file to that chat's composer once,
+keeping its draft text, and returns to it. The action appears in a footer, which owns the bottom
+safe area in place of the content. The route and pane pass the same `sourceChat` to each viewer.
+The footer appears only while `returnsToSourceChat` is true and disables its text-only button
+while the source chat is resolving. Without it, the preview content owns the bottom safe area.
+A preview without a chat, or whose chat's Agent cannot take the file, does not offer it.
+The route carries identity only. `FileEntryPreview` owns classification and the choice between
+this page and system opening, and shares file export actions with the painting viewer.
+This page owns reading, rendering, and copying.
+
+The same route also accepts an opaque `previewRequestId` from `appShell/filePreview` for a
+temporary cache source. This branch does not query or create file/library records and shares the
+existing image, text, HTML and document renderers. Its source metadata is not a managed entry;
+chat attachment, image editing, sharing conversion and Office reference actions are unavailable.
+Closing the last viewer releases its cache bytes. Unavailable/expired requests show the ordinary
+unavailable state instead of resolving an entry or accepting a URI from navigation.
+
+Managed file types use the header's Share action to open the common bottom sharing panel. Complete
+HTML offers Original, Image and PPT inside that same panel; the viewer has no parallel conversion
+actions or conversion progress layer. Capture scripts and temporary conversion lifetimes belong
+to `features/sharing`, using the shared HtmlCapture executor and Backend.documentExport.
+
+- `FileImageViewer` reuses `ArtifactImageViewer`, including zoom and preview failure recovery. Its
+  flat More menu offers saving to Photos, sharing and system opening. Edit joins the same menu
+  only when the existing editing request allows it and the file is an exported-document PNG or
+  the loaded image is confirmed static. Edit exits zoom before opening the editor. The old bottom
+  image toolbar is replaced by the shared Add to current chat footer. Cropping, rotation, mirroring,
+  straightening and perspective adjustments create a new managed image through
+  `Backend.file.editImage`. Only an accepted source-matching callback replaces the caller's
+  attachment. The source file and existing messages retain their
+  original bytes. The library's grid and list also enable editing, retaining each saved result as
+  a new library entry and displaying it in the same viewer. Cancellation and failed saves retain
+  the current image.
+- `FileTextViewer` reads at most 1 MiB plus one truncation-detection byte. Truncated HTML stays
+  in source view. `FileTextBody` renders plain text and source as a virtualized list of bounded
+  blocks from `splitTextBlocks` in `@cherrystudio/ui/utils`. Copy uses the displayed source text and
+  explicitly says when it is partial; sharing always exports the complete original file.
+- `FileHtmlBody` loads strings through `react-native-webview`, with local file access and cookie
+  sharing disabled, and no app message bridge. Web links leave through `openExternalUrl`; other
+  navigations are blocked. Load/process failures show the source, and the user can switch manually.
+- `FileDocumentViewer` renders PDF, DOCX, PPTX, XLSX and RTF through `FileDocumentPreview`, the trusted
+  WebView page from [`@cherrystudio/file-preview-webview`](../../../../packages/file-preview-webview/README.md).
+  `useDocumentPreviewPage` loads the bundled page; `FilePreviewBridge` serves exact byte ranges and
+  bundled PDF resources over the page's message bridge. Other document types keep the system-open
+  state; a document too large to preview shows `FileMenuGuide`, which points to system opening in
+  the header's overflow menu. The package owns everything inside the document; this page owns file access, the container,
+  theme, locale, logging and the system-open fallback. For previewed Office files, the header menu
+  enables structural selection. A footer shows the selected excerpt and opens a new chat draft
+  containing the original attachment and a selection chip (`file · ¶4`, `file · Sheet!B2`,
+  `file · Slide 2`), passed through the composer handoff rather than as draft text.
+  `FileDocumentPreview` validates source id/revision; the reference carries the structural anchor and excerpt for the Agent to read and compare.
+  Selecting or opening a draft does not send a message. The footer owns the bottom safe area while
+  selection is active, so the preview disables its own bottom inset.
+  Refreshes of the same entry keep the viewer mounted and pass `updatedAt` as the package's
+  `refreshKey`, preserving valid reading state while clearing the app's held selection. RTF is
+  read-only, limited to 10 MiB, and does not expose Office selection references.
+- The shared `FileEntryPreview` sharing helpers copy into an OS-managed cache directory using the
+  display filename. The copy survives closing the share sheet because Android recipients may read
+  it later.
+
+Whole-text copying in the native text reader is explicit; its native partial selection remains disabled.
+DOCX text selection and copying inside the document WebView are owned by the preview package.
+The image viewer uses the existing
+pinch/pan/double-tap interaction; native navigation owns back, and image zoom disables the iOS pop
+gesture as in the painting viewer. The new page uses ordinary stack transitions.
+
+An editable preview adds `imageEditRequestId` to its route identity. This opaque in-memory request
+is owned by `appShell/imagePreview`; callbacks never enter URLs, persisted drafts or file rows.
+Back first cancels an active edit. Leaving the preview or disposing its source releases the request;
+late results cannot restore a removed attachment. Repeated edits stay in the same preview and use
+the last accepted image. The image editor uses the installed Skia renderer and adds no native
+dependency. Its gesture, orientation,
+save/cancel and light/dark acceptance remain pending authorized device verification.
+
+The new native dependencies require a development-client rebuild before device acceptance.
+No device acceptance or automated tests were run as part of implementation. See the
+[file preview reference](../../../../docs/references/file-preview-and-viewer.md) for scope and the
+remaining acceptance matrix.

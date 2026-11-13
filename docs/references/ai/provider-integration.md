@@ -1,0 +1,308 @@
+# AI Provider Integration
+
+> Status: as-built.
+
+This reference defines the mobile AI provider/model request architecture. Terms follow
+[Domain Language](../domain-language.md).
+
+The target ownership and staged migration for shared Provider connection facts are defined in
+[Provider Serving Boundaries](./provider-serving-boundaries.md). This document continues to describe
+the currently implemented runtime paths until each migration phase lands.
+
+## Runtime Paths
+
+Agent conversation requests use one path:
+
+```text
+MobileAgentHost -> PiDurableAgentRuntime (pi-durable) -> piModelResolver -> provider/model services
+```
+
+`pi-durable` is the local conversation engine. Its `pi-ai` adapters implement provider protocols;
+they do not own another conversation loop. The engine receives a normalized Agent transcript and resolves the
+selected Agent model through the Host-owned provider adapter. The current Pi binding supports
+API-key-authenticated Anthropic Messages, Google Generate Content, OpenAI Chat Completions, and
+OpenAI Responses endpoint families; other protocol or authentication families fail explicitly.
+Providers declaring optional API-key authentication can use these endpoints without a saved key.
+The Pi adapter supplies the SDK-only placeholder and suppresses generated credentials while
+preserving explicitly configured authentication headers.
+
+Vertex AI Gemini and Claude use the same model resolver with `iam-gcp` service-account credentials. The
+configuration form imports a Google Cloud JSON key, edits project/location, and can override the
+derived service URL. `VertexAuthClient` owns native RS256 signing, bounded token exchange over the
+shared HTTP client, and a memory-only cache per provider and credential fingerprint. Model discovery
+shares that client. Replacing credentials invalidates cache identity; deleting a provider or stopping
+the application aborts its token requests. Concurrent callers cancel independently.
+
+Every model invocation, including recovery and compaction, resolves a current token. Tokens stay
+outside Pi's serialized model and working-copy input; the stream binding owns them and registers
+them for error redaction. Service-account invocations have `iam-gcp` usage attribution and do not
+select or rotate API keys. Their authoritative bearer credential replaces conflicting configured
+auth headers. The pinned Pi AI and Google GenAI Web patches expose instance-scoped token/auth and
+fetch injection, preserving upstream Google conversion and streaming. Ordinary API-key and Node
+ADC paths keep their existing behavior.
+
+Gemini uses Pi AI's `google-vertex` adapter. Claude uses Pi AI's public Anthropic `stream()` client
+injection with the official `@anthropic-ai/vertex-sdk`: Pi owns message conversion, tool calls,
+thinking signatures and stream parsing; the SDK owns Vertex publisher URLs and request shaping.
+The SDK receives a host-owned `authClient` and instance fetch. Its versioned browser-map patch only
+keeps Node Google auth out of the native graph and requires explicit credentials. Cherry's existing
+payload parameter resolver still owns reasoning selection; no second converter or conversation
+loop is introduced. The shared URL resolver supplies the versioned API root for Claude and the
+project collection for Gemini, preserving regional, multi-region and custom gateway addresses.
+
+Vertex currently admits Gemini and Claude text models. MaaS, image, audio and
+embedding models remain unavailable through the system capability gate. Provider-native web tools
+are not enabled for Vertex; application and MCP function tools retain the pi-durable loop. Adding
+other Vertex protocols requires explicit protocol adapters, not just opening the catalog filter.
+Pi AI's image-generation interface currently has only an OpenRouter implementation; it does not
+provide a direct Vertex image adapter. Image capabilities retain the separate service path below.
+
+Pi rehydrates the selected model's reasoning profile from `ProviderRegistryService` on each turn.
+Its final payload adapter uses the shared reasoning interpreter, preserves `default` and `auto`,
+and translates effort and budget fields into the selected native protocol. The same adapter gates
+temperature using model metadata and thinking-mode constraints. OpenAI-compatible chat endpoints
+use `max_tokens` and omit OpenAI-only storage/strict-tool options; stream-usage parameters follow
+the endpoint's dialect declaration rather than URL detection.
+
+The maintained Pi AI patch captures Google Chat Completions tool-call signatures in Pi's existing
+`ToolCall.thoughtSignature` field and replays them for the same provider, model and API. At Pi's final
+payload boundary, Gemini 3/4 receives a compatibility marker only when no signature remains, such as
+imported history or a model switch. Native Google replay retains its own signature handling.
+Classic Qwen 3 models on LMStudio and GPUStack receive a prompt switch when using the shared generic
+Chat reasoning profile. Native thinking parameters come only from dedicated registry wire profiles;
+generic hosts retain their effort contract without an inferred `enable_thinking` parameter.
+Provider-default selections remain authoritative.
+Parameterless object tools receive an empty `properties` map in the model-facing copy without
+changing local validation or root-reference schemas.
+
+Poe model discovery consumes each bot's declared endpoints and preserves that result during catalog
+enrichment. With no declaration, it keeps a registered route or falls back to Chat Completions.
+Compatible model lists skip malformed entries individually and report the count through diagnostics;
+Gemini model discovery accepts null pagination markers.
+
+Model-backed application tools use this capability path:
+
+```text
+Mobile Agent Host → Pi Runtime → application-owned RuntimeTool
+                                      ↓
+                              capability service
+                                      ↓
+                         AiService / ai-core / AI SDK
+```
+
+Image generation uses this path today. Future model-backed capabilities use the same boundary but do
+not need AI SDK unless their application adapter chooses it. Pi owns tool selection and iteration;
+the capability service owns provider configuration, credentials, request execution, usage,
+cancellation, output import, and cleanup. See
+[Agent Tools And Controlled Resources](../agent/agent-tools-and-resources.md).
+
+`AiService` remains a private, desktop-aligned backend adapter for non-conversation operations:
+
+- `listModels()` for provider discovery;
+- `generateImage()` for painting jobs and the Agent image tool.
+
+It has no text-generation path; every language request goes through Pi.
+
+Settings and onboarding chat checks use the bound AgentRuntime through `Backend.models`.
+Translation and automatic session naming use its separate `RuntimeTextGenerator` capability,
+sharing chat's OAuth and protocol adapters without creating conversation history or tools.
+`AiService` is not exposed through `Backend` or frontend context. Every request supplies an explicit
+`uniqueModelId`; `AiService` does not resolve an Assistant, Topic, or default-model fallback.
+
+### Invocation Usage And Context Occupancy
+
+Image generation captures an immutable usage context through ai-core's `onProviderCallStart` for
+each provider invocation, including each batch and retry. Its completion handler keeps that
+context paired with the ai-core-generated invocation ID, image count, usage, timing, and completion
+time. The invocation ID is generated locally as `ai-core:image:<UUID>` and is distinct from any
+provider-issued request ID.
+The credential receipt describes the key actually selected for the operation; observing a new
+invocation does not rotate credentials. Failed attempts have no successful usage event and do not
+produce invented billing records. `AiUsageRecordService` deduplicates successful records by request
+ID and contains persistence failures; ai-core isolates synchronous observer failures from results.
+
+Pi conversation occupancy and billed usage are separate. `projectPiTurn` keeps the latest measured
+input-token count as `contextTokens`, while summing each response's billed usage. An Anthropic
+`pause_turn` continuation therefore retains one context occupancy and both invocation receipts.
+The runtime continuation regression covers this distinction. ai-core's `getContextTokens` is not
+applied to Pi totals: Pi owns their semantics, and the current image path has no conversation
+context-occupancy display requiring that helper.
+
+## Provider And Model Records
+
+`ProviderService` reads and writes `user_provider` rows. A Provider owns its display name, API keys,
+auth config, endpoint configs, feature flags, settings, ordering, and enabled state.
+
+`ModelService` reads and writes `user_model` rows. Model metadata is resolved when the model is added
+or reconciled, then stored locally for runtime use. Most fields are read from that projection.
+Request-only registry facts that intentionally are not persisted, such as reasoning wire dialects,
+are rehydrated by `ProviderRegistryService` at request time.
+
+`UniqueModelId` combines provider id and model id and is the runtime model identifier used by Agents,
+paintings, and settings. Provider and Model shapes follow Cherry Desktop unless mobile has a
+documented runtime compatibility reason to diverge.
+
+## AI SDK Provider Resolution
+
+`resolveProviderConnection()` is the shared, credential-selection-free connection resolver used by
+Pi and AI SDK request construction. It resolves the effective endpoint, endpoint-scoped adapter
+family, normalized wire model id, and mobile/Provider request headers. It does not select API keys
+or IAM/OAuth credentials. Because configured extra headers may contain sensitive values, the result
+remains in memory and must not be persisted or logged.
+
+A trailing `#` on a base URL disables automatic API-version insertion. Standard base-URL formatting
+removes that marker before Pi, AI SDK, and model-list requests use the address. Full request-path
+overrides remain a separate AI SDK contract and are not admitted by Pi or the provider setup form;
+the form offers a base-URL correction instead. URL validation rejects query parameters, credentials,
+and nonempty fragments because these cannot safely receive an appended request path.
+
+For language models, Pi consumes the resolved connection through `resolvePiLanguageBinding()` and
+requires a typed compatibility result before selecting a credential. AI SDK configuration consumes
+the same connection facts directly while retaining its broader Provider and IAM projections. The
+shared language transport policy is composed by both bindings where applicable. Image models
+bypass the Pi binding.
+
+`resolveProviderAiSdkConfig()` converts a Provider and Model into the configuration used by
+`AiService`. Endpoint selection priority is:
+
+1. `model.endpointTypes[0]`;
+2. a registered per-model gateway route;
+3. `provider.defaultChatEndpoint`;
+4. no selected endpoint, after which base-URL lookup applies its documented compatibility fallback.
+
+The endpoint and adapter-family logic chooses variants such as OpenAI, OpenAI-compatible, Azure,
+Azure Responses, Azure Anthropic, Gemini, CherryIN, NewAPI, AiHubMix, or Gateway. Provider settings
+builders are centralized in `src/backend/ai/provider/config.ts`.
+
+AI SDK `ToolSet` is never the canonical Agent tool model: Agent tool behavior resolves through the
+application-owned `RuntimeTool` contract and a Pi adapter.
+
+Endpoint declarations own wire-level behavior. `resolveEndpointDialect()` currently supplies the
+stream-usage behavior for the selected endpoint, while `ProviderRegistryService` consumes the
+reasoning-summary declaration when it builds the reasoning wire profile. OpenAI Responses
+reasoning summary is default-off; the official OpenAI, Azure OpenAI, and OpenAI Codex endpoint
+declarations opt into it explicitly. Mobile's explicit system-role compatibility policy still
+controls developer-role behavior. Provider-level actual-cost reporting is projected to the current
+persisted `apiFeatures` shape only when the registry declares it, so absent catalog facts do not
+overwrite a newer persisted value with a generated default.
+
+Service-tier controls are materialized on Model records from the catalog, but no request path sends
+them.
+
+Mobile sends application instructions with the `system` role on OpenAI Chat Completions and OpenAI
+Responses endpoints. The Pi bridge disables its URL/model-based developer-role inference. This is
+a runtime-wide compatibility policy rather than a provider or model capability.
+
+## Special Providers
+
+CherryAI:
+
+- resolves to `openai-compatible`;
+- signs `/chat/completions` requests through the shared `ProviderLanguageTransportPolicy` consumed
+  by Pi and AI SDK bindings;
+- adds `X-Client-ID`, `X-Timestamp`, and `X-Signature`.
+
+CherryIN uses the normal endpoint configuration and API-key path.
+
+Mobile provider account sign-in has two bindings: CherryIN retains its account-to-API-key flow;
+Pi supplies GitHub Copilot, OpenAI Codex, Kimi Code, xAI/Grok, and OpenRouter through a
+runtime-owned `ProviderAccountAdapter`. Registry OAuth flags alone do not enable a login flow.
+The first four use the official device-code flows. OpenRouter uses official PKCE with the manual
+code/final-redirect-URL fallback; native apps do not create a loopback HTTP listener. Its browser
+opens externally so the final redirect URL can be copied.
+
+Copilot starts on `github.com` by default. Only the separate GitHub Enterprise action asks for a
+company domain. Codex chooses device-code login without exposing the upstream CLI method picker;
+Kimi Code and xAI/Grok have no preliminary text input. OpenRouter retains the required manual
+authorization-result input with visible browser instructions. Catalog and saved-provider rows mark
+account sign-in support from `accounts.getCapabilities`, including preset-backed copies, rather
+than upstream catalog OAuth flags or the user's current signed-in state.
+
+`ProviderAccountRuntime` owns the public account workflow and teardown. `PiProviderAccountAdapter`
+is the native auth bridge inside the Pi zone: it adapts app HTTP/Expo crypto and supplies an
+instance-scoped `CredentialStore` backed by device-only SecureStore. OAuth credentials never become
+user-provider API keys or enter backups. Pi resolves and refreshes credentials under per-instance
+locks, preserving vendor fields and preventing ambient API-key fallback after refresh failure.
+Deleting a provider or signing out cancels attempts and removes its local credential. Upstream
+logout has no remote revocation operation; OpenRouter keys remain manageable in the provider console.
+
+OAuth network exchanges go through `providerAccountFetch` and the shared app HTTP transport, with
+one immutable route per HTTPS origin, request-local credentials, bounded text responses, and no
+redirects. `statusPolicy: 'all'` preserves non-2xx protocol responses for Pi to handle pending,
+slow-down, and rate-limit decisions. Transport failures retain the app's safe error/diagnostic
+boundary. Streaming model requests keep the existing Expo fetch path.
+
+The Pi request binding retains canonical provider IDs and all resolved `apiKey`, `headers`, and
+`baseUrl` fields while usage attribution keeps the app instance ID. Four selective official model
+catalogs supply API/compatibility metadata; Copilot filters them by the account's available model
+IDs. OpenRouter keeps ordinary API-key model discovery. Codex uses its dedicated Responses API over
+SSE. These account credentials currently serve conversation models; non-conversation AI SDK
+features retain their existing credential path.
+
+Meta account login is excluded because subscription credentials are restricted to the official
+Muse Code client. Anthropic account login is not enabled. The newer OpenAI ChatGPT OAuth route still
+requires a fixed loopback callback and additional identity-validation/platform integration. Radius
+has no Mobile provider preset or `pi-messages` binding. `grok-cli` still requires an external CLI and
+remains excluded. Supporting the xAI subscription flow on the `grok` preset does not enable `grok-cli`.
+
+The versioned Pi patch (see the [maintained patch inventory](../agent/pi-durable-migration.md#maintained-patch-contracts)) exposes `native-oauth`, injects app HTTP/PKCE primitives, and adds a
+native manual-callback adapter. Metro honors this package's browser file map. OAuth protocol polling,
+refresh, token parsing, and request-auth derivation remain upstream implementations. Update this
+patch and the native module-graph regression coverage together when upgrading Pi.
+
+Azure provider configuration handles OpenAI, Responses, and Anthropic variants. `iam-azure` auth
+configuration and API-version settings influence the generated provider settings.
+
+## Remote Registry Boundary
+
+Mobile starts from a complete compatible saved snapshot. Without one, model workflows wait for
+the first download of `models.json` and `provider-models.json` and offer retry after failure.
+The model files are not bundled; downloaded metadata passes Mobile capability filtering before use.
+Desktop-published schema v4 updates run in the background when no current saved snapshot exists;
+later refreshes follow explicit model-list access. GitCode's file API uses the registry branch in
+the `ref` query; GitHub is the other source. Compatible saved snapshots remain usable offline.
+The remote manifest must match v4 and the Desktop 2.1.11 semantic baseline supported by Mobile's
+consumed fields. This compatibility number is independent of the Mobile application version.
+Older saved schemas remain readable offline; startup attempts to replace them with v4. The producer
+version is provenance, not a ceiling on the minimum reader version.
+Mobile admits GIF generation with API frame defaults; catalog projection omits GIF editing and
+custom frame controls without extending the pinned SDK.
+
+The snapshot is unsigned. `providers.json` therefore stays in the application bundle and cannot be
+replaced remotely. Provider base URLs, adapter families, headers, and credential behavior remain
+inside the reviewed binary. A remote Provider-model override may still select an endpoint type from
+that bundled Provider definition and update an image model's `vendorTransport` relative path and
+sync/async behavior. Remote protocol support is not a substitute for synchronizing schemas,
+interpreters, normalizers, or endpoint semantics: required behavior consumed by Mobile must be
+implemented and validated, while unsupported optional behavior must be explicitly classified,
+before the compatibility version advances.
+
+The reader drops unknown list vocabulary and incompatible entries individually. `serverTools` and
+`ultra` in a downloaded catalog remain unsupported optional capabilities. Always-on adaptive
+reasoning is projected through the existing wire interpreter. `adaptive-between-tools` models and
+overrides are omitted because the pinned Anthropic SDK cannot execute `between_tools`; they must not
+silently use another dialect. The v4 image-control migration includes regression sources; local tests, typecheck,
+and device acceptance remain pending until explicitly requested.
+
+Native web tools are an application feature with trusted bundled `serverTools` declarations and
+explicit model eligibility; unsigned downloaded model flags cannot enable them. Adapters for the
+Responses, Anthropic Messages, Generate Content, and Chat Completions search contracts run in the Pi
+Durable execution path; an endpoint without one uses the application-owned external services. See
+[Web Search](../web-search.md) for the adapter table, arbitration, metadata, replay, and failure
+semantics.
+
+## Transport
+
+- Pi Agent requests use the Expo-compatible fetch supplied by `piModelResolver`.
+- Pi and AI SDK request construction consume the same `ResolvedProviderConnection` facts before
+  applying their client-specific URL formatting and credential materialization.
+- Generic AI SDK provider configs rely on runtime/provider-package fetch behavior.
+- CherryAI adds its shared signing transport policy over the selected client fetch.
+- Painting image-edit requests inject Expo fetch for local image inputs.
+
+## Reopen When
+
+- Desktop Provider/Model semantics change.
+- Pi provider coverage expands.
+- A new model-capability tool needs provider configuration, usage, or artifact semantics not covered
+  by the application capability boundary.

@@ -1,0 +1,99 @@
+import type { ParamValues } from '@cherrystudio/provider-registry';
+import type { ReactNode, Ref } from 'react';
+import type { ScrollViewProps } from 'react-native';
+import type { SharedValue } from 'react-native-reanimated';
+
+import type { FileAttachmentReport } from '@/shared/contracts/fileAttachment';
+import type { MessageUsageSummary } from '@/shared/contracts/messageUsage';
+import type { CherryMessagePart, MessageStats, MessageStatus } from '@/shared/data/types/message';
+import type { MessageTranslations } from '@/shared/data/types/messageTranslation';
+import type { Model } from '@/shared/data/types/model';
+
+export type MessageListItem = Readonly<{
+  /** Local Agent origin for on-demand reasoning reads; remote parts already own their text. */
+  agentSessionId?: string;
+  /** Timeline position; synthetic rows inherit the adjacent persisted timestamp. */
+  createdAt?: string;
+  data: Readonly<{
+    /** Stable render identities aligned one-to-one with `parts` when the source provides them. */
+    partKeys?: readonly string[];
+    attachmentReports?: Readonly<Record<string, FileAttachmentReport>>;
+    parts?: readonly CherryMessagePart[];
+    translations?: MessageTranslations;
+  }>;
+  id: string;
+  /** Files a pending reply waits on while the send prepares them, such as scanned PDFs. */
+  inputFileEntryIds?: readonly string[];
+  /** Image request settings captured by this message, independent of the current model. */
+  imageGeneration?: Readonly<{ paramValues: ParamValues }>;
+  /** Model identity captured by this message's immutable inference snapshot. */
+  model?: Readonly<Pick<Model, 'id' | 'modelId' | 'name' | 'providerId'>>;
+  /**
+   * The answers to this answer's question, oldest first and including this
+   * answer, when there is more than one.
+   */
+  branch?: Readonly<{
+    /** Shared by the answers to one question, so switching updates their row in place. */
+    key: string;
+    siblings: readonly Readonly<{ id: string; status: MessageStatus; modelId: string | null }>[];
+  }>;
+  /**
+   * The questions that are alternatives at this message's branch point, oldest
+   * first and including this question, when editing created a sibling.
+   */
+  questionBranch?: Readonly<{
+    siblings: readonly string[];
+  }>;
+  role: 'assistant' | 'system' | 'user';
+  /** Feature-owned timeline event synthesized beside persisted messages. */
+  systemEvent?: Readonly<{
+    type: 'fork-origin';
+    sourceSessionId: string;
+  }>;
+  /** Message-owned runtime timing and materialized provider statistics. */
+  stats?: MessageStats;
+  usage?: MessageUsageSummary;
+  status: MessageStatus;
+  /**
+   * Correlation id shared by a submission's rows. Row actions that operate on
+   * the whole exchange need it; synthetic and not-yet-reserved rows have none.
+   */
+  turnId?: string;
+}>;
+
+export type MessageListProps = {
+  ref?: Ref<MessageListHandle>;
+  /** The list frame owns row gutters and spacing, including selection layouts. */
+  rowInsets?: { horizontal: number; user: number; assistant: number };
+  /** Floating content reserved through the keyboard adapter without resizing the viewport. */
+  bottomAccessoryHeight?: SharedValue<number>;
+  contentBottomInset: number;
+  contentTopInset: number;
+  dataKey?: string;
+  enteringMessageId?: string;
+  extraData?: unknown;
+  initialLayoutReady?: boolean;
+  /** Applied once per dataKey, before restoring a saved reading position. */
+  initialScrollTarget?: 'end' | { messageId: string };
+  /** The loaded window ends before the current conversation's live edge. */
+  hasNewerMessages?: boolean;
+  keyboardOffset: number;
+  /** Use 'always' when an outer press target owns background dismissal. */
+  keyboardShouldPersistTaps?: ScrollViewProps['keyboardShouldPersistTaps'];
+  messages: readonly MessageListItem[];
+  onLoadOlder?: () => Promise<void>;
+  onLoadNewer?: () => Promise<void>;
+  onReturnToLatest?: () => void;
+  onReady?: () => void;
+  onTargetRestored?: (target: { dataKey: string; messageId: string }) => void;
+  renderMessage: MessageRenderer;
+};
+
+/** Controlled direct manipulation without exposing the virtualized-list implementation. */
+export type MessageListHandle = {
+  beginInteraction(): void;
+  scrollBy(distance: number): void;
+  endInteraction(): void;
+};
+
+export type MessageRenderer = (message: MessageListItem) => ReactNode;

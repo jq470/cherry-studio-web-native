@@ -1,0 +1,403 @@
+import { BottomSheet, Button, Section } from '@cherrystudio/ui/components';
+import type { ReactNode } from 'react';
+import { ScrollView, Text } from 'react-native';
+import { act, create, type ReactTestRenderer } from 'react-test-renderer';
+
+import { type PendingToolApproval, ToolApprovalSheet } from '../ToolApprovalSheet';
+
+jest.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    // Interpolation values are half of what this sheet gets right or wrong — a
+    // pending count rendered without its count would read as passing.
+    t: (key: string, options?: Record<string, unknown>) =>
+      options ? `${key} ${JSON.stringify(options)}` : key,
+  }),
+}));
+
+jest.mock('@/frontend/components/MessageDetail', () => {
+  const { Text: MockText } = jest.requireActual('react-native');
+  return {
+    MessageDetailText: ({ value }: { value: string }) => <MockText>{value}</MockText>,
+    MessageDetailValue: ({ value }: { value: unknown }) => (
+      <MockText>{value === undefined ? null : JSON.stringify(value)}</MockText>
+    ),
+  };
+});
+
+jest.mock('@/frontend/components/MarkdownText', () => {
+  const { Text: MockText } = jest.requireActual('react-native');
+  return { MarkdownText: ({ markdown }: { markdown: string }) => <MockText>{markdown}</MockText> };
+});
+
+jest.mock('@cherrystudio/ui/components', () => {
+  const { Text: MockText, View: MockView } = jest.requireActual('react-native');
+
+  function MockButton({ children, ...props }: { children?: ReactNode }) {
+    return <MockView {...props}>{children}</MockView>;
+  }
+  MockButton.Label = MockText;
+
+  function MockSection({ children, footer }: { children?: ReactNode; footer?: string }) {
+    return (
+      <MockView>
+        <MockText>{footer}</MockText>
+        {children}
+      </MockView>
+    );
+  }
+  MockSection.SwitchItem = function MockSwitchItem(props: object) {
+    return <MockView {...props} />;
+  };
+
+  function MockBottomSheet({
+    children,
+    footer,
+    headerAction,
+    title,
+    ...props
+  }: {
+    children?: ReactNode;
+    footer?: ReactNode;
+    headerAction?: ReactNode;
+    title: string;
+  }) {
+    return (
+      <MockView {...props}>
+        <MockText>{title}</MockText>
+        {headerAction}
+        {children}
+        {footer}
+      </MockView>
+    );
+  }
+
+  return {
+    BottomSheet: MockBottomSheet,
+    Button: MockButton,
+    Section: MockSection,
+    MessagePart: {
+      ValueSection: ({ value }: { value: unknown }) => (
+        <MockText>{value === undefined ? null : JSON.stringify(value)}</MockText>
+      ),
+    },
+  };
+});
+
+const approveLabel = 'chat.tool.approval.continue';
+const denyLabel = 'chat.tool.approval.deny';
+
+function makeApproval(overrides: Partial<PendingToolApproval> = {}): PendingToolApproval {
+  return {
+    approvalId: 'approval-1',
+    input: { query: 'cherry' },
+    displayName: 'Server One: Search docs',
+    ...overrides,
+  };
+}
+
+describe('ToolApprovalSheet', () => {
+  let renderer: ReactTestRenderer;
+
+  afterEach(async () => {
+    await act(() => renderer.unmount());
+  });
+
+  function render(
+    overrides: {
+      approvals?: readonly PendingToolApproval[];
+      canRespond?: boolean;
+      canApprove?: boolean;
+      onRespond?: () => Promise<void>;
+    } = {},
+  ) {
+    const onRespond = jest.fn(overrides.onRespond ?? (async () => undefined));
+    const element = (approvals: readonly PendingToolApproval[]) => (
+      <ToolApprovalSheet
+        approvals={approvals}
+        canRespond={overrides.canRespond}
+        canApprove={overrides.canApprove}
+        isOpen
+        onRespond={onRespond}
+      />
+    );
+
+    act(() => {
+      renderer = create(element(overrides.approvals ?? [makeApproval()]));
+    });
+
+    return {
+      onRespond,
+      rerender: (approvals: readonly PendingToolApproval[]) =>
+        act(() => {
+          renderer.update(element(approvals));
+        }),
+    };
+  }
+
+  function findButton(label: string) {
+    return renderer.root
+      .findAllByType(Button)
+      .find((node) => node.findAllByType(Button.Label)[0]?.props.children === label);
+  }
+
+  async function press(label: string) {
+    const button = findButton(label);
+    if (!button) {
+      throw new Error(`no button labelled ${label}`);
+    }
+
+    await act(async () => button.props.onPress());
+  }
+
+  test.each([true, false])(
+    'shows the pending grant accurately and attaches it only when approved=%s',
+    async (approved) => {
+      const { onRespond } = render({
+        approvals: [
+          makeApproval({
+            sshCommand: true,
+            canGrantSshDiagnostics: true,
+            input: { command: 'pwd', target: 'user@host', cwd: '.', stdin: '' },
+          }),
+        ],
+      });
+      expect(renderer.root.findByType(Section).props.footer).toBe('ssh.grant.ask');
+      act(() => renderer.root.findByType(Section.SwitchItem).props.onValueChange(true));
+      expect(renderer.root.findByType(Section).props.footer).toBe('ssh.grant.onApproval');
+      await press(approved ? approveLabel : denyLabel);
+      expect(onRespond).toHaveBeenCalledWith({
+        approvalId: 'approval-1',
+        approved,
+        ...(approved ? { sshDiagnosticsGrant: true } : {}),
+      });
+    },
+  );
+
+  function renderedTexts(): string[] {
+    return renderer.root
+      .findAllByType(Text)
+      .map((node) => node.props.children)
+      .filter((child): child is string => typeof child === 'string');
+  }
+
+  test('approves the call the sheet is showing', async () => {
+    const { onRespond } = render();
+
+    await press(approveLabel);
+
+    // Each source resolves the pending tool using this approval identity.
+    expect(onRespond).toHaveBeenCalledWith({
+      approvalId: 'approval-1',
+      approved: true,
+    });
+  });
+
+  test('cannot be dismissed while an approval is pending', () => {
+    render();
+
+    expect(renderer.root.findByType(BottomSheet).props.dismissible).toBe(false);
+  });
+
+  test('does not mount a sheet before an approval exists', () => {
+    act(() => {
+      renderer = create(<ToolApprovalSheet approvals={[]} isOpen={false} onRespond={jest.fn()} />);
+    });
+
+    expect(renderer.root.findAllByType(BottomSheet)).toHaveLength(0);
+  });
+
+  test('hides the approval details scroll indicator', () => {
+    render();
+
+    expect(renderer.root.findByType(ScrollView).props.showsVerticalScrollIndicator).toBe(false);
+  });
+
+  test('presents skill creation as readable content with raw arguments behind an explicit action', async () => {
+    const input = {
+      name: 'meeting-notes',
+      description: 'Organize meeting notes',
+      instructions: '## Steps\n\nSummarize the decisions.',
+    };
+    const { onRespond } = render({
+      approvals: [makeApproval({ toolName: 'create_skill', displayName: 'Create Skill', input })],
+    });
+    expect(renderedTexts()).toEqual(
+      expect.arrayContaining([
+        'skills.create.name',
+        'meeting-notes',
+        input.description,
+        input.instructions,
+        'skills.approval.createDescription',
+      ]),
+    );
+    expect(renderedTexts()).not.toContain('Create Skill');
+    expect(renderedTexts()).not.toContain(JSON.stringify(input));
+    await press('skills.approval.showDetails');
+    expect(renderedTexts()).toContain(JSON.stringify(input));
+    await press('skills.create.name');
+    expect(onRespond).toHaveBeenCalledWith({ approvalId: 'approval-1', approved: true });
+  });
+
+  test('explains skill installation and lets cancellation deny that exact call', async () => {
+    const input = { url: 'https://skills.cherryin.ai/example' };
+    const { onRespond } = render({
+      approvals: [makeApproval({ toolName: 'install_skill', displayName: 'Install Skill', input })],
+    });
+    expect(renderedTexts()).toContain('skills.approval.installDescription');
+    expect(renderedTexts()).toContain(input.url);
+    expect(renderedTexts()).not.toContain(JSON.stringify(input));
+    await press('common.cancel');
+    expect(onRespond).toHaveBeenCalledWith({ approvalId: 'approval-1', approved: false });
+  });
+
+  test('denies the call the sheet is showing', async () => {
+    const { onRespond } = render();
+
+    await press(denyLabel);
+
+    // Same payload, inverted verdict — the one bit that decides whether the
+    // tool runs, and the easiest thing to write backwards.
+    expect(onRespond).toHaveBeenCalledWith({
+      approvalId: 'approval-1',
+      approved: false,
+    });
+  });
+
+  test('keeps denial neutral and allow as the primary action', () => {
+    render();
+
+    expect(findButton(denyLabel)?.props.variant).toBe('secondary');
+    expect(findButton(approveLabel)?.props.variant).toBe('default');
+  });
+
+  test('ignores a second decision while the first is still in flight', async () => {
+    let settle!: () => void;
+    const { onRespond } = render({
+      onRespond: () =>
+        new Promise<void>((resolve) => {
+          settle = resolve;
+        }),
+    });
+
+    await act(async () => {
+      findButton(approveLabel)?.props.onPress();
+      await Promise.resolve();
+    });
+
+    expect(findButton(approveLabel)?.props.disabled).toBe(true);
+    expect(findButton(denyLabel)?.props.disabled).toBe(true);
+
+    // Disabled is what the user sees; the guard in `submit` is what actually
+    // holds. A second response to an approval already being settled comes back
+    // as invalidOperation, and the sheet would re-present it with no
+    // explanation.
+    await press(denyLabel);
+    expect(onRespond).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      settle();
+    });
+    expect(findButton(approveLabel)?.props.disabled).toBe(false);
+  });
+
+  test('keeps the decided request on screen while the sheet closes', () => {
+    const { rerender } = render();
+
+    rerender([]);
+
+    // The list empties the instant the last decision lands, but the sheet is
+    // still animating out — dropping the request here flashes an empty card on
+    // the way off screen.
+    expect(renderedTexts()).toContain('Server One: Search docs');
+  });
+
+  test('resets the submitting state when the sheet advances to another approval', async () => {
+    let settle!: () => void;
+    const { rerender } = render({
+      onRespond: () =>
+        new Promise<void>((resolve) => {
+          settle = resolve;
+        }),
+    });
+
+    await act(async () => {
+      findButton(approveLabel)?.props.onPress();
+      await Promise.resolve();
+    });
+    expect(findButton(approveLabel)?.props.disabled).toBe(true);
+
+    rerender([
+      makeApproval({
+        approvalId: 'approval-2',
+        displayName: 'Server Two: Create file',
+      }),
+    ]);
+
+    expect(findButton(approveLabel)?.props.disabled).toBe(false);
+    await act(async () => settle());
+  });
+
+  test('says how many approvals are still queued behind this one', () => {
+    render({
+      approvals: [makeApproval(), makeApproval({ approvalId: 'approval-2' })],
+    });
+
+    expect(renderedTexts()).toContain('chat.tool.approval.pendingCount {"count":2}');
+  });
+
+  test('advances to the next approval without closing the sheet', () => {
+    const { rerender } = render({
+      approvals: [makeApproval(), makeApproval({ approvalId: 'approval-2' })],
+    });
+
+    rerender([
+      makeApproval({
+        approvalId: 'approval-2',
+        displayName: 'Server Two: Create file',
+      }),
+    ]);
+
+    expect(renderedTexts()).toContain('Server Two: Create file');
+    expect(renderer.root.findByType(BottomSheet).props.open).toBe(true);
+  });
+
+  test('renders the snapshotted display name without exposing the provider alias', () => {
+    render({
+      approvals: [
+        makeApproval({
+          displayName: 'Get current location',
+        }),
+      ],
+    });
+
+    expect(renderedTexts()).toContain('Get current location');
+    expect(renderedTexts()).not.toContain('location_get_current');
+  });
+
+  test('blocks unavailable decisions', async () => {
+    const { onRespond } = render({ canRespond: false });
+
+    expect(findButton(approveLabel)?.props.disabled).toBe(true);
+    expect(findButton(denyLabel)?.props.disabled).toBe(true);
+    await press(approveLabel);
+    await press(denyLabel);
+    expect(onRespond).not.toHaveBeenCalled();
+  });
+
+  test('keeps denial available while health sharing consent cannot be granted', async () => {
+    const { onRespond } = render({ canApprove: false });
+    expect(findButton(approveLabel)?.props.disabled).toBe(true);
+    expect(findButton(denyLabel)?.props.disabled).toBe(false);
+    await press(approveLabel);
+    expect(onRespond).not.toHaveBeenCalled();
+    await press(denyLabel);
+    expect(onRespond).toHaveBeenCalledWith({ approvalId: 'approval-1', approved: false });
+  });
+
+  test('retains asynchronously loaded arguments during the close animation', () => {
+    const { rerender } = render({ approvals: [makeApproval({ input: undefined })] });
+    rerender([makeApproval({ input: { command: 'ls' } })]);
+    rerender([]);
+    expect(renderedTexts()).toContain(JSON.stringify({ command: 'ls' }));
+  });
+});

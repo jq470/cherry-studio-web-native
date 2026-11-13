@@ -1,0 +1,238 @@
+import { fileEntryService } from '@/backend/data/services/FileEntryService';
+import {
+  type ExtractedDocumentText,
+  readDocumentUriText,
+} from '@/backend/services/file/documentText';
+import {
+  getInternalFileUri,
+  imageUriToDataUrl,
+  readFileUriBytes,
+} from '@/backend/services/file/fileStorage';
+import { readImageUriText } from '@/backend/services/file/imageText';
+import {
+  discardNormalizedImage,
+  IMPORTED_IMAGE_MAX_BYTES,
+  normalizeImportedImage,
+} from '@/backend/services/file/importedImageNormalization';
+import type { FileAttachmentFact } from '@/shared/contracts/fileAttachment';
+import type { FileEntry, FileEntryId } from '@/shared/data/types/file';
+import { FileEntryIdSchema } from '@/shared/data/types/file';
+
+export type ManagedFileFact = FileAttachmentFact;
+
+export type TurnResourceLedger = {
+  /** Managed ids explicitly referenced by the current input or Session transcript. */
+  fileEntryIds: ReadonlySet<string>;
+  /** Current input facts validated before the message reservation. */
+  inputFiles: ReadonlyMap<string, ManagedFileFact>;
+  /** Current and historical facts whose row and managed blob passed preflight. */
+  availableFiles: ReadonlyMap<string, ManagedFileFact>;
+  /**
+   * Entries this turn produced. They are the turn's drafts: `edit_file` rewrites
+   * one in place instead of deriving a copy, so a turn ends with one artifact
+   * per file no matter how many edits it took. The set is a subset of
+   * `fileEntryIds` and is empty until the first artifact is granted.
+   */
+  draftFileEntryIds: ReadonlySet<string>;
+  /**
+   * Monotonic Host-side grant: an artifact produced during this turn joins the
+   * ledger so the model may reference it later in the same turn. Only the Host
+   * or its catalog wrapper calls this with validated ids; tools never widen
+   * their own scope.
+   */
+  grantFile(fileEntryId: FileEntryId): void;
+  /** Host-only inherited authorization; an earlier turn's file never becomes this turn's draft. */
+  inheritFile(fileEntryId: FileEntryId): void;
+};
+
+/** The slice of the turn ledger a tool may consult: membership, not content. */
+export type TurnFileScope = Pick<TurnResourceLedger, 'fileEntryIds'>;
+
+/** Host-owned catalog capability: tools can consult membership; the wrapper grants outputs. */
+export type TurnToolResources = Pick<
+  TurnResourceLedger,
+  'availableFiles' | 'draftFileEntryIds' | 'fileEntryIds' | 'grantFile'
+>;
+
+/** Host-only managed-file boundary. It never exposes a device path to Pi. */
+export interface ManagedFileResolver {
+  /** Bounded pixels for explicit read_file calls; never changes the managed original. */
+  readImage?(
+    file: ManagedFileFact,
+    signal: AbortSignal,
+  ): Promise<{ data: string; mediaType: string } | undefined>;
+  resolveAvailable(
+    fileEntryIds: readonly FileEntryId[],
+  ): Promise<ReadonlyMap<string, ManagedFileFact>>;
+  readAsBytes(file: ManagedFileFact, signal: AbortSignal): Promise<Uint8Array | undefined>;
+  readAsDataUrl(file: ManagedFileFact, signal: AbortSignal): Promise<string | undefined>;
+  readDocumentText(
+    file: ManagedFileFact,
+    signal: AbortSignal,
+  ): Promise<ExtractedDocumentText | undefined>;
+  readImageText(
+    file: ManagedFileFact,
+    signal: AbortSignal,
+  ): Promise<ExtractedDocumentText | undefined>;
+}
+
+type AvailableFileEntries = {
+  findAvailableByIds(ids: readonly FileEntryId[]): Promise<FileEntry[]>;
+};
+
+export function createManagedFileResolver(
+  entries: AvailableFileEntries,
+  getUri: (entry: Pick<FileEntry, 'filename' | 'id'>) => string | undefined,
+  readDataUrl: (uri: string, mediaType: string, signal: AbortSignal) => Promise<string>,
+  readBytes: (uri: string, signal: AbortSignal) => Promise<Uint8Array>,
+  readDocument: typeof readDocumentUriText = readDocumentUriText,
+  readImageText: typeof readImageUriText = readImageUriText,
+): ManagedFileResolver {
+  return {
+    async readImageText(file, signal) {
+      throwIfAborted(signal);
+      const uri = getUri({ filename: file.name, id: file.fileEntryId });
+      if (!uri) return undefined;
+      return readImageText(uri, signal);
+    },
+    async readDocumentText(file, signal) {
+      throwIfAborted(signal);
+      const uri = getUri({ filename: file.name, id: file.fileEntryId });
+      if (!uri) return undefined;
+      const result = await rejectOnAbort(readDocument(uri, file.mediaType, signal), signal);
+      throwIfAborted(signal);
+      return result;
+    },
+    async resolveAvailable(fileEntryIds) {
+      const uniqueIds = [...new Set(fileEntryIds)];
+      const availableEntries = await entries.findAvailableByIds(uniqueIds);
+      const facts = new Map<string, ManagedFileFact>();
+
+      for (const entry of availableEntries) {
+        if (!getUri(entry)) {
+          continue;
+        }
+        facts.set(entry.id, {
+          fileEntryId: entry.id,
+          revision: entry.updatedAt,
+          mediaType: entry.mediaType,
+          name: entry.filename,
+          size: entry.size,
+        });
+      }
+
+      return facts;
+    },
+    async readAsDataUrl(file, signal) {
+      throwIfAborted(signal);
+      const uri = getUri({ filename: file.name, id: file.fileEntryId });
+      if (!uri) {
+        return undefined;
+      }
+      try {
+        const dataUrl = await rejectOnAbort(readDataUrl(uri, file.mediaType, signal), signal);
+        throwIfAborted(signal);
+        return dataUrl;
+      } catch {
+        if (signal.aborted) {
+          throw signal.reason ?? new Error('Managed image read was aborted.');
+        }
+        throw new Error('Managed image content could not be read.');
+      }
+    },
+    async readAsBytes(file, signal) {
+      throwIfAborted(signal);
+      const uri = getUri({ filename: file.name, id: file.fileEntryId });
+      if (!uri) {
+        return undefined;
+      }
+      try {
+        const bytes = await rejectOnAbort(readBytes(uri, signal), signal);
+        throwIfAborted(signal);
+        return bytes;
+      } catch {
+        if (signal.aborted) {
+          throw signal.reason ?? new Error('Managed text read was aborted.');
+        }
+        throw new Error('Managed text content could not be read.');
+      }
+    },
+  };
+}
+
+export function createTurnResourceLedger(
+  inputFiles: ReadonlyMap<string, ManagedFileFact>,
+  authorizedFileEntryIds: readonly string[],
+  availableFiles: ReadonlyMap<string, ManagedFileFact> = inputFiles,
+): TurnResourceLedger {
+  const fileEntryIds = new Set<string>(inputFiles.keys());
+  const draftFileEntryIds = new Set<string>();
+
+  for (const fileEntryId of authorizedFileEntryIds) {
+    const parsed = FileEntryIdSchema.safeParse(fileEntryId);
+    if (parsed.success) {
+      fileEntryIds.add(parsed.data);
+    }
+  }
+
+  return {
+    availableFiles,
+    draftFileEntryIds,
+    fileEntryIds,
+    inputFiles,
+    inheritFile(fileEntryId) {
+      fileEntryIds.add(fileEntryId);
+    },
+    grantFile(fileEntryId) {
+      fileEntryIds.add(fileEntryId);
+      draftFileEntryIds.add(fileEntryId);
+    },
+  };
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) {
+    throw signal.reason ?? new Error('Managed file read was aborted.');
+  }
+}
+
+function rejectOnAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  throwIfAborted(signal);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason ?? new Error('Managed file read was aborted.'));
+    signal.addEventListener('abort', onAbort, { once: true });
+    void operation.then(resolve, reject).finally(() => {
+      signal.removeEventListener('abort', onAbort);
+    });
+  });
+}
+
+export const managedFileResolver = createManagedFileResolver(
+  fileEntryService,
+  getInternalFileUri,
+  imageUriToDataUrl,
+  readFileUriBytes,
+);
+
+managedFileResolver.readImage = async (file, signal) => {
+  signal.throwIfAborted();
+  const uri = getInternalFileUri({ filename: file.name, id: file.fileEntryId });
+  if (!uri) return undefined;
+  const normalized = await normalizeImportedImage({
+    uri,
+    mediaType: file.mediaType,
+    name: file.name,
+  });
+  try {
+    signal.throwIfAborted();
+    const mediaType = normalized?.mediaType ?? file.mediaType;
+    const dataUrl = await imageUriToDataUrl(normalized?.uri ?? uri, mediaType, signal);
+    const prefix = `data:${mediaType};base64,`;
+    if (!dataUrl.startsWith(prefix)) return undefined;
+    const data = dataUrl.slice(prefix.length);
+    if (!data || data.length > Math.ceil(IMPORTED_IMAGE_MAX_BYTES / 3) * 4) return undefined;
+    return { data, mediaType };
+  } finally {
+    if (normalized) discardNormalizedImage(normalized);
+  }
+};

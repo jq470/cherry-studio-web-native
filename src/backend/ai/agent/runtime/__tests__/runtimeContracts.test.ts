@@ -1,0 +1,99 @@
+import { RuntimeContextCheckpointSchema } from '../runtimeSchemas';
+import { toModelToolResult } from '../toolResults';
+import type {
+  RuntimeArtifact,
+  RuntimeContextCheckpoint,
+  RuntimeMessageToolRef,
+  RuntimeTool,
+  RuntimeToolRef,
+  RuntimeToolResult,
+} from '../types';
+
+describe('Agent Runtime settled contracts', () => {
+  test('retains full display data but sends only the compact model receipt', () => {
+    const result: RuntimeToolResult = {
+      value: { instructions: 'Complete guide body.' },
+      modelValue: { status: 'ok', instructionsInSystem: true },
+      instructions: { key: 'guide', text: 'Complete guide body.' },
+      artifacts: [],
+    };
+    expect(toModelToolResult(result)).toEqual({
+      value: { status: 'ok', instructionsInSystem: true },
+      artifacts: [],
+    });
+    expect(result.value).toEqual({ instructions: 'Complete guide body.' });
+    expect(
+      toModelToolResult({ value: 'display', modelValue: null, artifacts: [] }).value,
+    ).toBeNull();
+  });
+  test('round-trips stable refs, results, and managed artifacts as JSON', async () => {
+    const ref: RuntimeToolRef = {
+      source: 'mcp',
+      serverId: 'server-1',
+      rawToolName: 'search',
+    };
+    const artifact: RuntimeArtifact = {
+      ref: { kind: 'managed-file', fileEntryId: 'file-1' },
+      mediaType: 'text/markdown',
+      name: 'result.md',
+      kind: 'created',
+    };
+    const expected: RuntimeToolResult = {
+      value: { matches: 2 },
+      artifacts: [artifact],
+    };
+    const tool: RuntimeTool = {
+      ref,
+      providerName: 'mcp_server_1_search_a1b2',
+      displayName: 'Search',
+      description: 'Search documents.',
+      inputSchema: { type: 'object' },
+      approval: 'ask',
+      execute: async () => expected,
+    };
+
+    const result = await tool.execute({
+      input: { query: 'Cherry Studio' },
+      signal: new AbortController().signal,
+      toolCallId: 'call-1',
+      turnId: 'turn-1',
+    });
+
+    expect(JSON.parse(JSON.stringify({ ref, result }))).toEqual({ ref, result: expected });
+  });
+
+  test('round-trips classified tool failure metadata without interpreting the payload', () => {
+    const result: RuntimeToolResult = {
+      value: { status: 'error', error: 'HTTP 429' },
+      artifacts: [],
+      failure: {
+        scope: 'tool',
+        error: {
+          code: 'service_unavailable',
+          message: 'HTTP 429',
+          retryable: false,
+          origin: 'tool',
+        },
+      },
+    };
+    expect(JSON.parse(JSON.stringify(result))).toEqual(result);
+  });
+
+  test('keeps meta activity distinct from executable tool refs', () => {
+    const ref: RuntimeMessageToolRef = { source: 'meta', name: 'tool_search' };
+
+    expect(JSON.parse(JSON.stringify(ref))).toEqual(ref);
+  });
+
+  test('round-trips context checkpoints through the Runtime schema', () => {
+    const checkpoint: RuntimeContextCheckpoint = {
+      version: 1,
+      anchorTurnId: 'turn-1',
+      payload: { summary: 'Earlier conversation.', retained: ['fact-1'] },
+    };
+
+    expect(RuntimeContextCheckpointSchema.parse(JSON.parse(JSON.stringify(checkpoint)))).toEqual(
+      checkpoint,
+    );
+  });
+});

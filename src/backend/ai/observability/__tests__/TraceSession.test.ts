@@ -1,0 +1,168 @@
+import { sanitizeTraceAttributes, traceErrorAttributes } from '@/backend/utils/diagnosticTrace';
+import { AgentProtocolError } from '@/shared/contracts/agent';
+import { TraceSpanRecordSchema, type TraceSpanRecord } from '@/shared/data/types/trace';
+import { createAiFailure } from '@/shared/utils/createAiFailure';
+
+import { TraceSession } from '../TraceSession';
+
+function capture(traceId = 'a'.repeat(32)) {
+  const records: TraceSpanRecord[] = [];
+  let sequence = 0;
+  let wallTime = 1000;
+  let monotonicTime = 100;
+  const session = new TraceSession({
+    traceId,
+    processId: 'process',
+    name: 'ai.turn',
+    context: { sessionId: traceId, turnId: 'turn' },
+    newSpanId: () => (++sequence).toString(16).padStart(16, '0'),
+    write: (record) =>
+      records.push(TraceSpanRecordSchema.parse(JSON.parse(JSON.stringify(record)))),
+    onEnd: () => {},
+    now: () => wallTime,
+    monotonicNow: () => monotonicTime,
+  });
+  return {
+    root: session.root,
+    records,
+    advance() {
+      wallTime -= 500;
+      monotonicTime += 25;
+    },
+  };
+}
+
+describe('TraceSession', () => {
+  it('serializes correlated start/end revisions and measures elapsed time across clock changes', () => {
+    const { root, records, advance } = capture();
+    const child = root.startSpan('pi.generate_content');
+    advance();
+    child?.end('ok', { 'gen_ai.usage.input_tokens': 12 });
+    root.end('ok');
+
+    expect(records).toHaveLength(4);
+    expect(records[1]).toMatchObject({ parentSpanId: root.spanId, revision: 1, status: 'running' });
+    expect(records[2]).toMatchObject({
+      parentSpanId: root.spanId,
+      revision: 2,
+      durationMs: 25,
+      startedAt: 1000,
+      endedAt: 500,
+      attributes: { 'gen_ai.usage.input_tokens': 12 },
+    });
+    expect(records.every((record) => record.context.sessionId === root.traceId)).toBe(true);
+  });
+
+  it('closes only its own children on cancellation and ignores late results', () => {
+    const first = capture();
+    const second = capture('b'.repeat(32));
+    const abandoned = first.root.startSpan('provider');
+    const remaining = second.root.startSpan('provider');
+    first.root.end('cancelled');
+    abandoned?.end('ok');
+    abandoned?.setAttributes({ late: true });
+    expect(first.root.startSpan('late')).toBeUndefined();
+    remaining?.end('ok');
+    second.root.end('ok');
+
+    expect(first.records).toHaveLength(4);
+    expect(first.records.slice(2).map((record) => record.status)).toEqual([
+      'cancelled',
+      'cancelled',
+    ]);
+    expect(second.records.slice(2).map((record) => record.status)).toEqual(['ok', 'ok']);
+  });
+
+  it('excludes content-bearing attributes and error bodies while retaining bounded diagnostic facts', () => {
+    const { root, records } = capture();
+    root.end('error', {
+      prompt: 'private prompt',
+      authorization: 'Bearer secret',
+      'gen_ai.usage.input_tokens': 9,
+      'gen_ai.request.model': 'x'.repeat(500),
+      ...traceErrorAttributes(
+        Object.assign(new Error('private response'), {
+          code: 'rate_limit',
+          statusCode: 429,
+          body: 'private body',
+          cause: 'private cause',
+        }),
+      ),
+    });
+    expect(records[1].attributes).toEqual({
+      'gen_ai.usage.input_tokens': 9,
+      'error.type': 'Error',
+      'error.code': 'rate_limit',
+      'http.status_code': 429,
+    });
+    expect(JSON.stringify(records)).not.toMatch(/private|Bearer|stack/);
+  });
+
+  it('bounds per-trace work and reports spans omitted by the limit', () => {
+    const { root, records } = capture();
+    for (let index = 0; index < 300; index += 1) root.startSpan('tool')?.end('ok');
+    root.end('ok');
+    expect(records).toHaveLength(512);
+    expect(records.at(-1)?.attributes['trace.dropped_spans']).toBe(45);
+  });
+
+  it.each([false, true])(
+    'keeps protocol failure facts without its text (wrapped: %s)',
+    (wrapped) => {
+      const { root, records } = capture();
+      const view = {
+        code: 'EXECUTION_FAILED' as const,
+        ...createAiFailure({
+          code: 'runtime_error',
+          message: 'Maximum context length exceeded: private response',
+          retryable: true,
+          origin: 'provider',
+          name: 'ProviderError',
+          context: { statusCode: 400, responseBody: 'private body' },
+        }),
+      };
+      root.end('error', traceErrorAttributes(wrapped ? new AgentProtocolError(view) : view));
+      expect(records.at(-1)?.attributes).toEqual({
+        'error.type': wrapped ? 'AgentProtocolError' : 'ProviderError',
+        'error.code': 'EXECUTION_FAILED',
+        'error.source.code': 'runtime_error',
+        'error.product_reason': 'context_length',
+        'error.origin': 'provider',
+        'error.retryable': true,
+        'http.status_code': 400,
+      });
+      expect(JSON.stringify(records)).not.toMatch(/private|Maximum|body|message/);
+    },
+  );
+
+  it('counts only retained attributes toward the limit and makes truncation visible', () => {
+    const omitted = Object.fromEntries(
+      Array.from({ length: 24 }, (_, index) => [`prompt${index}`, 'private']),
+    );
+    expect(sanitizeTraceAttributes({ ...omitted, 'http.status_code': 400 })).toEqual({
+      'http.status_code': 400,
+    });
+    const attributes = Object.fromEntries(
+      Array.from({ length: 25 }, (_, index) => [`fact${index}`, index]),
+    );
+    const safe = sanitizeTraceAttributes(attributes);
+    expect(safe).toHaveProperty('fact23', 23);
+    expect(safe).not.toHaveProperty('fact24');
+    expect(safe['trace.attributes_truncated']).toBe(true);
+    expect(sanitizeTraceAttributes(safe)).toEqual(safe);
+  });
+
+  it('keeps terminal facts when request facts already fill the attribute limit', () => {
+    const { root, records } = capture();
+    root.setAttributes(
+      Object.fromEntries(Array.from({ length: 30 }, (_, index) => [`fact${index}`, index])),
+    );
+    root.end('error', { 'error.category': 'network', 'error.retry_scope': 'automatic' });
+    const attributes = records.at(-1)?.attributes;
+    expect(attributes).toMatchObject({
+      'error.category': 'network',
+      'error.retry_scope': 'automatic',
+      'trace.attributes_truncated': true,
+    });
+  });
+});

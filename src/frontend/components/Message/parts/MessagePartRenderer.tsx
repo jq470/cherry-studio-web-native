@@ -1,0 +1,112 @@
+import { memo } from 'react';
+
+import type { ResolvedCitationText } from '@/frontend/utils/messageCitations';
+import type { CherryMessagePart } from '@/shared/data/types/message';
+
+import { CodePart } from './CodePart';
+import { CompactionAnchorPart } from './CompactionAnchorPart';
+import { CompactPart } from './CompactPart';
+import { ErrorPart } from './ErrorPart';
+import { FilePart } from './FilePart';
+import type { MessagePartRenderMode } from './MessageParts';
+import { ReasoningPart } from './ReasoningPart';
+import { SourceUrlPart } from './SourceUrlPart';
+import { TextPart } from './TextPart';
+import { ToolPartRenderer } from './tools/ToolPartRenderer';
+import { isToolMessagePart, isWebSearchToolPart } from './tools/toolPartState';
+import { TranslationPart } from './TranslationPart';
+import { UnknownPart } from './UnknownPart';
+
+type MessagePartRendererProps = {
+  sessionId?: string;
+  partId?: string;
+  messageId?: string;
+  isStreaming: boolean;
+  messageParts?: readonly CherryMessagePart[];
+  part: CherryMessagePart;
+  renderMode?: MessagePartRenderMode;
+  resolvedText?: ResolvedCitationText;
+};
+
+export const MessagePartRenderer = memo(function MessagePartRenderer({
+  isStreaming,
+  sessionId,
+  partId,
+  messageId,
+  messageParts,
+  part,
+  renderMode = 'markdown',
+  resolvedText,
+}: MessagePartRendererProps) {
+  if (isToolMessagePart(part)) {
+    return <ToolPartRenderer messageId={messageId} messageParts={messageParts} part={part} />;
+  }
+
+  switch (part.type) {
+    case 'data-compaction-anchor':
+      return <CompactionAnchorPart data={part.data} />;
+    case 'text':
+      return (
+        <TextPart
+          isStreaming={isStreaming && part.state !== 'done'}
+          messageId={messageId}
+          part={part}
+          renderMode={renderMode}
+          resolvedText={resolvedText}
+        />
+      );
+    case 'reasoning':
+      return (
+        <ReasoningPart
+          isStreaming={isStreaming && part.state !== 'done'}
+          part={part}
+          partId={partId}
+          source={sessionId && messageId && partId ? { sessionId, messageId, partId } : undefined}
+        />
+      );
+    case 'data-code':
+      return <CodePart isStreaming={isStreaming} part={part} />;
+    case 'data-compact':
+      return <CompactPart isStreaming={isStreaming} part={part} />;
+    case 'data-error':
+      return <ErrorPart messageId={messageId} part={part} />;
+    case 'data-translation':
+      return <TranslationPart isStreaming={isStreaming} part={part} />;
+    case 'data-video':
+      return null;
+    case 'file':
+      return <FilePart part={part} />;
+    case 'source-document':
+      return null;
+    case 'source-url':
+      return <SourceUrlPart part={part} />;
+    case 'step-start':
+      return null;
+    default:
+      return <UnknownPart />;
+  }
+}, areMessagePartRendererPropsEqual);
+
+function areMessagePartRendererPropsEqual(
+  previous: MessagePartRendererProps,
+  next: MessagePartRendererProps,
+) {
+  if (
+    previous.isStreaming !== next.isStreaming ||
+    previous.sessionId !== next.sessionId ||
+    previous.partId !== next.partId ||
+    previous.messageId !== next.messageId ||
+    previous.part !== next.part ||
+    previous.renderMode !== next.renderMode ||
+    previous.resolvedText?.markdown !== next.resolvedText?.markdown ||
+    previous.resolvedText?.plainText !== next.resolvedText?.plainText
+  ) {
+    return false;
+  }
+
+  return (
+    !isToolMessagePart(next.part) ||
+    !isWebSearchToolPart(next.part) ||
+    previous.messageParts === next.messageParts
+  );
+}

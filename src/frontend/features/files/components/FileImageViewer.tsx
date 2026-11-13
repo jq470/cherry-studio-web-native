@@ -1,0 +1,210 @@
+/* oxlint-disable react/style-prop-object -- Expo StatusBar style is a string union. */
+import {
+  Button,
+  ContentState,
+  ImageEditor,
+  type MenuItem,
+  useToast,
+} from '@cherrystudio/ui/components';
+import { useQuery } from '@tanstack/react-query';
+import { Stack } from 'expo-router';
+import { StatusBar } from 'expo-status-bar';
+import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { View } from 'react-native';
+import { useUniwind } from 'uniwind';
+
+import { useSaveImageToPhotos } from '@/frontend/appShell/fileExport';
+import { usePaneChrome } from '@/frontend/appShell/layout';
+import type { ChatTarget } from '@/frontend/appShell/navigation/chat';
+import { ArtifactImagePages, ArtifactImageViewer } from '@/frontend/components/ArtifactPreview';
+import { queryKeys } from '@/frontend/data';
+import { imageEditGeometry } from '@/shared/utils/imageEditGeometry';
+
+import type { FileViewerSource } from '../fileViewerSource';
+import { useAddFileToChat } from '../hooks/useAddFileToChat';
+import { useFileImageEdit } from '../hooks/useFileImageEdit';
+import { readPngDimensions } from '../utils/readPngDimensions';
+import { FileViewerFooter } from './FileViewerFooter';
+import { FileViewerHeader } from './FileViewerHeader';
+
+export function FileImageViewer({
+  file: initialFile,
+  imageEditRequestId,
+  sourceChat,
+}: {
+  file: FileViewerSource;
+  imageEditRequestId?: string;
+  sourceChat?: ChatTarget;
+}) {
+  const { t } = useTranslation();
+  const { theme } = useUniwind();
+  const { toast } = useToast();
+  const editing = useFileImageEdit(initialFile, imageEditRequestId);
+  // A pane is not a stack screen: it has no screen options to set, and sits below the status bar.
+  const isInPane = usePaneChrome() !== null;
+  const { file } = editing;
+  const saveToPhotos = useSaveImageToPhotos({ uri: file.uri });
+  const addToChat = useAddFileToChat(file.kind === 'managed' ? file : undefined, sourceChat);
+  const [isZoomed, setIsZoomed] = useState(false);
+  const [stillImageUri, setStillImageUri] = useState<string>();
+  const [width, setWidth] = useState(0);
+  const isDocument =
+    file.entry.provenance === 'document-export' && file.entry.mediaType === 'image/png';
+  const [failed, setFailed] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+  const dimensionsQuery = useQuery({
+    enabled: isDocument,
+    queryKey: queryKeys.files.imageDimensions(file.entry, file.uri),
+    queryFn: () => {
+      const dimensions = readPngDimensions(file.uri);
+      if (!dimensions) throw new Error('Invalid PNG');
+      return dimensions;
+    },
+    networkMode: 'always',
+    retry: false,
+    staleTime: Infinity,
+    gcTime: 60_000,
+  });
+  const dimensions = dimensionsQuery.data;
+
+  const items: MenuItem[] = [];
+  if (editing.canEdit && (isDocument || stillImageUri === file.uri)) {
+    items.push({
+      id: 'edit',
+      label: t('common.edit'),
+      onPress: () => {
+        setIsZoomed(false);
+        editing.start();
+      },
+    });
+  }
+  items.push({
+    id: 'save',
+    label: t('sharing.saveToPhotos'),
+    onPress: () => void saveToPhotos(),
+  });
+
+  if (editing.isEditing) {
+    return (
+      <View
+        className={
+          isInPane
+            ? 'flex-1 bg-background px-safe pb-safe'
+            : 'flex-1 bg-background px-safe pt-safe pb-safe'
+        }
+      >
+        {isInPane ? null : <Stack.Screen options={{ gestureEnabled: false, headerShown: false }} />}
+        <StatusBar style={theme === 'dark' ? 'light' : 'dark'} />
+        <ImageEditor
+          uri={file.uri}
+          getGeometry={imageEditGeometry}
+          isSaving={editing.isSaving}
+          labels={{
+            cancel: t('common.cancel'),
+            done: t('common.done'),
+            title: t('imageEditor.title'),
+            loading: t('fileViewer.loading'),
+            saving: t('imageEditor.saving'),
+            reset: t('imageEditor.reset'),
+            rotate: t('imageEditor.rotate'),
+            undo: t('imageEditor.undo'),
+            redo: t('imageEditor.redo'),
+            aspect: t('imageEditor.aspect'),
+            aspectRatio: t('imageEditor.aspectRatio'),
+            direction: t('imageEditor.direction'),
+            perspective: t('imageEditor.perspective'),
+            compare: t('imageEditor.compare'),
+            zero: t('imageEditor.zero'),
+            increase: (label) => t('imageEditor.increase', { label }),
+            decrease: (label) => t('imageEditor.decrease', { label }),
+            free: t('imageEditor.free'),
+            original: t('imageEditor.original'),
+            screen: t('imageEditor.screen'),
+            screenLandscape: t('imageEditor.screenLandscape'),
+            straighten: t('imageEditor.straighten'),
+            horizontal: t('imageEditor.horizontal'),
+            vertical: t('imageEditor.vertical'),
+            flipHorizontal: t('imageEditor.flipHorizontal'),
+            flipVertical: t('imageEditor.flipVertical'),
+            cropLeft: t('imageEditor.cropLeft'),
+            cropRight: t('imageEditor.cropRight'),
+            cropTop: t('imageEditor.cropTop'),
+            cropBottom: t('imageEditor.cropBottom'),
+          }}
+          onCancel={editing.cancel}
+          onSubmit={(edit) => void editing.save(edit)}
+          onError={() => {
+            editing.cancel();
+            toast.show({ label: t('fileViewer.previewFailed'), variant: 'danger' });
+          }}
+        />
+      </View>
+    );
+  }
+
+  return (
+    <>
+      {isInPane ? null : (
+        <Stack.Screen options={{ gestureEnabled: !isZoomed, headerShown: true }} />
+      )}
+      <FileViewerHeader file={file} items={items} />
+      <View
+        className={
+          addToChat.returnsToSourceChat
+            ? 'flex-1 bg-background px-safe'
+            : 'flex-1 bg-background px-safe pb-safe'
+        }
+        onLayout={({ nativeEvent }) => setWidth(nativeEvent.layout.width)}
+      >
+        <View className="flex-1">
+          {!isDocument ? (
+            <ArtifactImageViewer
+              accessibilityLabel={file.entry.filename}
+              onZoomChange={setIsZoomed}
+              onLoad={({ source }) => setStillImageUri(source.isAnimated ? undefined : file.uri)}
+              uri={file.uri}
+            />
+          ) : failed || dimensionsQuery.isError ? (
+            <View className="flex-1 justify-center bg-background p-6">
+              <ContentState.Error
+                title={t('fileViewer.previewFailed')}
+                primaryAction={{
+                  children: t('common.retry'),
+                  onPress: () => {
+                    setFailed(false);
+                    setIsZoomed(false);
+                    setAttempt((value) => value + 1);
+                    void dimensionsQuery.refetch();
+                  },
+                }}
+              />
+            </View>
+          ) : dimensions && width > 0 ? (
+            <ArtifactImagePages
+              key={attempt}
+              images={[{ ...dimensions, uri: file.uri, label: file.entry.filename }]}
+              onError={() => {
+                setFailed(true);
+                setIsZoomed(false);
+              }}
+              onZoomChange={setIsZoomed}
+              width={width}
+            />
+          ) : (
+            <View className="flex-1 justify-center bg-background p-6">
+              <ContentState.Loading title={t('fileViewer.loading')} />
+            </View>
+          )}
+        </View>
+      </View>
+      {addToChat.returnsToSourceChat ? (
+        <FileViewerFooter>
+          <Button disabled={addToChat.isResolving} onPress={addToChat.add}>
+            {t('fileViewer.addToChat')}
+          </Button>
+        </FileViewerFooter>
+      ) : null}
+    </>
+  );
+}

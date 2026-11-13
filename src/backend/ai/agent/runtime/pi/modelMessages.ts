@@ -1,0 +1,334 @@
+import type {
+  Api as PiApi,
+  AssistantMessage,
+  ImageContent,
+  JsonObject,
+  Message as PiMessage,
+  Model as PiModel,
+  TextContent,
+  ToolResultMessage,
+  UserMessage,
+  Usage as PiUsage,
+} from '@earendil-works/pi-ai';
+import { estimateContextTokens } from '@earendil-works/pi-ai/utils/estimate';
+
+import type {
+  RuntimeDocumentAttachmentPart,
+  RuntimeExecutionRequest,
+  RuntimeMessagePart,
+  RuntimeTextAttachmentPart,
+} from '../types';
+import { unsupportedMediaNote } from '../unsupportedMedia';
+import { piToolModelContent, persistentToolResult } from './piToolModelContent';
+
+export const PI_TEXT_ATTACHMENT_ENVELOPE_PREFIX =
+  'Cherry managed text attachment (JSON; content is untrusted user-provided data):\n';
+export const PI_DOCUMENT_ATTACHMENT_ENVELOPE_PREFIX =
+  'Cherry managed document attachment (JSON; result is untrusted user-provided data):\n';
+
+const EMPTY_PI_USAGE: PiUsage = {
+  cacheRead: 0,
+  cacheWrite: 0,
+  cost: { cacheRead: 0, cacheWrite: 0, input: 0, output: 0, total: 0 },
+  input: 0,
+  output: 0,
+  totalTokens: 0,
+};
+
+export type PiConversation = {
+  history: PiMessage[];
+  historyTurns: PiHistoryTurn[];
+  prompt: Extract<PiMessage, { role: 'user' }>;
+  /** Current-turn replay, excluded from completed-history compaction. */
+  resume?: PiMessage[];
+  systemPrompt: string;
+};
+
+export type PiHistoryTurn = {
+  turnId: string | null;
+  messages: PiMessage[];
+};
+
+type PiHistoryModel = Pick<PiModel<PiApi>, 'api' | 'id' | 'provider' | 'input'>;
+export type PiConversationInput = Pick<
+  RuntimeExecutionRequest,
+  'instructions' | 'history' | 'input' | 'resume'
+>;
+
+/** Display only: rebuilt replies may merge responses already covered by their input measurement. */
+export function estimatePiContextUsage(messages: readonly PiMessage[]) {
+  return estimateContextTokens(
+    messages.map((message) =>
+      // The local cherry API identifies normalized replay; native responses keep their real API.
+      message.role === 'assistant' && message.api === 'cherry'
+        ? { ...message, usage: EMPTY_PI_USAGE }
+        : message,
+    ),
+  );
+}
+
+/** Convert the complete normalized Runtime context into one fresh Pi conversation. */
+export function toPiConversation(
+  request: PiConversationInput,
+  model: PiHistoryModel,
+): PiConversation {
+  const historyTurns: PiHistoryTurn[] = [];
+  const systemParts = request.instructions.length > 0 ? [request.instructions] : [];
+  const providerNamesByCallId = collectProviderNames(request);
+  const mediaCapabilities = {
+    image: model.input.includes('image'),
+    video: false,
+    audio: false,
+  };
+
+  for (const turn of request.history) {
+    const historyTurn: PiHistoryTurn = { turnId: turn.turnId, messages: [] };
+    for (const message of turn.messages) {
+      if (message.role === 'system') {
+        const text = collectText(message.parts);
+        if (text.length > 0) systemParts.push(text);
+        continue;
+      }
+      if (message.role === 'user') {
+        historyTurn.messages.push({
+          role: 'user',
+          content: collectUserContent(message.parts, mediaCapabilities),
+          timestamp: Date.now(),
+        });
+        continue;
+      }
+      appendAssistantHistory(
+        historyTurn.messages,
+        message.parts,
+        providerNamesByCallId,
+        model,
+        message.contextTokens,
+      );
+    }
+    historyTurns.push(historyTurn);
+  }
+
+  const resume: PiMessage[] = [];
+  if (request.resume?.length) {
+    appendAssistantHistory(resume, request.resume, providerNamesByCallId, model);
+  }
+  return {
+    history: historyTurns.flatMap((turn) => turn.messages),
+    historyTurns,
+    ...(resume.length ? { resume } : {}),
+    prompt: {
+      role: 'user',
+      content: collectUserContent(request.input, mediaCapabilities),
+      timestamp: Date.now(),
+    },
+    systemPrompt: systemParts.join('\n\n'),
+  };
+}
+
+function collectUserContent(
+  parts: readonly RuntimeMessagePart[],
+  mediaCapabilities: { image: boolean; video: boolean; audio: boolean },
+): UserMessage['content'] {
+  const content = parts.flatMap<TextContent | ImageContent>((part) => {
+    if (part.type === 'text') {
+      return [{ type: 'text' as const, text: part.text }];
+    }
+    if (part.type === 'text-attachment') {
+      return [toPiTextAttachment(part)];
+    }
+    if (part.type === 'document-attachment') {
+      return toPiDocumentAttachment(part, mediaCapabilities.image);
+    }
+    if (part.type === 'file') {
+      const note = unsupportedMediaNote(
+        part.mediaType,
+        mediaCapabilities,
+        part.fileEntryId ? { fileEntryId: part.fileEntryId, name: part.name } : undefined,
+      );
+      if (note) return [{ type: 'text' as const, text: note }];
+      return [
+        ...(part.fileEntryId
+          ? [
+              {
+                type: 'text' as const,
+                text: `Cherry managed image: ${JSON.stringify({ fileEntryId: part.fileEntryId, name: part.name })}`,
+              },
+            ]
+          : []),
+        toPiImage(part),
+      ];
+    }
+    return [];
+  });
+  return content.some((part) => part.type === 'image')
+    ? content
+    : content.flatMap((part) => (part.type === 'text' ? [part.text] : [])).join('\n');
+}
+
+function toPiTextAttachment(part: RuntimeTextAttachmentPart): TextContent {
+  const envelope = {
+    version: 1,
+    kind: 'managed-text-attachment',
+    trust: part.trust,
+    fileEntryId: part.fileEntryId,
+    name: part.name,
+    mediaType: part.mediaType,
+    ...(part.attachmentReport?.parser ? { parser: part.attachmentReport.parser } : {}),
+    ...(part.attachmentReport?.mode === 'image-text'
+      ? {
+          interpretation:
+            'OCR text from the first image frame only. The model has not received image pixels; visual details and layout may be missing.',
+        }
+      : {}),
+    truncation: part.truncated ? '[truncated]' : '[complete]',
+    content: part.text,
+  } as const;
+  return {
+    type: 'text',
+    text: `${PI_TEXT_ATTACHMENT_ENVELOPE_PREFIX}${JSON.stringify(envelope)}`,
+  };
+}
+
+function toPiDocumentAttachment(
+  part: RuntimeDocumentAttachmentPart,
+  acceptsImages: boolean,
+): (TextContent | ImageContent)[] {
+  const assetDelivery = acceptsImages
+    ? part.assetDelivery
+    : part.assetDelivery.map((asset) =>
+        asset.status === 'sent' ? { ...asset, status: 'model-unsupported' as const } : asset,
+      );
+  const envelope = {
+    version: 1,
+    kind: 'managed-document-attachment',
+    trust: part.trust,
+    fileEntryId: part.fileEntryId,
+    name: part.name,
+    mediaType: part.mediaType,
+    parser: part.parser,
+    parserVersion: part.parserVersion,
+    format: 'anydoc-document-ir',
+    totalCharacters: part.totalCharacters,
+    ...part.document,
+    assetDelivery,
+    ...(part.document.delivery === 'deferred'
+      ? { continuation: { tool: 'read_file', file_entry_id: part.fileEntryId, offset: 0 } }
+      : {}),
+  };
+  return [
+    { type: 'text', text: `${PI_DOCUMENT_ATTACHMENT_ENVELOPE_PREFIX}${JSON.stringify(envelope)}` },
+    ...(acceptsImages
+      ? part.images.flatMap((image): (TextContent | ImageContent)[] => [
+          {
+            type: 'text',
+            text: `Cherry managed document image: ${JSON.stringify({ fileEntryId: part.fileEntryId, assetRef: image.assetRef, trust: part.trust })}`,
+          },
+          toPiImage(image),
+        ])
+      : []),
+  ];
+}
+
+function toPiImage(part: { mediaType: string; uri: string }): ImageContent {
+  const prefix = `data:${part.mediaType};base64,`;
+  if (!part.uri.startsWith(prefix) || part.uri.length === prefix.length) {
+    throw new Error('Runtime image content must be a matching base64 data URL.');
+  }
+  return { type: 'image', data: part.uri.slice(prefix.length), mimeType: part.mediaType };
+}
+
+function collectProviderNames(request: PiConversationInput): Map<string, string> {
+  const result = new Map<string, string>();
+  for (const part of request.resume ?? []) {
+    if (part.type === 'tool-call') result.set(part.toolCallId, part.providerName);
+  }
+  for (const turn of request.history) {
+    for (const message of turn.messages) {
+      for (const part of message.parts) {
+        if (part.type === 'tool-call') result.set(part.toolCallId, part.providerName);
+      }
+    }
+  }
+  return result;
+}
+
+function collectText(parts: readonly RuntimeMessagePart[]): string {
+  return parts
+    .flatMap((part) => (part.type === 'text' || part.type === 'reasoning' ? [part.text] : []))
+    .join('\n');
+}
+
+function appendAssistantHistory(
+  history: PiMessage[],
+  parts: RuntimeMessagePart[],
+  providerNamesByCallId: Map<string, string>,
+  model: PiHistoryModel,
+  contextTokens?: number,
+): void {
+  let content: AssistantMessage['content'] = [];
+  let lastAssistant: AssistantMessage | undefined;
+  const flushAssistant = () => {
+    if (content.length === 0) return;
+    const stopReason = content.some((part) => part.type === 'toolCall') ? 'toolUse' : 'stop';
+    lastAssistant = {
+      api: model.api,
+      content,
+      model: model.id,
+      provider: model.provider,
+      role: 'assistant',
+      stopReason,
+      timestamp: Date.now(),
+      // Persisted message usage sums multiple requests, not this context's size.
+      usage: EMPTY_PI_USAGE,
+    };
+    history.push(lastAssistant);
+    content = [];
+  };
+
+  for (const part of parts) {
+    switch (part.type) {
+      case 'text':
+        content.push({ type: 'text', text: part.text });
+        break;
+      case 'reasoning':
+        // Stored parts carry no provider signature. Providers drop or demote unsigned thinking
+        // from earlier turns, so normalized history omits it instead of resending it as text.
+        break;
+      case 'tool-call':
+        content.push({
+          type: 'toolCall',
+          id: part.toolCallId,
+          name: part.providerName,
+          arguments: part.input as JsonObject,
+        });
+        break;
+      case 'tool-result': {
+        flushAssistant();
+        const result: ToolResultMessage = {
+          role: 'toolResult',
+          toolCallId: part.toolCallId,
+          toolName: providerNamesByCallId.get(part.toolCallId) ?? 'unknown',
+          content: piToolModelContent(
+            part.output,
+            (providerNamesByCallId.get(part.toolCallId) ?? '').startsWith('mcp_'),
+            model.input.includes('image'),
+          ),
+          details: persistentToolResult(part.output),
+          isError: part.isError,
+          timestamp: Date.now(),
+        };
+        history.push(result);
+        break;
+      }
+      default:
+        // Assistant artifact files are not implicit model attachments.
+        break;
+    }
+  }
+
+  flushAssistant();
+  // Keep execution's saved input measurement unchanged. Display estimates are computed separately.
+  if (lastAssistant && contextTokens !== undefined) {
+    lastAssistant.usage = { ...EMPTY_PI_USAGE, input: contextTokens, totalTokens: contextTokens };
+  }
+}

@@ -1,0 +1,493 @@
+import { type ReactNode, useEffect } from 'react';
+import { Text } from 'react-native';
+import { act, create, type ReactTestRenderer } from 'react-test-renderer';
+
+import { FileAttachmentError } from '@/shared/contracts/fileAttachment';
+
+import { useComposerActions, useComposerState } from '../../context/ComposerProvider';
+import type {
+  ComposerAttachmentDraft,
+  ComposerAttachmentReady,
+} from '../../utils/composerAttachments';
+import { ComposerAttachments } from '../ComposerAttachments';
+import { ComposerSurface } from '../ComposerSurface';
+import { ComposerTestProvider } from './_composerTestProvider';
+
+type MockComposerProps = {
+  canSend?: boolean;
+  children?: ReactNode;
+  labels?: { send: string; stop: string };
+  onChangeText: (text: string) => void;
+  onSend: () => Promise<void> | void;
+  onStop: () => void;
+  value: string;
+};
+
+const mockToastShow = jest.fn();
+const mockAlertShow = jest.fn();
+// Stable like the real providers, so handler identity reflects only the surface's own inputs.
+const mockToast = { show: mockToastShow };
+const mockAlert = { show: mockAlertShow };
+const mockTranslate = (key: string) => key;
+const mockLoggerDebug = jest.fn();
+const mockLoggerError = jest.fn();
+const mockLoggerWarn = jest.fn();
+let mockComposerProps: MockComposerProps | undefined;
+let mockComposerActions: ReturnType<typeof useComposerActions> | undefined;
+let mockComposerState: ReturnType<typeof useComposerState> | undefined;
+
+jest.mock('react-native-reanimated', () =>
+  jest.requireActual('@/frontend/components/Composer/components/__tests__/_sharedValueMock'),
+);
+
+jest.mock('@cherrystudio/ui/components', () => {
+  const React = jest.requireActual('react');
+  const { View } = jest.requireActual('react-native');
+
+  function MockComposer(props: MockComposerProps) {
+    mockComposerProps = props;
+    return React.createElement(View, { testID: 'mock-composer' }, props.children);
+  }
+
+  function MockCollapsible({ children, ...props }: { children?: ReactNode }) {
+    return React.createElement(View, { ...props, testID: 'mock-collapsible' }, children);
+  }
+
+  return {
+    Composer: Object.assign(MockComposer, { Collapsible: MockCollapsible }),
+    Spinner: (props: Record<string, unknown>) => React.createElement('mock-spinner', props),
+    useToast: () => ({ toast: mockToast }),
+    useComposerExpansion: () => null,
+    useAlert: () => ({ alert: mockAlert }),
+  };
+});
+
+jest.mock('@/frontend/components/FileEntryPreview', () => ({ FileEntryPreview: () => null }));
+
+jest.mock('react-i18next', () => ({
+  useTranslation: () => ({ t: mockTranslate }),
+}));
+
+jest.mock('@/shared/core/logger/LoggerService', () => ({
+  loggerService: {
+    withContext: () => ({
+      debug: (...args: unknown[]) => mockLoggerDebug(...args),
+      error: (...args: unknown[]) => mockLoggerError(...args),
+      warn: (...args: unknown[]) => mockLoggerWarn(...args),
+    }),
+  },
+}));
+
+describe('ComposerSurface', () => {
+  let renderer: ReactTestRenderer | undefined;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockComposerProps = undefined;
+    mockComposerActions = undefined;
+    mockComposerState = undefined;
+  });
+
+  afterEach(() => {
+    act(() => renderer?.unmount());
+    renderer = undefined;
+  });
+
+  it('hands the draft back before field edits, including clearing or unchanged text', () => {
+    render(
+      <ComposerSurface onSend={jest.fn()} onStop={jest.fn()} streaming={false}>
+        <StateProbe />
+      </ComposerSurface>,
+    );
+    const edits = jest.fn(() => mockComposerState?.draft);
+    const unsubscribe = mockComposerActions!.subscribeDraftEdits(edits);
+
+    act(() => mockComposerActions!.setDraft('recognized words'));
+    expect(edits).not.toHaveBeenCalled();
+    act(() => mockComposerProps!.onChangeText(''));
+    expect(edits.mock.results[0]?.value).toBe('recognized words');
+    expect(mockComposerState?.draft).toBe('');
+    act(() => mockComposerProps!.onChangeText(''));
+    expect(edits).toHaveBeenCalledTimes(2);
+
+    unsubscribe();
+    act(() => mockComposerProps!.onChangeText('typed words'));
+    expect(edits).toHaveBeenCalledTimes(2);
+    expect(mockComposerState?.draft).toBe('typed words');
+  });
+
+  it('hands off dictation before an accepted send clears the draft, once per send attempt', async () => {
+    const pending = deferred<void>();
+    render(
+      <ComposerSurface onSend={() => pending.promise} onStop={jest.fn()} streaming={false}>
+        <StateProbe />
+      </ComposerSurface>,
+      'recognized words',
+    );
+    const edits = jest.fn(() => mockComposerState?.draft);
+    mockComposerActions!.subscribeDraftEdits(edits);
+    let firstSend!: Promise<void>;
+    let secondSend!: Promise<void>;
+    act(() => {
+      firstSend = Promise.resolve(mockComposerProps!.onSend());
+      secondSend = Promise.resolve(mockComposerProps!.onSend());
+    });
+    expect(edits).toHaveBeenCalledTimes(1);
+    expect(edits.mock.results[0]?.value).toBe('recognized words');
+    expect(mockComposerState?.draft).toBe('');
+    await act(async () => {
+      pending.resolve();
+      await Promise.all([firstSend, secondSend]);
+    });
+  });
+
+  it('accepts only one send while the current send promise is unsettled', async () => {
+    const pending = deferred<void>();
+    const onSend = jest.fn(() => pending.promise);
+    render(<ComposerSurface onSend={onSend} onStop={jest.fn()} streaming={false} />, 'hello');
+
+    let firstSend: Promise<void> | undefined;
+    let secondSend: Promise<void> | undefined;
+    act(() => {
+      firstSend = Promise.resolve(mockComposerProps?.onSend());
+      secondSend = Promise.resolve(mockComposerProps?.onSend());
+    });
+
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(mockLoggerDebug).toHaveBeenCalledWith('Ignored duplicate message send');
+
+    await act(async () => {
+      pending.resolve();
+      await Promise.all([firstSend, secondSend]);
+    });
+  });
+
+  it.each(['accepted', 'rejected'] as const)(
+    'keeps the pending send and newer draft across a surface remount (%s)',
+    async (outcome) => {
+      const pending = deferred<void>();
+      const firstSend = jest.fn(() => pending.promise);
+      const nextSend = jest.fn(async () => undefined);
+      render(
+        <ComposerSurface key="image-editor" onSend={firstSend} onStop={jest.fn()} streaming={false}>
+          <StateProbe />
+        </ComposerSurface>,
+        'first draft',
+      );
+      let sending: Promise<void> | undefined;
+      act(() => {
+        sending = Promise.resolve(mockComposerProps?.onSend());
+      });
+      act(() => {
+        renderer?.update(
+          <ComposerTestProvider>
+            <ComposerSurface key="workspace" onSend={nextSend} onStop={jest.fn()} streaming={false}>
+              <StateProbe />
+            </ComposerSurface>
+          </ComposerTestProvider>,
+        );
+      });
+      act(() => mockComposerActions?.setDraft('new draft'));
+
+      expect(mockComposerProps?.canSend).toBe(false);
+      await act(async () => mockComposerProps?.onSend());
+      expect(nextSend).not.toHaveBeenCalled();
+      expect(mockComposerState?.draft).toBe('new draft');
+
+      await act(async () => {
+        if (outcome === 'accepted') pending.resolve();
+        else pending.reject(new Error('request rejected'));
+        await sending;
+      });
+      const recoveredDraft = outcome === 'accepted' ? 'new draft' : 'first draft\nnew draft';
+      expect(mockComposerState?.draft).toBe(recoveredDraft);
+      expect(mockComposerProps?.canSend).toBe(true);
+      await act(async () => mockComposerProps?.onSend());
+      expect(nextSend).toHaveBeenCalledTimes(1);
+      expect(nextSend).toHaveBeenCalledWith({ attachments: [], text: recoveredDraft });
+      expect(firstSend).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('keeps its actions and labels while the draft and caller handlers change', async () => {
+    const onSend = jest.fn(async () => undefined);
+    const onStop = jest.fn();
+    render(
+      <ComposerSurface onSend={jest.fn()} onStop={jest.fn()} streaming={false}>
+        <StateProbe />
+      </ComposerSurface>,
+      'first',
+    );
+    const initial = mockComposerProps!;
+
+    act(() => mockComposerActions?.setDraft('first draft'));
+    act(() =>
+      renderer?.update(
+        <ComposerTestProvider initialDraft="first">
+          <ComposerSurface onSend={onSend} onStop={onStop} streaming={false}>
+            <StateProbe />
+          </ComposerSurface>
+        </ComposerTestProvider>,
+      ),
+    );
+    expect(mockComposerProps?.value).toBe('first draft');
+    expect(mockComposerProps?.onSend).toBe(initial.onSend);
+    expect(mockComposerProps?.onStop).toBe(initial.onStop);
+    expect(mockComposerProps?.labels).toBe(initial.labels);
+
+    act(() => mockComposerProps?.onStop());
+    expect(onStop).toHaveBeenCalledTimes(1);
+    await act(async () => mockComposerProps?.onSend());
+    expect(onSend).toHaveBeenCalledWith({ attachments: [], text: 'first draft' });
+  });
+
+  it('allows another send after the current attempt settles', async () => {
+    const onSend = jest.fn(async () => undefined);
+    render(
+      <ComposerSurface onSend={onSend} onStop={jest.fn()} streaming={false}>
+        <StateProbe />
+      </ComposerSurface>,
+      'first',
+    );
+
+    await act(async () => mockComposerProps?.onSend());
+    act(() => mockComposerActions?.setDraft('second'));
+    await act(async () => mockComposerProps?.onSend());
+
+    expect(onSend).toHaveBeenNthCalledWith(1, { attachments: [], text: 'first' });
+    expect(onSend).toHaveBeenNthCalledWith(2, { attachments: [], text: 'second' });
+  });
+
+  it('restores the exact draft and attachments once when sending fails', async () => {
+    const attachment = readyAttachment();
+    const onSend = jest.fn(async () => {
+      throw new Error('request was not accepted');
+    });
+    render(
+      <ComposerSurface onSend={onSend} onStop={jest.fn()} streaming={false}>
+        <StateProbe />
+      </ComposerSurface>,
+      '  hello  ',
+      [attachment],
+    );
+
+    await act(async () => mockComposerProps?.onSend());
+
+    expect(onSend).toHaveBeenCalledWith({ attachments: [attachment], text: 'hello' });
+    expect(mockComposerState).toEqual({
+      attachments: [attachment],
+      draft: '  hello  ',
+      isSubmitting: false,
+    });
+    expect(mockToastShow).toHaveBeenCalledTimes(1);
+    expect(mockToastShow).toHaveBeenCalledWith({
+      label: 'chat.input.sendFailed',
+      variant: 'danger',
+    });
+  });
+
+  it('explains attachment rejection once and preserves content typed while send was pending', async () => {
+    const pending = deferred<void>();
+    const original = readyAttachment();
+    const added = readyAttachment({
+      id: 'file:new',
+      name: 'new.pdf',
+      fileEntryId: '00000000-0000-7000-8000-000000000039',
+    });
+    render(
+      <ComposerSurface onSend={() => pending.promise} onStop={jest.fn()} streaming={false}>
+        <StateProbe />
+      </ComposerSurface>,
+      'original',
+      [original],
+    );
+    let send: Promise<void> | undefined;
+    act(() => {
+      send = Promise.resolve(mockComposerProps?.onSend());
+    });
+    act(() => {
+      mockComposerActions?.setDraft('new text');
+      mockComposerActions?.addAttachments([added]);
+    });
+    await act(async () => {
+      pending.reject(new FileAttachmentError({ code: 'document-empty', name: 'scan.pdf' }));
+      await send;
+    });
+    expect(mockComposerState).toEqual({
+      draft: 'original\nnew text',
+      attachments: [added, original],
+      isSubmitting: false,
+    });
+    expect(mockAlertShow).toHaveBeenCalledTimes(1);
+    expect(mockAlertShow).toHaveBeenCalledWith({
+      title: 'attachments.sendRejected',
+      description: 'scan.pdf\n\nattachments.issue.document-empty\n\nattachments.draftKept',
+    });
+    expect(mockToastShow).not.toHaveBeenCalled();
+  });
+
+  it('uses caller-owned action and failure labels', async () => {
+    const onSend = jest.fn(async () => {
+      throw new Error('generation failed');
+    });
+    render(
+      <ComposerSurface
+        labels={{ send: 'Generate image', sendFailed: 'Image failed', stop: 'Stop generating' }}
+        onSend={onSend}
+        onStop={jest.fn()}
+        streaming={false}
+      />,
+      'paint',
+    );
+
+    expect(mockComposerProps?.labels).toEqual({
+      send: 'Generate image',
+      stop: 'Stop generating',
+    });
+
+    await act(async () => mockComposerProps?.onSend());
+
+    expect(mockToastShow).toHaveBeenCalledWith({
+      label: 'Image failed',
+      variant: 'danger',
+    });
+  });
+
+  it('unmounts the attachment row after a successful send clears it', async () => {
+    const attachment = readyAttachment();
+    const onSend = jest.fn(async () => undefined);
+    render(
+      <ComposerSurface onSend={onSend} onStop={jest.fn()} streaming={false}>
+        <ComposerAttachments />
+        <StateProbe />
+      </ComposerSurface>,
+      '',
+      [attachment],
+    );
+
+    expect(renderer?.root.findAllByProps({ testID: 'mock-collapsible' }).length).toBeGreaterThan(0);
+
+    await act(async () => mockComposerProps?.onSend());
+
+    expect(onSend).toHaveBeenCalledWith({ attachments: [attachment], text: '' });
+    expect(mockComposerState?.attachments).toEqual([]);
+    expect(renderer?.root.findAllByProps({ testID: 'mock-collapsible' })).toHaveLength(0);
+  });
+
+  it('shows attachment progress and blocks sending until the attachment is ready', () => {
+    const importingAttachment: ComposerAttachmentDraft = {
+      id: 'file:uploading',
+      kind: 'file',
+      mediaType: 'application/pdf',
+      name: 'uploading.pdf',
+      status: 'importing',
+      uri: 'file:///source/uploading.pdf',
+    };
+    render(
+      <ComposerSurface onSend={jest.fn(async () => undefined)} onStop={jest.fn()} streaming={false}>
+        <ComposerAttachments />
+        <StateProbe />
+      </ComposerSurface>,
+      'send later',
+      [importingAttachment],
+    );
+
+    expect(renderer?.root.findAllByType('mock-spinner')).toHaveLength(1);
+    expect(renderer?.root.findByType('mock-spinner').props).toMatchObject({
+      accessibilityElementsHidden: true,
+      importantForAccessibility: 'no-hide-descendants',
+      size: 'sm',
+    });
+    expect(
+      renderer?.root.findAllByType(Text).some((node) => node.props.children === 'uploading.pdf'),
+    ).toBe(true);
+    expect(mockComposerProps?.canSend).toBe(false);
+
+    act(() => {
+      mockComposerActions?.setAttachments([
+        readyAttachment({
+          id: importingAttachment.id,
+          name: importingAttachment.name,
+        }),
+      ]);
+    });
+
+    expect(renderer?.root.findAllByType('mock-spinner')).toHaveLength(0);
+    expect(mockComposerProps?.canSend).toBe(true);
+  });
+
+  it('fails closed if an unready attachment reaches the imperative send boundary', async () => {
+    const onSend = jest.fn(async () => undefined);
+    const importingAttachment: ComposerAttachmentDraft = {
+      id: 'file:uploading',
+      kind: 'file',
+      mediaType: 'application/pdf',
+      name: 'uploading.pdf',
+      status: 'importing',
+      uri: 'file:///source/uploading.pdf',
+    };
+    render(<ComposerSurface onSend={onSend} onStop={jest.fn()} streaming={false} />, 'send later', [
+      importingAttachment,
+    ]);
+
+    await act(async () => mockComposerProps?.onSend());
+
+    expect(onSend).not.toHaveBeenCalled();
+    expect(mockToastShow).toHaveBeenCalledWith({
+      label: 'chat.input.sendFailed',
+      variant: 'danger',
+    });
+  });
+
+  function render(
+    children: ReactNode,
+    initialDraft = '',
+    initialAttachments: readonly ComposerAttachmentDraft[] = [],
+  ) {
+    act(() => {
+      renderer = create(
+        <ComposerTestProvider initialAttachments={initialAttachments} initialDraft={initialDraft}>
+          {children}
+        </ComposerTestProvider>,
+      );
+    });
+  }
+});
+
+function StateProbe() {
+  const composerActions = useComposerActions();
+  const composerState = useComposerState();
+
+  useEffect(() => {
+    mockComposerActions = composerActions;
+    mockComposerState = composerState;
+  }, [composerActions, composerState]);
+
+  return null;
+}
+
+function readyAttachment(
+  overrides: Partial<ComposerAttachmentReady> = {},
+): ComposerAttachmentReady {
+  return {
+    fileEntryId: '00000000-0000-7000-8000-000000000001',
+    id: 'file:ready',
+    kind: 'file',
+    mediaType: 'application/pdf',
+    name: 'ready.pdf',
+    status: 'ready',
+    uri: 'file:///managed/ready.pdf',
+    ...overrides,
+  };
+}
+
+function deferred<TValue>() {
+  let resolve!: (value: TValue) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<TValue>((resolvePromise, rejectPromise) => {
+    reject = rejectPromise;
+    resolve = resolvePromise;
+  });
+
+  return { promise, resolve, reject };
+}

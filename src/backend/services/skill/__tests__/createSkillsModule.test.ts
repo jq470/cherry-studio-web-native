@@ -1,0 +1,509 @@
+import type {
+  AgentGlobalSkillService,
+  SkillInstallRecord,
+} from '@/backend/data/services/AgentGlobalSkillService';
+import type { Skill } from '@/shared/data/types/skill';
+import { cherryinSkillLocator, cherryinSkillUrl } from '@/shared/utils/cherryinSkills';
+
+import { createSkillsModule } from '../createSkillsModule';
+import type { SkillPackageFiles } from '../skillPackage';
+import type { SkillSourceCandidate } from '../skillSources';
+import type { SkillStorage } from '../skillStorage';
+
+jest.mock('@/backend/services/http', () => ({
+  createHttpClient: jest.fn(),
+  isHttpError: () => false,
+}));
+
+/** A package served by the fake GitHub source; `files` are read on every acquisition. */
+type TestPackage = { name: string; files: Record<string, string> };
+
+const reviewed: TestPackage = {
+  name: 'notes',
+  files: {
+    'SKILL.md': '---\nname: notes\ndescription: Take notes\n---\nWrite notes.',
+    'references/t.md': '# T',
+  },
+};
+const needsWeb: TestPackage = {
+  name: 'web-notes',
+  files: { 'SKILL.md': '---\nname: web-notes\ndescription: Web notes\n---\nSearch first.' },
+};
+const needsPython: TestPackage = {
+  name: 'py-notes',
+  files: {
+    'SKILL.md':
+      '---\nname: py-notes\ndescription: Py notes\nallowed-tools: Bash(python:*) Read\n---\nRun python.',
+    'scripts/run.py': 'print(1)',
+  },
+};
+
+type Fakes = ReturnType<typeof createFakes>;
+function createFakes() {
+  const rows = new Map<string, Skill>();
+  const published: string[] = [];
+  const staged = new Set<string>();
+  const stageFiles = new Map<string, SkillPackageFiles>();
+  const revisionFiles = new Map<string, SkillPackageFiles>();
+  let nextId = 1;
+  const toSkill = (record: SkillInstallRecord, id: string, folderName: string): Skill => ({
+    ...record,
+    id,
+    folderName,
+    isEnabled: true,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  });
+  const skills = {
+    findByFolderName: async (folderName: string) =>
+      [...rows.values()].find((s) => s.folderName === folderName) ?? null,
+    getById: async (id: string) => {
+      const row = rows.get(id);
+      if (!row) throw new Error('not found');
+      return row;
+    },
+    applyBindingUpdatesTx: async (
+      _tx: unknown,
+      agentId: string,
+      updates: { skillId: string; isEnabled: boolean }[],
+    ) => {
+      fakes.bound.push(
+        ...updates
+          .filter((update) => update.isEnabled)
+          .map((update) => `${agentId}:${update.skillId}`),
+      );
+    },
+    createTx: async (_tx: unknown, record: SkillInstallRecord, agentIds: readonly string[]) => {
+      const id = `00000000-0000-4000-8000-00000000000${nextId++}`;
+      const skill = toSkill(record, id, record.name);
+      rows.set(id, skill);
+      fakes.bound.push(...agentIds.map((agentId) => `${agentId}:${id}`));
+      return skill;
+    },
+    updateRevisionTx: async (_tx: unknown, id: string, record: SkillInstallRecord) => {
+      const skill = toSkill(record, id, rows.get(id)!.folderName);
+      rows.set(id, skill);
+      return skill;
+    },
+    deleteTx: async (_tx: unknown, id: string) => {
+      rows.delete(id);
+    },
+    listStorageReferences: async () =>
+      [...rows.values()].map((s) => ({ folderName: s.folderName, contentHash: s.contentHash })),
+  } as unknown as AgentGlobalSkillService;
+  const storage: SkillStorage = {
+    stage: async (files) => {
+      const handle = `stage-${staged.size + 1}`;
+      staged.add(handle);
+      stageFiles.set(handle, files);
+      return handle;
+    },
+    discardStaging: (handle) => void staged.delete(handle),
+    publish: async (handle, ref) => {
+      if (!staged.delete(handle)) throw new Error('missing staging');
+      published.push(`${ref.folderName}/${ref.contentHash}`);
+      revisionFiles.set(`${ref.folderName}/${ref.contentHash}`, stageFiles.get(handle)!);
+      stageFiles.delete(handle);
+    },
+    hasRevision: () => true,
+    readFile: async (ref, path) =>
+      revisionFiles.get(`${ref.folderName}/${ref.contentHash}`)?.get(path) ?? null,
+    reconcile: jest.fn(),
+  };
+  const fakes = {
+    rows,
+    published,
+    staged,
+    bound: [] as string[],
+    skills,
+    storage,
+    db: {
+      withWriteTx: async <T>(fn: (tx: never) => Promise<T>) => fn(undefined as never),
+    },
+  };
+  return fakes;
+}
+
+const marketplace = {
+  popular: async () => [],
+  resolveUrl: async () => [],
+  search: async () => [],
+  searchSkillsSh: async () => [],
+  listCherryin: async () => ({ items: [], nextOffset: null }),
+  getCherryin: async (): Promise<never> => {
+    throw new Error('unused');
+  },
+};
+
+function createModule(fakes: Fakes, packages: TestPackage[]) {
+  const candidates = (): SkillSourceCandidate[] =>
+    packages.map((pkg) => ({
+      candidateId: `github:${pkg.name}`,
+      name: pkg.name,
+      description: '',
+      author: null,
+      version: null,
+      tags: [],
+      source: {
+        registry: 'github',
+        locator: `github:owner/repo/${pkg.name}`,
+        url: `https://github.com/owner/repo/blob/main/${pkg.name}/SKILL.md`,
+        revision: 'commit',
+      },
+    }));
+  return createSkillsModule({
+    readAuthor: async () => 'Current user',
+    marketplace: { ...marketplace, resolveUrl: async () => candidates() },
+    db: fakes.db,
+    skills: fakes.skills,
+    storage: fakes.storage,
+    sources: {
+      github: {
+        registry: 'github',
+        resolve: async () => {
+          throw new Error('unused');
+        },
+        acquire: async (candidate) => {
+          const pkg = packages.find((item) => item.name === candidate.name);
+          if (!pkg) throw new Error('not found');
+          return {
+            expectedName: pkg.name,
+            files: new Map(
+              Object.entries(pkg.files).map(([path, text]) => [
+                path,
+                new TextEncoder().encode(text),
+              ]),
+            ),
+          };
+        },
+        resolveUrl: async (url) => {
+          const candidate = candidates().find((item) => item.source.url === url);
+          if (!candidate) throw new Error('not found');
+          return candidate;
+        },
+      },
+    },
+    agentExists: async () => true,
+  });
+}
+
+describe('createSkillsModule', () => {
+  it('preserves a CherryIN installation when an upstream update changes its declared name', async () => {
+    const fakes = createFakes();
+    let name = 'notes';
+    const candidate = (): SkillSourceCandidate => ({
+      candidateId: `cherryin:${name}`,
+      name,
+      description: 'Take notes',
+      author: null,
+      version: null,
+      tags: [],
+      source: {
+        registry: 'cherryin',
+        locator: cherryinSkillLocator('notes', 'SKILL.md'),
+        url: cherryinSkillUrl('notes', 'SKILL.md'),
+        revision: name,
+      },
+    });
+    const module = createSkillsModule({
+      ...fakes,
+      readAuthor: async () => 'Current user',
+      marketplace: { ...marketplace, resolveUrl: async () => [candidate()] },
+      sources: {
+        github: {
+          registry: 'github',
+          resolve: async () => {
+            throw new Error('unused');
+          },
+          resolveUrl: async () => {
+            throw new Error('unused');
+          },
+          acquire: async () => {
+            throw new Error('unused');
+          },
+        },
+        cherryin: {
+          registry: 'cherryin',
+          resolve: async () => candidate(),
+          acquire: async () => ({
+            expectedName: name,
+            files: new Map([
+              [
+                'SKILL.md',
+                new TextEncoder().encode(
+                  `---\nname: ${name}\ndescription: Take notes\n---\nWrite notes.`,
+                ),
+              ],
+            ]),
+          }),
+        },
+      },
+      agentExists: async () => true,
+    });
+    const [resolved] = await module.resolve(cherryinSkillUrl('notes'));
+    const installed = await module.install({ candidateId: resolved!.candidateId });
+    name = 'renamed-notes';
+    await expect(module.update(installed.id)).resolves.toMatchObject({
+      outcome: 'rejected',
+      inspection: { issues: [{ code: 'name-mismatch' }] },
+    });
+    expect(await fakes.skills.getById(installed.id)).toEqual(installed);
+    expect(fakes.published).toHaveLength(1);
+  });
+
+  it('saves generated content with the current author and no Agent binding', async () => {
+    const fakes = createFakes();
+    const module = createModule(fakes, []);
+    const changed = jest.fn();
+    module.subscribeChanges(changed);
+    const input = {
+      name: 'my-notes',
+      description: 'When asked for notes',
+      instructions: 'Keep notes concise.',
+      allowedTools: ['write_file'],
+      tags: ['notes'],
+    };
+    const saved = await module.create(input);
+    expect(saved).toMatchObject({
+      source: 'marketplace',
+      sourceUrl: null,
+      name: input.name,
+      author: 'Current user',
+      version: '1.0',
+      tags: ['notes'],
+      profile: { declaredTools: ['write_file'] },
+    });
+    expect(await module.instructionReader.read(saved)).toBe(input.instructions);
+    expect(fakes.bound).toEqual([]);
+    expect(changed).toHaveBeenCalledTimes(1);
+    await expect(module.create(input)).rejects.toMatchObject({ code: 'already-installed' });
+    expect(fakes.rows.size).toBe(1);
+    expect(fakes.bound).toEqual([]);
+    await expect(module.update(saved.id)).rejects.toMatchObject({ code: 'source-invalid' });
+  });
+
+  it('reads the complete instruction body from the supplied immutable revision without an interpreter', async () => {
+    const fakes = createFakes();
+    const module = createModule(fakes, [needsPython]);
+    const [candidate] = await module.resolve('https://github.com/owner/repo');
+    const installed = await module.install({ candidateId: candidate!.candidateId });
+    fakes.storage.readFile = async (ref, path) =>
+      ref.contentHash === installed.contentHash && path === 'SKILL.md'
+        ? new TextEncoder().encode(needsPython.files['SKILL.md']!)
+        : null;
+    expect(await module.instructionReader.read({ ...installed, isEnabled: false })).toBe(
+      'Run python.',
+    );
+    expect(
+      await module.instructionReader.read({ ...installed, contentHash: 'missing-revision' }),
+    ).toBeNull();
+  });
+  it('reuses the same accepted package for a new Agent without republishing it', async () => {
+    const fakes = createFakes();
+    const module = createModule(fakes, [reviewed]);
+    const [first] = await module.resolve('https://github.com/owner/repo');
+    const installed = await module.install({
+      candidateId: first!.candidateId,
+      agentIds: ['first'],
+    });
+    const [again] = await module.resolve('https://github.com/owner/repo');
+    const reused = await module.install({ candidateId: again!.candidateId, agentIds: ['second'] });
+    expect(reused.id).toBe(installed.id);
+    expect(fakes.rows.size).toBe(1);
+    expect(fakes.published).toHaveLength(1);
+    expect(fakes.bound).toEqual([`first:${installed.id}`, `second:${installed.id}`]);
+  });
+
+  it('inspects, binds explicitly, and installs packages despite app limitations', async () => {
+    const fakes = createFakes();
+    const module = createModule(fakes, [reviewed, needsWeb, needsPython]);
+    const changes = jest.fn();
+    module.subscribeChanges(changes);
+    const [notes, web, py] = await module.resolve('https://github.com/owner/repo');
+    expect(notes).toMatchObject({
+      name: 'notes',
+      installedSkillId: null,
+    });
+
+    const inspection = await module.inspect(notes!.candidateId);
+    expect(inspection).toMatchObject({
+      issues: [],
+      limitations: { scripts: [], unavailableTools: [] },
+      package: {
+        name: 'notes',
+        instructions: 'Write notes.',
+        manifest: [{ path: 'SKILL.md' }, { path: 'references/t.md' }],
+      },
+    });
+    expect(await module.inspect(py!.candidateId)).toMatchObject({
+      limitations: { scripts: ['scripts/run.py'], unavailableTools: ['Bash'] },
+    });
+    expect(fakes.staged.size).toBe(0);
+
+    const installed = await module.install({
+      candidateId: notes!.candidateId,
+      agentIds: ['agent-1'],
+    });
+    expect(installed).toMatchObject({
+      name: 'notes',
+      folderName: 'notes',
+      profile: { declaredTools: [] },
+    });
+    expect(fakes.published).toEqual([`notes/${installed.contentHash}`]);
+    expect(fakes.bound).toEqual([`agent-1:${installed.id}`]);
+    expect(changes).toHaveBeenCalledTimes(1);
+    await expect(module.install({ candidateId: notes!.candidateId })).rejects.toMatchObject({
+      code: 'candidate-expired',
+    });
+    const [again] = await module.resolve('https://github.com/owner/repo');
+    expect(again!.installedSkillId).toBe(installed.id);
+    await expect(module.install({ candidateId: again!.candidateId })).rejects.toMatchObject({
+      code: 'already-installed',
+    });
+    expect(await module.inspect(web!.candidateId)).toMatchObject({
+      candidate: { installedSkillId: null },
+    });
+    await expect(module.install({ candidateId: py!.candidateId })).resolves.toMatchObject({
+      name: 'py-notes',
+    });
+    await expect(
+      module.install({ candidateId: web!.candidateId, agentIds: ['agent-1'] }),
+    ).resolves.toMatchObject({ name: 'web-notes' });
+    expect(fakes.rows.size).toBe(3);
+  });
+
+  it('keeps the installation when a record commit fails and cleans staging', async () => {
+    const fakes = createFakes();
+    const module = createModule(fakes, [reviewed]);
+    fakes.db.withWriteTx = async () => {
+      throw new Error('commit failed');
+    };
+    const [notes] = await module.resolve('https://github.com/owner/repo');
+    await expect(module.install({ candidateId: notes!.candidateId })).rejects.toThrow(
+      'commit failed',
+    );
+    expect(fakes.rows.size).toBe(0);
+    expect(fakes.staged.size).toBe(0);
+  });
+
+  it('updates despite execution limitations, preserves the last valid package, and uninstalls', async () => {
+    const fakes = createFakes();
+    const packages = [reviewed];
+    const module = createModule(fakes, packages);
+    const [notes] = await module.resolve('https://github.com/owner/repo');
+    const installed = await module.install({ candidateId: notes!.candidateId });
+
+    expect(await module.update(installed.id)).toMatchObject({ outcome: 'unchanged' });
+
+    packages[0] = {
+      ...reviewed,
+      files: { ...reviewed.files, 'references/t.md': '# T2' },
+    };
+    const updated = await module.update(installed.id);
+    expect(updated).toMatchObject({
+      outcome: 'updated',
+      skill: { id: installed.id, source: 'marketplace' },
+    });
+    expect(updated.skill.contentHash).not.toBe(installed.contentHash);
+    expect(fakes.published).toHaveLength(2);
+
+    packages[0] = {
+      name: 'notes',
+      files: { 'SKILL.md': '---\nname: notes\ndescription: Take notes\n---\nRun python.' },
+    };
+    const pythonUpdate = await module.update(installed.id);
+    expect(pythonUpdate.outcome).toBe('updated');
+    expect(fakes.published).toHaveLength(3);
+
+    packages[0] = {
+      ...reviewed,
+      files: { 'SKILL.md': '---\nname: notes\n---\nMissing description.' },
+    };
+    expect(await module.update(installed.id)).toMatchObject({
+      outcome: 'rejected',
+      skill: { contentHash: pythonUpdate.skill.contentHash },
+    });
+    expect(fakes.published).toHaveLength(3);
+
+    await module.uninstall(installed.id);
+    expect(fakes.rows.size).toBe(0);
+    expect(fakes.published).toHaveLength(3); // Active turns retain immutable revisions.
+    await module.reconcileStorage();
+    expect(fakes.storage.reconcile).toHaveBeenCalledWith([]);
+  });
+
+  it('records what a package asks of the app at installation and again on update', async () => {
+    const fakes = createFakes();
+    let files: Record<string, string> = {
+      'SKILL.md':
+        '---\nname: notes\ndescription: Take notes\ncompatibility: Requires Python\n---\nRead references/outline.md, then run scripts/fill.py.',
+      'scripts/fill.py': 'print(1)',
+      'references/outline.md': 'Use headings.',
+    };
+    const candidate: SkillSourceCandidate = {
+      candidateId: 'github:notes',
+      name: 'notes',
+      description: 'Take notes',
+      author: null,
+      version: null,
+      tags: [],
+      source: {
+        registry: 'github',
+        locator: 'github:owner/repo/notes',
+        url: 'https://github.com/owner/repo/blob/main/notes/SKILL.md',
+        revision: 'commit',
+      },
+    };
+    const module = createSkillsModule({
+      readAuthor: async () => 'Current user',
+      marketplace: { ...marketplace, resolveUrl: async () => [candidate] },
+      db: fakes.db,
+      skills: fakes.skills,
+      storage: fakes.storage,
+      sources: {
+        github: {
+          registry: 'github',
+          acquire: async () => ({
+            expectedName: 'notes',
+            files: new Map(
+              Object.entries(files).map(([path, text]) => [path, new TextEncoder().encode(text)]),
+            ),
+          }),
+          resolve: async () => candidate,
+          resolveUrl: async () => candidate,
+        },
+      },
+      agentExists: async () => true,
+    });
+    const [resolved] = await module.resolve(candidate.source.url!);
+    // Prose mentioning Python is not read; the script file is a fact of the package.
+    expect(await module.inspect(resolved!.candidateId)).toMatchObject({
+      limitations: { scripts: ['scripts/fill.py'], unavailableTools: [] },
+    });
+    const installed = await module.install({
+      candidateId: resolved!.candidateId,
+      agentIds: ['agent-1'],
+    });
+    expect(installed.manifest.map(({ path }) => path)).toEqual([
+      'SKILL.md',
+      'references/outline.md',
+      'scripts/fill.py',
+    ]);
+    expect(installed.profile).toEqual({ declaredTools: [] });
+    expect(fakes.bound).toEqual([`agent-1:${installed.id}`]);
+    expect((await module.update(installed.id)).outcome).toBe('unchanged');
+    files = {
+      'SKILL.md':
+        '---\nname: notes\ndescription: Take notes\nallowed-tools: Bash Read\n---\nRun `python scripts/fill.py`.',
+      'scripts/fill.py': 'print(1)',
+    };
+    expect(await module.update(installed.id)).toMatchObject({
+      outcome: 'updated',
+      skill: {
+        profile: { declaredTools: ['Bash', 'Read'] },
+        manifest: [{ path: 'SKILL.md' }, { path: 'scripts/fill.py' }],
+      },
+    });
+    expect((await fakes.skills.getById(installed.id)).contentHash).not.toBe(installed.contentHash);
+  });
+});

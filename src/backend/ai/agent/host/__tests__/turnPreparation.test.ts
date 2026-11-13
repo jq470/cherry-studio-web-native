@@ -1,0 +1,1144 @@
+import type { PluginGuideSnapshot } from '@/backend/services/builtInMcp';
+import { parseAnydocDocument } from '@/backend/services/file/anydocParser';
+import type {
+  AgentMessageView,
+  AgentSessionView,
+  AgentSubmitMessageInput,
+} from '@/shared/contracts/agent';
+import type { DocumentParserMode } from '@/shared/contracts/fileAttachment';
+import { FileEntryIdSchema, type FileEntryId } from '@/shared/data/types/file';
+import { createUniqueModelId } from '@/shared/data/types/model';
+
+import type { ManagedFileFact, ManagedFileResolver } from '../../resources/managedFileResolver';
+import { FakeRuntime, type RuntimeModel, type RuntimeTool } from '../../runtime';
+import type {
+  StoredRuntimeContextCheckpoint,
+  StoredRuntimeTurnContext,
+  StoredSkillActivation,
+} from '../../sessionStore/AgentSessionStore';
+import type { SystemCapabilitySource } from '../../tools/builtInToolSource';
+import { createReadFileTool } from '../../tools/readFileTool';
+import type { AgentDefinition } from '../agentDefinitions';
+import type { AgentInferenceModelSnapshot } from '../inferenceSnapshot';
+import type { SkillTurnScope } from '../skillScope';
+import {
+  prepareDurableTurn,
+  prepareInitialTurn,
+  prepareTurn,
+  type TurnPreparationDependencies,
+} from '../turnPreparation';
+import { toRuntimeHistory } from '../turnRuntimeInput';
+
+const AGENT_ID = 'agent-1';
+const SESSION_ID = 'session-1';
+const FILE_ENTRY_ID = FileEntryIdSchema.parse('00000000-0000-7000-8000-000000000001');
+const NOW = '2026-01-01T00:00:00.000Z';
+
+const BASE_MODEL: RuntimeModel = { providerId: 'provider-1', modelId: 'model-1' };
+const OVERRIDE_MODEL: RuntimeModel = { providerId: 'provider-2', modelId: 'model-2' };
+
+const SESSION: AgentSessionView = {
+  id: SESSION_ID,
+  agentId: AGENT_ID,
+  name: '',
+  isNameManuallyEdited: false,
+  forkBoundaryMessageId: null,
+  forkedFromSessionId: null,
+  createdAt: NOW,
+  updatedAt: NOW,
+};
+
+const AGENT: AgentDefinition = {
+  id: AGENT_ID,
+  name: 'Planner Agent',
+  instructions: 'Plan carefully.',
+  mode: 'standard',
+  model: BASE_MODEL,
+  options: { maxOutputTokens: 512, reasoningEffort: 'low', temperature: 0.2 },
+  toolApprovalMode: 'auto',
+};
+
+const EMPTY_CONTEXT: StoredRuntimeTurnContext = {
+  anchorFound: true,
+  hasMessages: false,
+  history: [],
+  referencedFileEntryIds: [],
+};
+
+jest.mock('@/backend/services/file/anydocParser', () => ({
+  ANYDOC_PARSER_VERSION: '0.4.1',
+  parseAnydocDocument: jest.fn(),
+}));
+
+describe('turn preparation', () => {
+  test.each(['existing', 'initial', 'durable'] as const)(
+    'standard %s chat remains available without function calling or tool discovery',
+    async (kind) => {
+      const harness = createHarness();
+      harness.preflightModel.mockResolvedValue({
+        contextWindow: 128_000,
+        inputModalities: ['text'],
+        maxInputTokens: 120_000,
+        maxOutputTokens: 8_000,
+        supportsTools: false,
+      });
+      const unavailable = async (): Promise<never> => {
+        throw new Error('Tools unavailable');
+      };
+      harness.dependencies.skills = { resolve: jest.fn(unavailable) };
+      harness.dependencies.skillWorkflow = {
+        search: unavailable,
+        searchSkillsSh: unavailable,
+        listCherryin: unavailable,
+        getCherryin: unavailable,
+        popular: unavailable,
+        resolve: unavailable,
+        inspect: unavailable,
+        install: unavailable,
+        update: unavailable,
+        create: unavailable,
+        previewAdaptation: unavailable,
+        adapt: unavailable,
+        uninstall: unavailable,
+        subscribeChanges: () => () => undefined,
+      };
+      harness.getSystemTools.mockImplementation(unavailable);
+      harness.resolveRuntimeTools.mockImplementation(unavailable);
+      const signal = new AbortController().signal;
+      const input = textInput();
+      const plan =
+        kind === 'initial'
+          ? await prepareInitialTurn(harness.dependencies, { ...input, agentId: AGENT_ID }, signal)
+          : kind === 'durable'
+            ? await prepareDurableTurn(harness.dependencies, input, [], signal)
+            : await prepareTurn(harness.dependencies, input, signal);
+      expect(plan.inputParts).toEqual(input.parts);
+      expect(plan.tools).toEqual([]);
+      expect(plan.pluginGuides).toEqual([]);
+      expect(plan.skills.scope.entries).toEqual([]);
+      expect(harness.getSystemTools).not.toHaveBeenCalled();
+      expect(harness.resolveRuntimeTools).not.toHaveBeenCalled();
+      expect(harness.dependencies.skills.resolve).not.toHaveBeenCalled();
+    },
+  );
+
+  test('rejects explicit Skill installation for a model without function calling', async () => {
+    const harness = createHarness();
+    harness.preflightModel.mockResolvedValue({
+      contextWindow: 128_000,
+      inputModalities: ['text'],
+      maxInputTokens: 120_000,
+      maxOutputTokens: 8_000,
+      supportsTools: false,
+    });
+    await expect(
+      prepareTurn(
+        harness.dependencies,
+        { ...textInput(), skillAction: 'find-and-install' },
+        new AbortController().signal,
+      ),
+    ).rejects.toMatchObject({ view: { code: 'CAPABILITY_UNSUPPORTED' } });
+  });
+  test.each(['existing', 'initial', 'durable'] as const)(
+    'minimal %s turns skip tools and plugin discovery even for a model without tool calling',
+    async (kind) => {
+      const harness = createHarness();
+      const resolveSkills = jest.fn(async () => {
+        throw new Error('Skills unavailable');
+      });
+      harness.dependencies.skills = { resolve: resolveSkills };
+      harness.getAgent.mockResolvedValue({ ...AGENT, mode: 'minimal' });
+      harness.getSystemTools.mockRejectedValue(new Error('Tools unavailable'));
+      harness.resolveRuntimeTools.mockRejectedValue(new Error('Plugin connection unavailable'));
+      harness.preflightModel.mockResolvedValue({
+        contextWindow: 128_000,
+        inputModalities: ['text', 'image'],
+        maxInputTokens: 120_000,
+        maxOutputTokens: 8_000,
+        supportsTools: false,
+      });
+      const signal = new AbortController().signal;
+      const input = textInput();
+      const plan =
+        kind === 'initial'
+          ? await prepareInitialTurn(harness.dependencies, { ...input, agentId: AGENT_ID }, signal)
+          : kind === 'durable'
+            ? await prepareDurableTurn(harness.dependencies, input, [], signal)
+            : await prepareTurn(harness.dependencies, input, signal);
+
+      expect(plan.tools).toEqual([]);
+      expect(plan.pluginGuides).toEqual([]);
+      expect(plan.toolDiscoveryWarnings).toEqual([]);
+      expect(plan.inferenceSnapshot.tools).toEqual([]);
+      expect(harness.getSystemTools).not.toHaveBeenCalled();
+      expect(harness.resolveRuntimeTools).not.toHaveBeenCalled();
+      expect(resolveSkills).not.toHaveBeenCalled();
+      expect(harness.loadSkillActivations).not.toHaveBeenCalled();
+      expect(plan.skills.scope.entries).toEqual([]);
+    },
+  );
+
+  test.each([
+    { skillIds: ['00000000-0000-4000-8000-000000000124'] },
+    { skillAction: 'find-and-install' as const },
+    { skillAction: 'create' as const },
+  ])('minimal mode rejects explicit Skill input %j', async (selection) => {
+    const harness = createHarness();
+    harness.getAgent.mockResolvedValue({ ...AGENT, mode: 'minimal' });
+    await expect(
+      prepareTurn(
+        harness.dependencies,
+        { ...textInput(), ...selection },
+        new AbortController().signal,
+      ),
+    ).rejects.toMatchObject({ view: { code: 'CAPABILITY_UNSUPPORTED' } });
+    expect(harness.getSystemTools).not.toHaveBeenCalled();
+    expect(harness.resolveRuntimeTools).not.toHaveBeenCalled();
+  });
+
+  test('minimal mode accepts direct images and sends OCR text to a model without vision', async () => {
+    const harness = createHarness();
+    harness.getAgent.mockResolvedValue({ ...AGENT, mode: 'minimal' });
+    harness.files.resolveAvailable = async () =>
+      new Map([[FILE_ENTRY_ID, fact(FILE_ENTRY_ID, 'photo.png', 'image/png', 3)]]);
+    const input = {
+      ...textInput(),
+      parts: [{ type: 'file' as const, fileEntryId: FILE_ENTRY_ID, mediaType: 'image/png' }],
+    };
+    const plan = await prepareTurn(harness.dependencies, input, new AbortController().signal);
+    expect(plan.userParts).toEqual([
+      expect.objectContaining({
+        type: 'file',
+        attachmentReport: { mode: 'image', sourceTruncated: false, requestTruncated: false },
+      }),
+    ]);
+    expect(plan.tools).toEqual([]);
+
+    harness.preflightModel.mockResolvedValue({
+      contextWindow: 128_000,
+      inputModalities: ['text'],
+      maxInputTokens: 120_000,
+      maxOutputTokens: 8_000,
+      supportsTools: false,
+    });
+    harness.files.readImageText = jest.fn(async () => ({ text: 'Total: 42', truncated: false }));
+    const ocr = await prepareTurn(harness.dependencies, input, new AbortController().signal);
+    expect(ocr.userParts).toEqual([
+      expect.objectContaining({
+        type: 'file',
+        attachmentReport: expect.objectContaining({
+          mode: 'image-text',
+          parser: 'native-image-ocr',
+        }),
+      }),
+    ]);
+  });
+
+  test('minimal mode rejects documents before parsing or tool discovery', async () => {
+    const harness = createHarness();
+    harness.getAgent.mockResolvedValue({ ...AGENT, mode: 'minimal' });
+    await expect(
+      prepareTurn(
+        harness.dependencies,
+        {
+          ...textInput(),
+          parts: [{ type: 'file', fileEntryId: FILE_ENTRY_ID, mediaType: 'text/plain' }],
+        },
+        new AbortController().signal,
+      ),
+    ).rejects.toMatchObject({
+      view: {
+        code: 'CAPABILITY_UNSUPPORTED',
+        retryable: false,
+        attachmentIssue: {
+          code: 'runtime-unsupported',
+          fileEntryId: FILE_ENTRY_ID,
+          name: 'notes.txt',
+        },
+      },
+    });
+    expect(harness.files.readAsBytes).not.toHaveBeenCalled();
+    expect(harness.getSystemTools).not.toHaveBeenCalled();
+    expect(harness.resolveRuntimeTools).not.toHaveBeenCalled();
+  });
+
+  test('minimal mode rejects explicit image generation before preparing it', async () => {
+    const harness = createHarness();
+    harness.getAgent.mockResolvedValue({ ...AGENT, mode: 'minimal' });
+    const prepare = jest.fn(async () => null);
+    harness.dependencies.imageGeneration = { prepare };
+    await expect(
+      prepareTurn(
+        harness.dependencies,
+        { ...textInput(), imageGeneration: { mode: 'generate', paramValues: {} } },
+        new AbortController().signal,
+      ),
+    ).rejects.toMatchObject({ view: { code: 'CAPABILITY_UNSUPPORTED' } });
+    expect(prepare).not.toHaveBeenCalled();
+  });
+
+  test('minimal mode rejects implicit image generation from a selected image model', async () => {
+    const harness = createHarness();
+    harness.getAgent.mockResolvedValue({ ...AGENT, mode: 'minimal' });
+    const execute = jest.fn(async () => []);
+    harness.dependencies.imageGeneration = {
+      prepare: async () => ({ settings: { mode: 'generate', paramValues: {} }, execute }),
+    };
+    await expect(
+      prepareTurn(harness.dependencies, textInput(), new AbortController().signal),
+    ).rejects.toMatchObject({ view: { code: 'CAPABILITY_UNSUPPORTED' } });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  test('parallel replies reject an implicit image plan before executing it', async () => {
+    const harness = createHarness();
+    const execute = jest.fn(async () => []);
+    harness.dependencies.imageGeneration = {
+      prepare: async () => ({ settings: { mode: 'generate', paramValues: {} }, execute }),
+    };
+    await expect(
+      prepareDurableTurn(harness.dependencies, textInput(), [], new AbortController().signal, {
+        readOnlyTools: true,
+      }),
+    ).rejects.toMatchObject({ view: { code: 'CAPABILITY_UNSUPPORTED' } });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  test.each(['auto', 'default'] as const)(
+    'parallel replies keep only reads, with connected reads under the %s approval mode',
+    async (toolApprovalMode) => {
+      const harness = createHarness();
+      harness.getAgent.mockResolvedValueOnce({ ...AGENT, toolApprovalMode });
+      const mcp = (name: string, effect?: RuntimeTool['effect']): RuntimeTool => ({
+        ...tool(name, 'ask'),
+        ref: { source: 'mcp', serverId: 'server-1', rawToolName: name },
+        ...(effect ? { effect } : {}),
+      });
+      harness.getSystemTools.mockResolvedValueOnce([
+        { ...tool('builtin_read', 'auto'), effect: 'read' },
+        { ...tool('builtin_gated_read', 'ask'), effect: 'read', autoApprovalEligible: false },
+        { ...tool('builtin_write', 'auto'), effect: 'write' },
+      ]);
+      harness.resolveRuntimeTools.mockResolvedValueOnce({
+        tools: [mcp('search', 'read'), mcp('lookup'), mcp('plugin_write', 'write')],
+        pluginGuides: [],
+      });
+
+      const plan = await prepareDurableTurn(
+        harness.dependencies,
+        textInput(),
+        [],
+        new AbortController().signal,
+        { readOnlyTools: true },
+      );
+
+      // Unknown and write effects stay out; a read asks only when the Agent's mode says so.
+      expect(plan.tools.map((entry) => [entry.providerName, entry.approval])).toEqual([
+        ['builtin_read', 'auto'],
+        ['search', toolApprovalMode === 'auto' ? 'auto' : 'ask'],
+      ]);
+    },
+  );
+
+  test.each(['existing', 'initial'] as const)(
+    'freezes the parser before %s preparation yields and shares it with read_file',
+    async (kind) => {
+      const harness = createHarness();
+      let mode: DocumentParserMode = 'anydoc';
+      harness.dependencies.documentParserMode = () => mode;
+      const mediaType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+      const document = fact(FILE_ENTRY_ID, 'report.docx', mediaType, 3);
+      harness.files.resolveAvailable = async () => new Map([[FILE_ENTRY_ID, document]]);
+      harness.files.readDocumentText = async () => ({ text: 'built-in result', truncated: false });
+      const ir = { unknownFutureField: { text: '原始结果🍒' } };
+      jest
+        .mocked(parseAnydocDocument)
+        .mockResolvedValue({ status: 'ok', ir, assets: [], warnings: ['unchanged'] });
+      harness.getAgent.mockImplementationOnce(async () => {
+        mode = 'builtin';
+        return AGENT;
+      });
+      harness.getSystemTools.mockImplementation(async (input) => [
+        createReadFileTool(harness.files, input.resources, input.documentParserMode),
+      ]);
+      const parts = [{ type: 'file' as const, fileEntryId: FILE_ENTRY_ID, mediaType }];
+      const plan =
+        kind === 'initial'
+          ? await prepareInitialTurn(
+              harness.dependencies,
+              {
+                agentId: AGENT_ID,
+                sessionId: SESSION_ID,
+                userMessageId: 'user-1',
+                assistantMessageId: 'assistant-1',
+                parts,
+              },
+              new AbortController().signal,
+            )
+          : await prepareTurn(
+              harness.dependencies,
+              {
+                sessionId: SESSION_ID,
+                userMessageId: 'user-1',
+                assistantMessageId: 'assistant-1',
+                parts,
+              },
+              new AbortController().signal,
+            );
+      expect(mode).toBe('builtin');
+      expect(plan.documentParserMode).toBe('anydoc');
+      expect(plan.runtimeContentAttachments.get(FILE_ENTRY_ID)).toMatchObject({
+        type: 'document-attachment',
+        document: { result: { ir } },
+      });
+      expect(plan.userParts[0]).toMatchObject({
+        attachmentReport: { mode: 'document-ir', parser: 'anydoc', delivery: 'complete' },
+      });
+      expect(JSON.stringify(plan.userParts)).not.toContain('原始结果');
+      const read = await plan.tools[0]!.execute({
+        input: { file_entry_id: FILE_ENTRY_ID },
+        signal: new AbortController().signal,
+        toolCallId: 'read-1',
+        turnId: 'turn-1',
+      });
+      expect(read.value).toMatchObject({
+        parser: 'anydoc',
+        format: 'json-fragment',
+        text: JSON.stringify(ir),
+      });
+
+      const history = [{ ...textMessage('old-input', 'old-turn'), parts: plan.userParts }];
+      const originalHistory = JSON.parse(JSON.stringify(history));
+      harness.loadRuntimeTurnContext.mockResolvedValue({
+        anchorFound: true,
+        hasMessages: true,
+        history,
+        referencedFileEntryIds: [FILE_ENTRY_ID],
+      });
+      const next = await prepareTurn(
+        harness.dependencies,
+        textInput(),
+        new AbortController().signal,
+      );
+      expect(next.documentParserMode).toBe('builtin');
+      expect(next.runtimeContentAttachments.get(FILE_ENTRY_ID)).toMatchObject({
+        type: 'text-attachment',
+        text: 'built-in result',
+      });
+      expect(
+        toRuntimeHistory(next.history, next.runtimeContentAttachments)[0]?.messages[0]?.parts,
+      ).toEqual([
+        expect.objectContaining({
+          type: 'text-attachment',
+          text: 'built-in result',
+          attachmentReport: expect.objectContaining({ parser: 'builtin' }),
+        }),
+      ]);
+      expect(history).toEqual(originalHistory);
+      expect(history[0]?.parts[0]).toMatchObject({ attachmentReport: { parser: 'anydoc' } });
+      expect(
+        (
+          await next.tools[0]!.execute({
+            input: { file_entry_id: FILE_ENTRY_ID },
+            signal: new AbortController().signal,
+            toolCallId: 'read-2',
+            turnId: 'turn-1',
+          })
+        ).value,
+      ).toMatchObject({ parser: 'builtin', text: 'built-in result' });
+    },
+  );
+  test('prepares a Draft first turn without reading a durable Session', async () => {
+    const harness = createHarness();
+
+    const plan = await prepareInitialTurn(
+      harness.dependencies,
+      {
+        agentId: AGENT_ID,
+        sessionId: SESSION_ID,
+        userMessageId: 'user-1',
+        assistantMessageId: 'assistant-1',
+        parts: [{ text: 'Hello.', type: 'text' }],
+      },
+      new AbortController().signal,
+    );
+
+    expect(plan.hasMessages).toBe(false);
+    expect(plan.history).toEqual([]);
+    expect(harness.getSession).not.toHaveBeenCalled();
+    expect(harness.getLatestContextCheckpoint).not.toHaveBeenCalled();
+    expect(harness.loadRuntimeTurnContext).not.toHaveBeenCalled();
+  });
+
+  test.each(['default', 'none', 'auto', 'xhigh', 'max'] as const)(
+    'preserves the explicit %s reasoning selection over the agent default',
+    async (reasoningEffort) => {
+      const harness = createHarness();
+      const plan = await prepareTurn(
+        harness.dependencies,
+        {
+          ...textInput(),
+          reasoningEffort,
+        },
+        new AbortController().signal,
+      );
+      expect(plan.agent.options.reasoningEffort).toBe(reasoningEffort);
+      expect(AGENT.options.reasoningEffort).toBe('low');
+    },
+  );
+
+  test('builds a canonical turn plan from frozen model, tool, and attachment facts', async () => {
+    const harness = createHarness();
+    const input: AgentSubmitMessageInput = {
+      sessionId: SESSION_ID,
+      userMessageId: 'user-1',
+      assistantMessageId: 'assistant-1',
+      parts: [
+        { type: 'text', text: 'Review this file.' },
+        {
+          type: 'file',
+          fileEntryId: FILE_ENTRY_ID,
+          mediaType: 'text/plain',
+        },
+      ],
+      modelId: createUniqueModelId(OVERRIDE_MODEL.providerId, OVERRIDE_MODEL.modelId),
+      reasoningEffort: 'default',
+    };
+
+    const plan = await prepareTurn(harness.dependencies, input, new AbortController().signal);
+
+    expect(harness.getSystemTools).toHaveBeenCalledWith({
+      workspaceFolderId: null,
+      sessionId: SESSION_ID,
+      agentId: AGENT.id,
+      askUser: harness.askUser,
+      model: OVERRIDE_MODEL,
+      acceptsImages: true,
+      resources: plan.resources,
+      documentParserMode: 'anydoc',
+      resolveUsageAttribution: plan.usageAttribution.resolve,
+    });
+    // Tools read the attribution when they run; the Host binds the message after reservation.
+    expect(plan.usageAttribution.resolve()).toEqual({
+      source: { type: 'agent', id: AGENT_ID, name: AGENT.name, icon: null },
+      messageRef: null,
+    });
+    const messageRef = { kind: 'agent-session' as const, id: 'assistant-1' };
+    plan.usageAttribution.bindMessage(messageRef);
+    messageRef.id = 'changed-after-binding';
+    const resolvedAttribution = plan.usageAttribution.resolve();
+    expect(resolvedAttribution.messageRef).toEqual({
+      kind: 'agent-session',
+      id: 'assistant-1',
+    });
+    // Failed writes need not throw in Expo's non-strict test transform.
+    expect(Reflect.set(resolvedAttribution.source!, 'name', 'Changed by a tool')).toBe(false);
+    expect(Reflect.set(resolvedAttribution.messageRef!, 'id', 'changed-by-a-tool')).toBe(false);
+    expect(plan.usageAttribution.resolve()).toEqual({
+      source: { type: 'agent', id: AGENT_ID, name: AGENT.name, icon: null },
+      messageRef: { kind: 'agent-session', id: 'assistant-1' },
+    });
+    expect(() =>
+      plan.usageAttribution.bindMessage({ kind: 'agent-session', id: 'assistant-2' }),
+    ).toThrow('already bound');
+    expect(harness.resolveRuntimeTools).toHaveBeenCalledWith(
+      AGENT_ID,
+      expect.any(Function),
+      expect.any(AbortSignal),
+      null,
+    );
+    expect(harness.resolveInferenceModel).toHaveBeenCalledWith(OVERRIDE_MODEL);
+    expect(harness.preflightModel).toHaveBeenCalledWith(OVERRIDE_MODEL);
+
+    expect(plan.agent).toEqual({
+      ...AGENT,
+      model: OVERRIDE_MODEL,
+      options: { maxOutputTokens: 512, reasoningEffort: 'default', temperature: 0.2 },
+    });
+    expect(plan.inputParts).toEqual([
+      { type: 'text', text: 'Review this file.' },
+      {
+        type: 'file',
+        fileEntryId: FILE_ENTRY_ID,
+        mediaType: 'text/plain',
+        filename: 'notes.txt',
+      },
+    ]);
+    expect(plan.userParts).toEqual([
+      { id: 'input-0', type: 'text', text: 'Review this file.', state: 'done' },
+      {
+        id: 'input-1',
+        type: 'file',
+        fileEntryId: FILE_ENTRY_ID,
+        mediaType: 'text/plain',
+        filename: 'notes.txt',
+        purpose: 'input-attachment',
+        attachmentReport: {
+          mode: 'text',
+          sourceTruncated: false,
+          requestTruncated: false,
+          includedCharacters: expect.any(Number),
+        },
+      },
+    ]);
+    expect(plan.runtimeContentAttachments.get(FILE_ENTRY_ID)).toEqual({
+      attachmentReport: {
+        mode: 'text',
+        sourceTruncated: false,
+        requestTruncated: false,
+        includedCharacters: expect.any(Number),
+      },
+      fileEntryId: FILE_ENTRY_ID,
+      type: 'text-attachment',
+      mediaType: 'text/plain',
+      name: 'notes.txt',
+      text: 'trusted only as user input',
+      truncated: false,
+      trust: 'untrusted-user-content',
+    });
+    expect(plan.tools.map((tool) => tool.approval)).toEqual(['auto', 'deny']);
+    expect(harness.systemTool.approval).toBe('ask');
+    expect(harness.configuredTool.approval).toBe('deny');
+    expect(plan.inferenceSnapshot).toMatchObject({
+      version: 1,
+      model: {
+        uniqueModelId: createUniqueModelId(OVERRIDE_MODEL.providerId, OVERRIDE_MODEL.modelId),
+      },
+      parameters: { maxOutputTokens: 512, temperature: 0.2 },
+      tools: [{ approval: 'auto' }, { approval: 'deny' }],
+    });
+    expect(plan.hasMessages).toBe(false);
+    expect(plan.runtimeContextCheckpoint).toBeNull();
+  });
+
+  test('keeps an auto-ineligible ask unchanged under the auto approval mode', async () => {
+    const harness = createHarness();
+    harness.getSystemTools.mockResolvedValueOnce([
+      { ...harness.systemTool, autoApprovalEligible: false },
+    ]);
+
+    const plan = await prepareTurn(harness.dependencies, textInput(), new AbortController().signal);
+
+    // The Agent runs in auto mode, but a consent-bearing ask must survive it.
+    expect(plan.tools.map((tool) => tool.approval)).toEqual(['ask', 'deny']);
+  });
+
+  test('withholds ask_user_question only under the auto approval mode', async () => {
+    const question = tool('ask_user_question', 'auto');
+    const prepare = async (toolApprovalMode: AgentDefinition['toolApprovalMode']) => {
+      const harness = createHarness();
+      harness.getSystemTools.mockResolvedValueOnce([question, harness.systemTool]);
+      harness.getAgent.mockResolvedValueOnce({ ...AGENT, toolApprovalMode });
+      const plan = await prepareTurn(
+        harness.dependencies,
+        textInput(),
+        new AbortController().signal,
+      );
+      return plan.tools.map((entry) => entry.providerName);
+    };
+
+    // Auto mode never blocks on the user, so missing decisions go into the reply.
+    expect(await prepare('auto')).toEqual(['system_tool', 'configured_tool']);
+    expect(await prepare('default')).toEqual([
+      'ask_user_question',
+      'system_tool',
+      'configured_tool',
+    ]);
+  });
+
+  test.each(['existing', 'initial'] as const)(
+    '%s messages preserve explicit plugin intent without restricting the tool snapshot',
+    async (kind) => {
+      const harness = createHarness();
+      harness.getSystemTools.mockResolvedValue([]);
+      const prepare = (input: AgentSubmitMessageInput) =>
+        kind === 'initial'
+          ? prepareInitialTurn(
+              harness.dependencies,
+              {
+                ...input,
+                agentId: AGENT_ID,
+              },
+              new AbortController().signal,
+            )
+          : prepareTurn(harness.dependencies, input, new AbortController().signal);
+
+      const pluginReferences = [
+        { type: 'plugin' as const, pluginId: 'feishu', label: '飞书', offset: 0 },
+      ];
+      const sshReferences = [{ type: 'ssh' as const, label: 'SSH · guoxu', offset: 8 }];
+      const selected = await prepare({
+        ...textInput(),
+        parts: [
+          { type: 'text', text: '飞书 查找文档 SSH · guoxu', pluginReferences, sshReferences },
+        ],
+      });
+      const unselected = await prepare(textInput());
+      expect(selected.tools).toEqual([harness.configuredTool]);
+      expect(selected.inferenceSnapshot.tools).toHaveLength(1);
+      expect(unselected.tools).toEqual(selected.tools);
+      expect(unselected.inferenceSnapshot.tools).toEqual(selected.inferenceSnapshot.tools);
+      expect(selected.agent).toEqual(AGENT);
+      expect(selected.userParts).toEqual([
+        {
+          id: 'input-0',
+          type: 'text',
+          text: '飞书 查找文档 SSH · guoxu',
+          pluginReferences,
+          sshReferences,
+          state: 'done',
+        },
+      ]);
+    },
+  );
+
+  test('gates plugin tools behind their guide and restores guides loaded in earlier turns', async () => {
+    const harness = createHarness();
+    const pluginTool: RuntimeTool = {
+      ...harness.configuredTool,
+      ref: { source: 'mcp', serverId: 'feishu-1', rawToolName: 'fetch-doc' },
+      providerName: 'mcp_feishu_fetch_doc',
+    };
+    harness.resolveRuntimeTools.mockResolvedValue({
+      tools: [pluginTool],
+      pluginGuides: [
+        { pluginId: 'feishu', serverId: 'feishu-1', revision: 5, content: 'Read before edits.' },
+      ],
+    });
+    harness.loadWorkflowLoads.mockResolvedValue(['plugin:feishu-1', 'plugin:removed']);
+    const plan = await prepareTurn(harness.dependencies, textInput(), new AbortController().signal);
+
+    expect(plan.tools.map((tool) => [tool.providerName, tool.requiredInstructions?.key])).toEqual([
+      ['system_tool', undefined],
+      ['mcp_feishu_fetch_doc', 'workflow:plugin:feishu-1'],
+      ['load_workflow', undefined],
+    ]);
+    expect(plan.workflowInstructions).toEqual([
+      { key: 'workflow:plugin:feishu-1', text: expect.stringContaining('Read before edits.') },
+    ]);
+    expect(harness.loadWorkflowLoads).toHaveBeenCalledWith(SESSION_ID, undefined);
+  });
+
+  test('freezes the web policy independently of Agent mode', async () => {
+    const harness = createHarness();
+    const policy = {
+      modelToolsPreferred: true,
+      clientSearchAvailable: true,
+      clientFetchAvailable: false,
+    };
+    harness.dependencies.webTools = async () => policy;
+    const prepare = async () =>
+      (await prepareTurn(harness.dependencies, textInput(), new AbortController().signal)).webTools;
+
+    expect(await prepare()).toEqual(policy);
+    harness.getAgent.mockResolvedValue({ ...AGENT, mode: 'minimal' });
+    expect(await prepare()).toEqual(policy);
+    harness.getAgent.mockResolvedValue({ ...AGENT });
+    expect(await prepare()).toEqual(policy);
+  });
+
+  test('stops at session admission when the session does not exist', async () => {
+    const harness = createHarness();
+    harness.getSession.mockResolvedValueOnce(null);
+
+    await expect(
+      prepareTurn(harness.dependencies, textInput(), new AbortController().signal),
+    ).rejects.toMatchObject({ view: { code: 'SESSION_NOT_FOUND' } });
+
+    expect(harness.getAgent).not.toHaveBeenCalled();
+    expect(harness.getLatestContextCheckpoint).not.toHaveBeenCalled();
+  });
+
+  test('fails closed when configured tool bindings cannot be resolved', async () => {
+    const harness = createHarness();
+    harness.resolveRuntimeTools.mockRejectedValueOnce(new Error('private MCP failure'));
+
+    await expect(
+      prepareTurn(harness.dependencies, textInput(), new AbortController().signal),
+    ).rejects.toMatchObject({
+      view: {
+        code: 'EXECUTION_UNAVAILABLE',
+        message: 'The configured Agent tools are unavailable.',
+      },
+    });
+
+    expect(harness.resolveInferenceModel).not.toHaveBeenCalled();
+    expect(harness.preflightModel).toHaveBeenCalledWith(BASE_MODEL);
+  });
+
+  test('retains discovery failures for the current turn while keeping other capabilities usable', async () => {
+    const harness = createHarness();
+    harness.resolveRuntimeTools.mockImplementationOnce(async (_agentId, onUnavailable) => {
+      onUnavailable?.('Feishu document tools could not be loaded (network).');
+      return { tools: [], pluginGuides: [] };
+    });
+    const plan = await prepareTurn(harness.dependencies, textInput(), new AbortController().signal);
+    expect(plan.tools).toHaveLength(1);
+    expect(plan.toolDiscoveryWarnings).toEqual([
+      'Feishu document tools could not be loaded (network).',
+    ]);
+    const next = await prepareTurn(harness.dependencies, textInput(), new AbortController().signal);
+    expect(next.toolDiscoveryWarnings).toEqual([]);
+  });
+
+  test('replays full history when a valid checkpoint anchor is no longer present', async () => {
+    const harness = createHarness();
+    const checkpoint = {
+      version: 1 as const,
+      anchorTurnId: 'turn-anchor',
+      payload: { summary: 'Earlier context.' },
+    };
+    const history = [textMessage('message-after-anchor', 'turn-later')];
+    harness.getLatestContextCheckpoint.mockResolvedValueOnce({
+      assistantMessageId: 'assistant-anchor',
+      checkpoint,
+    });
+    harness.loadRuntimeTurnContext.mockResolvedValueOnce({
+      anchorFound: false,
+      hasMessages: true,
+      history,
+      referencedFileEntryIds: [],
+    });
+
+    const plan = await prepareTurn(harness.dependencies, textInput(), new AbortController().signal);
+
+    expect(harness.loadRuntimeTurnContext).toHaveBeenCalledWith(
+      SESSION_ID,
+      'turn-anchor',
+      undefined,
+    );
+    expect(plan.runtimeContextCheckpoint).toBeNull();
+    expect(plan.history).toEqual(history);
+    expect(plan.hasMessages).toBe(true);
+  });
+});
+
+describe('Skill turn preparation', () => {
+  const skillId = '00000000-0000-4000-8000-000000000123';
+  const activation = {
+    skillId,
+    name: 'notes',
+    contentHash: 'accepted',
+    origin: 'automatic' as const,
+  };
+  const scope: SkillTurnScope = {
+    entries: [
+      {
+        id: skillId,
+        name: 'notes',
+        description: 'Take notes',
+        contentHash: 'accepted',
+        folderName: 'notes',
+        files: ['SKILL.md'],
+        invocation: { modelInvocable: true, userInvocable: true },
+        limitations: { scripts: [], unavailableTools: [] },
+      },
+    ],
+    readInstructions: async () => 'Use a concise outline.',
+    readFile: async () => null,
+  };
+
+  test('enabled Skills expose metadata without eagerly reading entry instructions', async () => {
+    const harness = createHarness();
+    const readInstructions = jest.fn(scope.readInstructions);
+    harness.dependencies.skills = { resolve: async () => ({ ...scope, readInstructions }) };
+    const plan = await prepareDurableTurn(
+      harness.dependencies,
+      textInput(),
+      [],
+      new AbortController().signal,
+    );
+    expect(plan.skills.scope.entries).toHaveLength(1);
+    expect(plan.skills.selected).toHaveLength(0);
+    expect(plan.skills.active?.size).toBe(0);
+    expect(readInstructions).not.toHaveBeenCalled();
+  });
+
+  test('repeated activation receipts consume the restoration budget only once per Skill', async () => {
+    const harness = createHarness();
+    const otherId = '00000000-0000-4000-8000-000000000124';
+    const other = {
+      ...scope.entries[0]!,
+      id: otherId,
+      name: 'other-notes',
+      folderName: 'other-notes',
+    };
+    const readInstructions = jest.fn(async (id: string) =>
+      (id === skillId ? 'a' : 'b').repeat(24_000),
+    );
+    harness.dependencies.skills = {
+      resolve: async () => ({ ...scope, entries: [...scope.entries, other], readInstructions }),
+    };
+    harness.loadSkillActivations.mockResolvedValue([
+      {
+        messageId: 'older-other',
+        activation: { ...activation, skillId: otherId, name: other.name },
+      },
+      { messageId: 'first-read', activation },
+      { messageId: 'repeat-read', activation },
+    ]);
+    const plan = await prepareDurableTurn(
+      harness.dependencies,
+      textInput(),
+      [],
+      new AbortController().signal,
+    );
+    expect(plan.skills.active?.get(skillId)?.instructions).toBe('a'.repeat(24_000));
+    expect(plan.skills.active?.get(otherId)?.instructions).toBe('b'.repeat(24_000));
+    expect(readInstructions).toHaveBeenCalledTimes(2);
+  });
+
+  test.each([
+    [undefined, true],
+    ['create' as const, false],
+  ])(
+    'offers create_skill upfront only for the explicit workflow (%s)',
+    async (action, deferred) => {
+      const harness = createHarness();
+      harness.dependencies.skills = { resolve: async () => scope };
+      harness.dependencies.skillWorkflow = {
+        create: jest.fn(),
+      } as unknown as NonNullable<typeof harness.dependencies.skillWorkflow>;
+      const plan = await prepareTurn(
+        harness.dependencies,
+        { ...textInput(), ...(action ? { skillAction: action } : {}) },
+        new AbortController().signal,
+      );
+      expect(plan.tools.find((tool) => tool.providerName === 'create_skill')?.deferred).toBe(
+        deferred,
+      );
+    },
+  );
+
+  test('persists explicit selection receipts and rejects out-of-scope selection', async () => {
+    const harness = createHarness();
+    harness.dependencies.skills = { resolve: async () => scope };
+    const plan = await prepareTurn(
+      harness.dependencies,
+      {
+        ...textInput(),
+        skillIds: [skillId],
+        parts: [
+          {
+            type: 'text',
+            text: 'notes',
+            skillReferences: [{ type: 'skill', skillId, label: 'notes', offset: 0 }],
+          },
+        ],
+      },
+      new AbortController().signal,
+    );
+    expect(plan.userParts[0]).toMatchObject({
+      skillSelections: [{ ...activation, origin: 'explicit' }],
+      skillReferences: [{ type: 'skill', skillId, label: 'notes', offset: 0 }],
+    });
+    expect(plan.skills.selected[0]?.instructions).toBe('Use a concise outline.');
+    await expect(
+      prepareTurn(
+        harness.dependencies,
+        { ...textInput(), skillIds: ['00000000-0000-4000-8000-000000000124'] },
+        new AbortController().signal,
+      ),
+    ).rejects.toThrow('The selected Skill is not usable by this Agent');
+  });
+
+  test.each([
+    { isCurrent: true, origin: 'automatic' as const },
+    { isCurrent: true, origin: 'explicit' as const },
+    { isCurrent: false, origin: 'automatic' as const },
+  ])(
+    'restores compacted activations only while their scope is valid: %j',
+    async ({ isCurrent, origin }) => {
+      const harness = createHarness();
+      const checkpoint = {
+        version: 1 as const,
+        anchorTurnId: 'old-turn',
+        payload: { summary: 'Prior summary.' },
+      };
+      harness.getLatestContextCheckpoint.mockResolvedValue({
+        assistantMessageId: 'old-answer',
+        checkpoint,
+      });
+      harness.dependencies.skills = {
+        resolve: async () => (isCurrent ? scope : { ...scope, entries: [] }),
+      };
+      harness.loadRuntimeTurnContext.mockResolvedValue({
+        ...EMPTY_CONTEXT,
+        hasMessages: true,
+      });
+      harness.loadSkillActivations.mockResolvedValue([
+        { messageId: 'old-answer', activation: { ...activation, origin } },
+      ]);
+      const plan = await prepareTurn(
+        harness.dependencies,
+        textInput(),
+        new AbortController().signal,
+      );
+      // A Skill that is no longer usable simply stops contributing; compaction is kept.
+      expect(plan.skills.active?.get(skillId)?.instructions).toBe(
+        isCurrent ? 'Use a concise outline.' : undefined,
+      );
+      expect(plan.runtimeContextCheckpoint).toEqual(checkpoint);
+    },
+  );
+
+  test('a native Pi turn restores activations from the Cherry transcript', async () => {
+    const harness = createHarness();
+    harness.dependencies.skills = { resolve: async () => scope };
+    harness.loadSkillActivations.mockResolvedValue([{ messageId: 'old-answer', activation }]);
+    const plan = await prepareDurableTurn(
+      harness.dependencies,
+      textInput(),
+      [],
+      new AbortController().signal,
+    );
+    // Pi holds the model history, so no transcript is loaded; receipts still are.
+    expect(harness.loadRuntimeTurnContext).not.toHaveBeenCalled();
+    expect(plan.skills.active?.get(skillId)?.instructions).toBe('Use a concise outline.');
+  });
+});
+
+function createHarness() {
+  const textFact = fact(FILE_ENTRY_ID, 'notes.txt', 'text/plain', 26);
+  const getSession = jest.fn(
+    async (_sessionId: string): Promise<AgentSessionView | null> => SESSION,
+  );
+  const getAgent = jest.fn(async (_agentId: string): Promise<AgentDefinition | null> => AGENT);
+  const getLatestContextCheckpoint = jest.fn(
+    async (_sessionId: string): Promise<StoredRuntimeContextCheckpoint | null> => null,
+  );
+  const loadRuntimeTurnContext = jest.fn(
+    async (_sessionId: string, _anchorTurnId: string | null): Promise<StoredRuntimeTurnContext> =>
+      EMPTY_CONTEXT,
+  );
+  const loadSkillActivations = jest.fn(
+    async (_sessionId: string): Promise<StoredSkillActivation[]> => [],
+  );
+  const loadWorkflowLoads = jest.fn(async (_sessionId: string): Promise<string[]> => []);
+  const resolveAvailable = jest.fn(async (fileEntryIds: readonly FileEntryId[]) =>
+    fileEntryIds.includes(FILE_ENTRY_ID) ? new Map([[FILE_ENTRY_ID, textFact]]) : new Map(),
+  );
+  const readAsBytes = jest.fn(async () => new TextEncoder().encode('trusted only as user input'));
+  const files: ManagedFileResolver = {
+    resolveAvailable,
+    readAsBytes,
+    readDocumentText: jest.fn(async () => undefined),
+    readImageText: jest.fn(async () => undefined),
+    readAsDataUrl: jest.fn(async () => undefined),
+  };
+  const systemTool = tool('system_tool', 'ask');
+  const configuredTool = tool('configured_tool', 'deny');
+  const getSystemTools = jest.fn(
+    async (_input: Parameters<SystemCapabilitySource['getTools']>[0]) => [systemTool],
+  );
+  const resolveRuntimeTools = jest.fn(
+    async (_agentId: string, _onUnavailable?: (warning: string) => void) => ({
+      tools: [configuredTool],
+      pluginGuides: [] as PluginGuideSnapshot[],
+    }),
+  );
+  const resolveInferenceModel = jest.fn(
+    async (model: RuntimeModel): Promise<AgentInferenceModelSnapshot> => ({
+      uniqueModelId: createUniqueModelId(model.providerId, model.modelId),
+      providerId: model.providerId,
+      modelId: model.modelId,
+      apiModelId: `${model.modelId}-api`,
+      name: 'Selected Model',
+    }),
+  );
+  const runtime = new FakeRuntime({
+    modelPreflight: {
+      contextWindow: 128_000,
+      inputModalities: ['text', 'image'],
+      maxInputTokens: 120_000,
+      maxOutputTokens: 8_000,
+      supportsTools: true,
+    },
+  });
+  const preflightModel = jest.spyOn(runtime, 'preflightModel');
+  const askUser = jest.fn(async () => {
+    throw new Error('Preparation never asks the user.');
+  });
+  const dependencies: TurnPreparationDependencies = {
+    agents: { getAgent },
+    askUser,
+    documentParserMode: () => 'anydoc',
+    files,
+    inferenceModel: resolveInferenceModel,
+    runtime,
+    runtimeTools: { resolve: resolveRuntimeTools },
+    store: {
+      getLatestContextCheckpoint,
+      getSession,
+      loadRuntimeTurnContext,
+      loadSkillActivations,
+      loadWorkflowLoads,
+    },
+    systemCapabilities: { getTools: getSystemTools },
+  };
+
+  return {
+    askUser,
+    configuredTool,
+    dependencies,
+    files,
+    getAgent,
+    getLatestContextCheckpoint,
+    getSession,
+    getSystemTools,
+    loadRuntimeTurnContext,
+    loadSkillActivations,
+    loadWorkflowLoads,
+    preflightModel,
+    resolveInferenceModel,
+    resolveRuntimeTools,
+    runtime,
+    systemTool,
+  };
+}
+
+function textInput(): AgentSubmitMessageInput {
+  return {
+    sessionId: SESSION_ID,
+    userMessageId: 'user-1',
+    assistantMessageId: 'assistant-1',
+    parts: [{ type: 'text', text: 'Continue.' }],
+  };
+}
+
+function fact(
+  fileEntryId: FileEntryId,
+  name: string,
+  mediaType: string,
+  size: number,
+): ManagedFileFact {
+  return { fileEntryId, mediaType, name, size };
+}
+
+function tool(providerName: string, approval: RuntimeTool['approval']): RuntimeTool {
+  return {
+    ref: { source: 'builtin', capabilityId: providerName },
+    providerName,
+    displayName: providerName,
+    description: `${providerName} description`,
+    inputSchema: { type: 'object' },
+    approval,
+    execute: async () => ({ value: null, artifacts: [] }),
+  };
+}
+
+function textMessage(id: string, turnId: string): AgentMessageView {
+  return {
+    id,
+    sessionId: SESSION_ID,
+    turnId,
+    role: 'user',
+    status: 'success',
+    parts: [{ id: `${id}-part`, type: 'text', text: 'Later message.', state: 'done' }],
+    stats: null,
+    modelId: null,
+    inferenceSnapshot: null,
+    createdAt: NOW,
+    updatedAt: NOW,
+  };
+}

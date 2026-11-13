@@ -1,0 +1,61 @@
+import { index, sqliteTable, text } from 'drizzle-orm/sqlite-core';
+
+import {
+  DEFAULT_AGENT_MODE,
+  DEFAULT_AGENT_TOOL_APPROVAL_MODE,
+  type AgentMode,
+  type AgentToolApprovalMode,
+} from '@/shared/data/types/agent';
+
+import {
+  createUpdateDeleteTimestamps,
+  orderKeyColumns,
+  orderKeyIndex,
+  uuidPrimaryKey,
+} from './_columnHelpers';
+import { userModelTable } from './userModel';
+
+/**
+ * Agent table - stores user-configured Agent definitions
+ * (docs/references/agent/agent-persistence.md).
+ *
+ * Per-Agent MCP availability is normalized in `agent_tool_binding`; the broad
+ * interactive approval preference lives on this row. Agent CRUD never rewrites
+ * the binding relation. The fixed built-in Runtime catalog is Host-owned and is
+ * not stored on this row. Skill references remain deferred.
+ * Sessions reference agents via FK (ON DELETE RESTRICT); agents soft-delete
+ * first, so live Sessions never orphan.
+ */
+export const agentTable = sqliteTable(
+  'agent',
+  {
+    id: uuidPrimaryKey(),
+    name: text().notNull(),
+    // System instructions supplied to every turn
+    instructions: text().notNull().default(''),
+    mode: text({ enum: ['standard', 'minimal'] })
+      .$type<AgentMode>()
+      .notNull()
+      .default(DEFAULT_AGENT_MODE),
+    // Built-in Cherry emoji or file reference (agent-avatar-file:{agentId}.{uuid}.webp);
+    // NULL renders the default avatar. Never an absolute file:// path.
+    avatar: text(),
+    // Default model: FK to user_model(id) — UniqueModelId "providerId::modelId"
+    // Legitimately nullable: NULL = "no model selected yet"
+    model: text().references(() => userModelTable.id, { onDelete: 'set null' }),
+    // Per-Agent interactive approval preference. This does not enable tools.
+    toolApprovalMode: text({ enum: ['default', 'auto'] })
+      .$type<AgentToolApprovalMode>()
+      .notNull()
+      .default(DEFAULT_AGENT_TOOL_APPROVAL_MODE),
+    // Retired capability switches. Keep stored values for schema compatibility;
+    // current readers ignore them and tool discovery uses per-turn system gates.
+    disabledCapabilities: text({ mode: 'json' }).$type<string[]>().notNull().default([]),
+    ...orderKeyColumns,
+    ...createUpdateDeleteTimestamps,
+  },
+  (t) => [index('agent_created_at_idx').on(t.createdAt), orderKeyIndex('agent')(t)],
+);
+
+export type AgentRow = typeof agentTable.$inferSelect;
+export type InsertAgentRow = typeof agentTable.$inferInsert;

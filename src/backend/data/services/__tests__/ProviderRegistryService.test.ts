@@ -1,0 +1,458 @@
+import {
+  ENDPOINT_TYPE,
+  MODEL_CAPABILITY,
+  REASONING_EFFORT,
+  REASONING_FORMAT_PROFILES,
+} from '@cherrystudio/provider-registry';
+
+import { MobileRegistryLoader } from '@/backend/data/services/MobileRegistryLoader';
+import { installProviderRegistryTestSnapshot } from '@/backend/data/services/providerRegistryTestSnapshot';
+
+import {
+  mergePresetModel,
+  ProviderRegistryService,
+  projectRuntimeReasoning,
+  providerRegistryService,
+  resolveReasoningProfileFromRegistry,
+} from '../ProviderRegistryService';
+
+beforeEach(installProviderRegistryTestSnapshot);
+
+describe('provider-registry-service', () => {
+  test('keeps DeepSeek search on the Mobile endpoint without broadening model membership', () => {
+    const provider = { id: 'deepseek-copy', presetProviderId: 'deepseek' };
+    expect(
+      providerRegistryService.resolveServerTools(
+        provider,
+        'deepseek-v4-pro',
+        ENDPOINT_TYPE.ANTHROPIC_MESSAGES,
+      ),
+    ).toEqual(['web-search']);
+    for (const endpoint of [
+      ENDPOINT_TYPE.OPENAI_RESPONSES,
+      ENDPOINT_TYPE.OPENAI_CHAT_COMPLETIONS,
+    ]) {
+      expect(
+        providerRegistryService.resolveServerTools(provider, 'deepseek-v4-pro', endpoint),
+      ).toEqual([]);
+    }
+    expect(
+      providerRegistryService.resolveServerTools(
+        provider,
+        'deepseek-v3',
+        ENDPOINT_TYPE.ANTHROPIC_MESSAGES,
+      ),
+    ).toEqual([]);
+  });
+
+  test('keeps QwenCloud native tool membership bound to the requested endpoint', () => {
+    const provider = { id: 'qwencloud-copy', presetProviderId: 'qwencloud' };
+    expect(
+      providerRegistryService.resolveServerTools(
+        provider,
+        'qwen3.8-flash',
+        ENDPOINT_TYPE.OPENAI_CHAT_COMPLETIONS,
+      ),
+    ).toEqual(['web-search']);
+    expect(
+      providerRegistryService.resolveServerTools(
+        provider,
+        'qwen3.8-flash',
+        ENDPOINT_TYPE.ANTHROPIC_MESSAGES,
+      ),
+    ).toEqual([]);
+    expect(
+      providerRegistryService.resolveServerTools(
+        provider,
+        'glm-5.2',
+        ENDPOINT_TYPE.OPENAI_RESPONSES,
+      ),
+    ).toEqual(['web-search']);
+    expect(
+      providerRegistryService.resolveServerTools(
+        provider,
+        'glm-5.2',
+        ENDPOINT_TYPE.OPENAI_CHAT_COMPLETIONS,
+      ),
+    ).toEqual([]);
+  });
+
+  test('infers effort controls for manually added Step-5 Preview models', () => {
+    const [model] = providerRegistryService.resolveModels('custom-provider', ['step-5-preview'], {
+      presetProviderId: null,
+      defaultChatEndpoint: ENDPOINT_TYPE.OPENAI_CHAT_COMPLETIONS,
+    });
+    expect(model.reasoning?.selectableEfforts).toEqual(['low', 'medium', 'high']);
+  });
+
+  test('projects Grok Imagine aspect ratios and image routing from the downloaded catalog', () => {
+    const [model] = providerRegistryService.resolveModels('grok', ['grok-imagine-image-2.0']);
+    expect(model.endpointTypes).toEqual([ENDPOINT_TYPE.OPENAI_IMAGE_GENERATION]);
+    for (const mode of ['generate', 'edit'] as const) {
+      expect(model.imageGeneration?.modes?.[mode]?.supports.aspectRatio).toMatchObject({
+        type: 'enum',
+        default: 'auto',
+        options: expect.arrayContaining(['1:1', '16:9', '9:16']),
+      });
+    }
+  });
+
+  test('materializes downloaded GPT-6.1 Terra with its Codex limits and reasoning defaults', () => {
+    const [model] = providerRegistryService.resolveModels('openai-codex', ['gpt-6.1-terra']);
+    expect(model).toMatchObject({
+      apiModelId: 'gpt-6.1-terra',
+      presetModelId: 'gpt-6-1-terra',
+      contextWindow: 500_000,
+      maxInputTokens: 372_000,
+      maxOutputTokens: 128_000,
+      supportsFastMode: true,
+      reasoning: {
+        selectableEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+        defaultEffort: 'low',
+      },
+    });
+  });
+
+  test('projects downloaded GPT-6.1 Sol efforts for GGAPI without changing its API model id', () => {
+    const loader = new MobileRegistryLoader();
+    loader.installRemoteSnapshot(
+      loader.parseRemoteSnapshot({
+        models: {
+          version: 'v3',
+          models: [
+            {
+              id: 'gpt-6-1-sol',
+              name: 'GPT-6.1 Sol',
+              capabilities: ['reasoning'],
+              reasoning: {
+                controls: [
+                  {
+                    kind: 'effort',
+                    values: ['low', 'medium', 'high', 'xhigh', 'max'],
+                    default: 'medium',
+                  },
+                ],
+                supportedEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+                defaultEffort: 'medium',
+              },
+            },
+          ],
+        },
+        providerModels: { version: 'v3', overrides: [] },
+      }),
+    );
+    const service = new ProviderRegistryService(loader);
+    const [model] = service.resolveModels('ggapi', ['gpt-6.1-sol'], {
+      defaultChatEndpoint: ENDPOINT_TYPE.OPENAI_CHAT_COMPLETIONS,
+      presetProviderId: null,
+    });
+    expect(model).toMatchObject({
+      id: 'ggapi::gpt-6.1-sol',
+      apiModelId: 'gpt-6.1-sol',
+      presetModelId: 'gpt-6-1-sol',
+      reasoning: {
+        selectableEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+        defaultEffort: 'medium',
+      },
+    });
+  });
+
+  test('merges preset model and provider override into runtime model', () => {
+    const model = mergePresetModel(
+      {
+        capabilities: [MODEL_CAPABILITY.FUNCTION_CALL],
+        contextWindow: 128000,
+        id: 'gpt-4o',
+        maxOutputTokens: 16384,
+        metadata: {},
+        name: 'GPT-4o',
+        pricing: {
+          input: { perMillionTokens: 2.5 },
+          output: { perMillionTokens: 10 },
+        },
+        reasoning: {
+          supportedEfforts: [REASONING_EFFORT.LOW, REASONING_EFFORT.HIGH],
+        },
+      },
+      {
+        capabilities: { add: [MODEL_CAPABILITY.AUDIO_RECOGNITION] },
+        endpointTypes: [ENDPOINT_TYPE.OPENAI_CHAT_COMPLETIONS],
+        limits: { maxInputTokens: 64000 },
+        modelId: 'gpt-4o',
+        name: 'GPT-4o Override',
+        providerId: 'openai',
+        replaceWith: 'gpt-4o-mini',
+      },
+      'openai',
+      REASONING_FORMAT_PROFILES['openai-chat'].wire,
+    );
+
+    expect(model).toMatchObject({
+      capabilities: [MODEL_CAPABILITY.FUNCTION_CALL, MODEL_CAPABILITY.AUDIO_RECOGNITION],
+      id: 'openai::gpt-4o',
+      maxInputTokens: 64000,
+      modelId: 'gpt-4o',
+      name: 'GPT-4o Override',
+      presetModelId: 'gpt-4o',
+      providerId: 'openai',
+      replaceWith: 'openai::gpt-4o-mini',
+      reasoning: {
+        selectableEfforts: [REASONING_EFFORT.LOW, REASONING_EFFORT.HIGH],
+      },
+    });
+  });
+
+  test('keeps a provider-only price, including explicit free pricing', () => {
+    const pricing = { input: { perMillionTokens: 0 }, output: { perMillionTokens: 0 } };
+    const model = mergePresetModel(
+      { id: 'unpriced-model', name: 'Unpriced Model', metadata: {} },
+      { providerId: 'github', modelId: 'unpriced-model', pricing },
+      'github',
+    );
+    expect(model.pricing).toEqual(pricing);
+  });
+
+  test('synthesizes standalone provider-model rows from desktop registry data', () => {
+    const loader = new MobileRegistryLoader();
+    loader.installRemoteSnapshot(
+      loader.parseRemoteSnapshot({
+        models: { version: 'standalone', models: [] },
+        providerModels: {
+          version: 'standalone',
+          overrides: [
+            {
+              providerId: '302ai',
+              modelId: 'chatgpt-4o-latest',
+              apiModelId: 'chatgpt-4o-latest',
+              name: 'chatgpt-4o-latest',
+            },
+          ],
+        },
+      }),
+    );
+    const registryData = new ProviderRegistryService(loader).lookupModel(
+      '302ai',
+      'chatgpt-4o-latest',
+    );
+
+    expect(registryData.presetModel).toMatchObject({
+      id: 'chatgpt-4o-latest',
+      name: 'chatgpt-4o-latest',
+    });
+    expect(registryData.registryOverride).toMatchObject({
+      apiModelId: 'chatgpt-4o-latest',
+      providerId: '302ai',
+    });
+  });
+
+  test('returns image-generation support from override or model metadata', () => {
+    expect(
+      providerRegistryService.getImageGenerationSupport('aihubmix', 'ernie-irag-edit'),
+    ).toBeDefined();
+    expect(
+      providerRegistryService.getImageGenerationSupport('dashscope', 'qwen-image'),
+    ).toBeDefined();
+  });
+
+  test('lists the seven Radeon Cloud provider-registry models', () => {
+    const models = providerRegistryService.listProviderRegistryModels({
+      providerId: 'radeon-cloud',
+    });
+
+    expect(models.map(({ presetModelId, apiModelId }) => [presetModelId, apiModelId])).toEqual([
+      ['deepseek-v4-flash', 'DeepSeek-V4-Flash'],
+      ['deepseek-v4-pro', 'DeepSeek-V4-Pro'],
+      ['glm-5-1', 'GLM-5.1'],
+      ['glm-5-2', 'GLM-5.2'],
+      ['gpt-oss-120b', 'gpt-oss-120b'],
+      ['kimi-k2-6', 'Kimi-K2.6'],
+      ['qwen3-6-35b-a3b', 'Qwen3.6-35B-A3B'],
+    ]);
+  });
+
+  test('projects a preset provider catalog onto a copied provider id', () => {
+    const models = providerRegistryService.listProviderRegistryModels({
+      presetProviderId: 'zhipu',
+      providerId: 'copied-zhipu',
+    });
+
+    expect(models.length).toBeGreaterThan(0);
+    expect(models.every((model) => model.providerId === 'copied-zhipu')).toBe(true);
+    expect(models.every((model) => model.id.startsWith('copied-zhipu::'))).toBe(true);
+  });
+
+  test('does not inherit a catalog for a fully custom provider', () => {
+    expect(
+      providerRegistryService.listProviderRegistryModels({
+        presetProviderId: null,
+        providerId: 'fully-custom',
+      }),
+    ).toEqual([]);
+  });
+
+  test('loads Radeon Cloud after CherryIN', () => {
+    const providerIds = providerRegistryService.loadProviders().map(({ id }) => id);
+
+    expect(providerIds.slice(0, 2)).toEqual(['cherryin', 'radeon-cloud']);
+  });
+
+  test('exposes provider model-list and auth metadata', () => {
+    const service = new ProviderRegistryService({
+      findProvider: (providerId: string) =>
+        providerId === 'login-provider'
+          ? {
+              authMethods: ['external-cli'],
+              authOptional: true,
+              defaultChatEndpoint: null,
+              id: 'login-provider',
+              metadata: { website: { official: 'https://example.com' } },
+              modelListSource: 'registry',
+              name: 'Login Provider',
+            }
+          : null,
+      getProviderModelsVersion: () => 'provider-models-version',
+      getProvidersVersion: () => 'providers-version',
+      invalidate: () => undefined,
+      loadProviders: () => [],
+    } as never);
+
+    expect(service.getProviderDisplayMetadata('login-provider')).toEqual({
+      authMethods: ['external-cli'],
+      authOptional: true,
+      description: undefined,
+      modelListSource: 'registry',
+      websites: { official: 'https://example.com' },
+    });
+    expect(service.isRegistryProvider('login-provider')).toBe(true);
+    expect(service.isRegistryProvider('custom-provider')).toBe(false);
+  });
+
+  test('resolves the request-time model contract before endpoint and global profiles', () => {
+    const model = providerRegistryService.resolveModels('zhipu', ['glm-5-2'], {
+      defaultChatEndpoint: ENDPOINT_TYPE.OPENAI_CHAT_COMPLETIONS,
+      presetProviderId: 'zhipu',
+    })[0];
+
+    const resolved = providerRegistryService.resolveReasoningProfile(
+      {
+        defaultChatEndpoint: ENDPOINT_TYPE.OPENAI_CHAT_COMPLETIONS,
+        id: 'zhipu',
+        presetProviderId: 'zhipu',
+      },
+      model,
+      ENDPOINT_TYPE.OPENAI_CHAT_COMPLETIONS,
+    );
+
+    expect(resolved.support?.controls).toEqual([
+      { default: 'max', kind: 'effort', values: ['none', 'high', 'max'] },
+    ]);
+    expect(resolved.wire).toMatchObject({
+      off: {
+        operations: [{ target: 'thinking.type', value: { source: 'literal', value: 'disabled' } }],
+      },
+      effort: {
+        operations: [
+          { target: 'thinking.type', value: { source: 'literal', value: 'enabled' } },
+          { target: 'reasoningEffort', value: { source: 'effort' } },
+        ],
+      },
+    });
+  });
+
+  test('resolves endpoint inline wire before the global format wire', () => {
+    const inlineWire = {
+      effort: {
+        operations: [
+          {
+            target: 'disable_reasoning' as const,
+            value: { source: 'literal' as const, value: false },
+          },
+        ],
+      },
+    };
+
+    expect(
+      resolveReasoningProfileFromRegistry({
+        endpointType: ENDPOINT_TYPE.OPENAI_CHAT_COMPLETIONS,
+        format: { type: 'openai-chat', wire: inlineWire },
+      }).wire,
+    ).toBe(inlineWire);
+    expect(
+      resolveReasoningProfileFromRegistry({
+        endpointType: ENDPOINT_TYPE.OPENAI_CHAT_COMPLETIONS,
+        format: { type: 'openai-chat' },
+      }).wire,
+    ).toBe(REASONING_FORMAT_PROFILES['openai-chat'].wire);
+  });
+
+  test('selects generation-specific native reasoning wires', () => {
+    const geminiBudgetWire = resolveReasoningProfileFromRegistry({
+      endpointType: ENDPOINT_TYPE.GOOGLE_GENERATE_CONTENT,
+      wireDialect: 'budget',
+    }).wire;
+    const anthropicBudgetWire = resolveReasoningProfileFromRegistry({
+      endpointType: ENDPOINT_TYPE.ANTHROPIC_MESSAGES,
+      wireDialect: 'budget',
+    }).wire;
+
+    expect(geminiBudgetWire).toBe(REASONING_FORMAT_PROFILES.gemini.budgetWire);
+    expect(geminiBudgetWire.effort?.operations).toContainEqual({
+      target: 'thinkingConfig.thinkingBudget',
+      value: { source: 'budget' },
+    });
+    expect(anthropicBudgetWire).toBe(REASONING_FORMAT_PROFILES.anthropic.budgetWire);
+    expect(anthropicBudgetWire.auto?.operations).toContainEqual({
+      target: 'thinking.type',
+      value: { source: 'literal', value: 'enabled' },
+    });
+  });
+
+  test('ignores a budget dialect on single-dialect endpoint formats', () => {
+    expect(
+      resolveReasoningProfileFromRegistry({
+        endpointType: ENDPOINT_TYPE.OPENAI_CHAT_COMPLETIONS,
+        wireDialect: 'budget',
+      }).wire,
+    ).toBe(REASONING_FORMAT_PROFILES['openai-chat'].wire);
+  });
+
+  test('adds Responses summaries only for hosts that explicitly accept them', () => {
+    const defaultWire = resolveReasoningProfileFromRegistry({
+      endpointType: ENDPOINT_TYPE.OPENAI_RESPONSES,
+    }).wire;
+    const enabledWire = resolveReasoningProfileFromRegistry({
+      endpointType: ENDPOINT_TYPE.OPENAI_RESPONSES,
+      reasoningSummary: true,
+    }).wire;
+    const targets = (wire: typeof defaultWire) =>
+      Object.values(wire).flatMap((mode) =>
+        mode && typeof mode === 'object' && 'operations' in mode
+          ? mode.operations.map((operation) => operation.target)
+          : [],
+      );
+
+    expect(targets(defaultWire)).not.toContain('reasoningSummary');
+    expect(targets(enabledWire)).toContain('reasoningSummary');
+    expect(
+      enabledWire.off?.operations.some((operation) => operation.target === 'reasoningSummary'),
+    ).toBe(false);
+    for (const key of ['default', 'auto', 'effort'] as const) {
+      const summaryOperations = enabledWire[key]?.operations.filter(
+        (operation) => operation.target === 'reasoningSummary',
+      );
+      expect(summaryOperations).toEqual([
+        { target: 'reasoningSummary', value: { source: 'literal', value: 'auto' } },
+        { target: 'reasoningSummary', value: { source: 'assistant-summary' } },
+      ]);
+    }
+  });
+});
+
+test('keeps unsupported ultra effort out of Mobile defaults and selections', () => {
+  const reasoning = projectRuntimeReasoning(
+    { defaultEffort: 'ultra', controls: [{ kind: 'effort', values: ['high', 'ultra'] }] },
+    REASONING_FORMAT_PROFILES['openai-chat'].wire,
+  );
+  expect(reasoning.selectableEfforts).toEqual(['high']);
+  expect(reasoning.defaultEffort).toBeUndefined();
+});

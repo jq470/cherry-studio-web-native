@@ -1,0 +1,317 @@
+{
+  "expo": {
+    "name": "Cherry Studio",
+    "slug": "cherry-studio",
+    "version": "0.5.5",
+    "locales": {
+      "de": "./assets/permissions/locales/de.json",
+      "el": "./assets/permissions/locales/el.json",
+      "en": "./assets/permissions/locales/en.json",
+      "es": "./assets/permissions/locales/es.json",
+      "fr": "./assets/permissions/locales/fr.json",
+      "ja": "./assets/permissions/locales/ja.json",
+      "pt": "./assets/permissions/locales/pt.json",
+      "ro": "./assets/permissions/locales/ro.json",
+      "ru": "./assets/permissions/locales/ru.json",
+      "tr": "./assets/permissions/locales/tr.json",
+      "vi": "./assets/permissions/locales/vi.json",
+      "zh-Hans": "./assets/permissions/locales/zh-Hans.json",
+      "zh-Hant": "./assets/permissions/locales/zh-Hant.json"
+    },
+    "runtimeVersion": {
+      "policy": "fingerprint"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/80096eaf-3ad0-4b87-a466-15f04da1bacc",
+      "checkAutomatically": "ON_LOAD",
+      "fallbackToCacheTimeout": 0,
+      "enableBsdiffPatchSupport": true
+    },
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "scheme": "cherrystudio",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "supportsTablet": true,
+      "requireFullScreen": false,
+      "icon": {
+        "light": "./assets/icon-light.png",
+        "dark": "./assets/icon-dark.png"
+      },
+      "bundleIdentifier": "com.cherryai.cherrystudio-app",
+      "appleTeamId": "87242QY66T",
+      "privacyManifests": {
+        "NSPrivacyTracking": false,
+        "NSPrivacyCollectedDataTypes": [
+          {
+            "NSPrivacyCollectedDataType": "NSPrivacyCollectedDataTypeCrashData",
+            "NSPrivacyCollectedDataTypeLinked": false,
+            "NSPrivacyCollectedDataTypeTracking": false,
+            "NSPrivacyCollectedDataTypePurposes": [
+              "NSPrivacyCollectedDataTypePurposeAppFunctionality"
+            ]
+          },
+          {
+            "NSPrivacyCollectedDataType": "NSPrivacyCollectedDataTypePerformanceData",
+            "NSPrivacyCollectedDataTypeLinked": false,
+            "NSPrivacyCollectedDataTypeTracking": false,
+            "NSPrivacyCollectedDataTypePurposes": [
+              "NSPrivacyCollectedDataTypePurposeAppFunctionality"
+            ]
+          },
+          {
+            "NSPrivacyCollectedDataType": "NSPrivacyCollectedDataTypeOtherDiagnosticData",
+            "NSPrivacyCollectedDataTypeLinked": false,
+            "NSPrivacyCollectedDataTypeTracking": false,
+            "NSPrivacyCollectedDataTypePurposes": [
+              "NSPrivacyCollectedDataTypePurposeAppFunctionality"
+            ]
+          },
+          {
+            "NSPrivacyCollectedDataType": "NSPrivacyCollectedDataTypeProductInteraction",
+            "NSPrivacyCollectedDataTypeLinked": false,
+            "NSPrivacyCollectedDataTypeTracking": false,
+            "NSPrivacyCollectedDataTypePurposes": ["NSPrivacyCollectedDataTypePurposeAnalytics"]
+          },
+          {
+            "NSPrivacyCollectedDataType": "NSPrivacyCollectedDataTypeDeviceID",
+            "NSPrivacyCollectedDataTypeLinked": false,
+            "NSPrivacyCollectedDataTypeTracking": false,
+            "NSPrivacyCollectedDataTypePurposes": ["NSPrivacyCollectedDataTypePurposeAnalytics"]
+          }
+        ],
+        "NSPrivacyAccessedAPITypes": [
+          {
+            "NSPrivacyAccessedAPIType": "NSPrivacyAccessedAPICategoryUserDefaults",
+            "NSPrivacyAccessedAPITypeReasons": ["CA92.1"]
+          },
+          {
+            "NSPrivacyAccessedAPIType": "NSPrivacyAccessedAPICategorySystemBootTime",
+            "NSPrivacyAccessedAPITypeReasons": ["35F9.1"]
+          },
+          {
+            "NSPrivacyAccessedAPIType": "NSPrivacyAccessedAPICategoryFileTimestamp",
+            "NSPrivacyAccessedAPITypeReasons": ["C617.1"]
+          }
+        ]
+      },
+      "entitlements": {
+        "com.apple.developer.healthkit": true,
+        "com.apple.security.application-groups": ["group.com.cherryai.cherrystudio-app"]
+      },
+      "infoPlist": {
+        "UISupportedInterfaceOrientations~ipad": [
+          "UIInterfaceOrientationPortrait",
+          "UIInterfaceOrientationPortraitUpsideDown",
+          "UIInterfaceOrientationLandscapeLeft",
+          "UIInterfaceOrientationLandscapeRight"
+        ],
+        "NSCalendarsWriteOnlyAccessUsageDescription": "Cherry Studio adds calendar events you request in chat, such as a meeting tomorrow at 10 AM, using details from your selected AI service.",
+        "NSHealthShareUsageDescription": "Cherry Studio reads the Apple Health data you select when you ask in chat, such as summarizing your sleep and steps over the past week, and with your approval sends it to your selected AI service for analysis.",
+        "NSHealthUpdateUsageDescription": "Cherry Studio reads selected Apple Health data to answer your health and fitness questions. It does not save or modify data in Apple Health.",
+        "NSLocalNetworkUsageDescription": "Allow Cherry Studio to connect to the Cherry Studio desktop app, AI providers, MCP servers, and SSH devices such as routers and NAS on your local network.",
+        "NSBonjourServices": ["_cherry-remote._tcp"],
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": true
+        }
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "monochromeImage": "./assets/adaptive-icon-monochrome.png",
+        "backgroundColor": "#F65D5D"
+      },
+      "package": "com.cherryai.cherrystudio_app",
+      "predictiveBackGestureEnabled": false,
+      "blockedPermissions": [
+        "android.permission.RECEIVE_BOOT_COMPLETED",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.READ_MEDIA_VISUAL_USER_SELECTED"
+      ],
+      "permissions": [
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.CAMERA",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_DATA_SYNC",
+        "android.permission.WAKE_LOCK",
+        "android.permission.POST_NOTIFICATIONS"
+      ]
+    },
+    "web": {
+      "output": "static",
+      "favicon": "./assets/icon.png"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-dev-client",
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/notification-icon.png"
+        }
+      ],
+      "./scripts/withAndroidBackgroundGeneration.js",
+      "./scripts/withSystemIntegration.js",
+      "./scripts/withTabletOrientation.js",
+      [
+        "@sentry/react-native/expo",
+        {
+          "url": "https://sentry.io/",
+          "organization": "cherryai",
+          "project": "cherry-studio-app",
+          "experimental_android": {
+            "enableAndroidGradlePlugin": true,
+            "includeProguardMapping": true,
+            "autoUploadProguardMapping": true,
+            "uploadNativeSymbols": true,
+            "autoUploadNativeSymbols": true,
+            "includeNativeSources": true,
+            "includeSourceContext": true
+          }
+        }
+      ],
+      [
+        "expo-widgets",
+        {
+          "enablePushNotifications": false
+        }
+      ],
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#FFFFFF",
+          "image": "./assets/icon.png",
+          "imageWidth": 96,
+          "resizeMode": "contain",
+          "dark": {
+            "backgroundColor": "#000000"
+          }
+        }
+      ],
+      "expo-localization",
+      "expo-sqlite",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow Cherry Studio to scan desktop pairing QR codes and take photos for chat messages and drawings.",
+          "microphonePermission": "Allow Cherry Studio to use the microphone for voice input.",
+          "recordAudioAndroid": false,
+          "barcodeScannerEnabled": true
+        }
+      ],
+      "./scripts/withEmbeddedBarcodeScanner.js",
+      [
+        "expo-calendar",
+        {
+          "calendarPermission": "Cherry Studio reads and manages calendar events you request in chat, such as reviewing today's schedule or rescheduling a meeting, and sends relevant event details to your selected AI service.",
+          "remindersPermission": "Cherry Studio reads and manages reminders you request in chat, such as listing today's tasks or adding a grocery reminder, and sends relevant reminder details to your selected AI service."
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "isAndroidBackgroundLocationEnabled": false,
+          "isAndroidForegroundServiceEnabled": false,
+          "isIosBackgroundLocationEnabled": false,
+          "locationAlwaysAndWhenInUsePermission": false,
+          "locationAlwaysPermission": false,
+          "motionUsagePermission": "Cherry Studio does not read or track your motion and fitness activity. This permission description is required by the location service included in the app.",
+          "locationWhenInUsePermission": "Cherry Studio sends your current location and address, when requested, to your selected AI service to answer questions such as finding nearby restaurants, only while you use the app."
+        }
+      ],
+      "expo-document-picker",
+      [
+        "expo-font",
+        {
+          "fonts": ["./assets/fonts/GeistMono-Regular.ttf"]
+        }
+      ],
+      "expo-image",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow Cherry Studio to preview and select photos for drawings and chat messages.",
+          "cameraPermission": "Allow Cherry Studio to scan desktop pairing QR codes and take photos for chat messages and drawings.",
+          "microphonePermission": "Allow Cherry Studio to use the microphone for voice input."
+        }
+      ],
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "Allow Cherry Studio to use the microphone for voice input.",
+          "recordAudioAndroid": true,
+          "enableBackgroundRecording": false,
+          "enableBackgroundPlayback": false
+        }
+      ],
+      [
+        "expo-speech-recognition",
+        {
+          "microphonePermission": "Allow Cherry Studio to use the microphone for voice input.",
+          "speechRecognitionPermission": "Allow Cherry Studio to turn your speech into text for voice input.",
+          "androidSpeechServicePackages": [
+            "com.google.android.googlequicksearchbox",
+            "com.google.android.as",
+            "com.google.android.tts"
+          ]
+        }
+      ],
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Allow Cherry Studio to preview photos for drawings and chat messages.",
+          "savePhotosPermission": "Cherry Studio saves images to your photo library when you choose Save, such as a generated drawing or an image from chat.",
+          "preventAutomaticLimitedAccessAlert": true,
+          "granularPermissions": []
+        }
+      ],
+      "expo-web-browser",
+      "./scripts/withUuRemote.js",
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "minSdkVersion": 26,
+            "compileSdkVersion": 37,
+            "targetSdkVersion": 36,
+            "buildToolsVersion": "37.0.0",
+            "usesCleartextTraffic": true,
+            "extraProguardRules": "-keepattributes SourceFile,LineNumberTable\n-keep @interface expo.modules.kotlin.records.Field { *; }\n-keep @interface expo.modules.kotlin.records.Required"
+          },
+          "ios": {
+            "deploymentTarget": "17.0",
+            "buildReactNativeFromSource": true
+          }
+        }
+      ],
+      "expo-status-bar",
+      "expo-secure-store"
+    ],
+    "experiments": {
+      "typedRoutes": true,
+      "reactCompiler": true
+    },
+    "extra": {
+      "eas": {
+        "projectId": "80096eaf-3ad0-4b87-a466-15f04da1bacc",
+        "build": {
+          "experimental": {
+            "ios": {
+              "appExtensions": [
+                {
+                  "targetName": "ExpoWidgetsTarget",
+                  "bundleIdentifier": "com.cherryai.cherrystudio-app.ExpoWidgetsTarget",
+                  "entitlements": {
+                    "com.apple.security.application-groups": ["group.com.cherryai.cherrystudio-app"]
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}

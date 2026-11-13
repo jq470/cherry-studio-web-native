@@ -1,0 +1,242 @@
+import type { RuntimeDurableTurn } from '../../runtime';
+import { DurableTurnMetadataSchema, projectDurableHostTurn } from '../durableHostProjection';
+
+function turn(overrides: Partial<RuntimeDurableTurn>): RuntimeDurableTurn {
+  return {
+    identity: { sessionId: 'session', slot: 0, turnId: 'turn', requestId: 'turn' },
+    userMessageId: 'user',
+    assistantMessageId: 'assistant',
+    inputBoundary: 'pi:1',
+    answerBoundary: 'pi:2',
+    status: 'completed',
+    hasAssistant: true,
+    usage: null,
+    error: null,
+    createdAt: 1_000,
+    updatedAt: 9_000,
+    parts: [{ id: 'answer', type: 'text', text: 'Done', state: 'done' }],
+    metadata: {
+      userParts: [{ id: 'question', type: 'text', text: 'Run it', state: 'done' }],
+      referencedFileEntryIds: [],
+      hasHistoryBeforeActiveTurn: false,
+      inferenceSnapshot: {
+        version: 1,
+        model: {
+          uniqueModelId: 'provider::model',
+          providerId: 'provider',
+          modelId: 'model',
+          name: 'Model',
+        },
+        parameters: {},
+        tools: [],
+      },
+    },
+    ...overrides,
+  };
+}
+
+describe('durable message timing', () => {
+  test('pre-workspace metadata remains unbound instead of inheriting a later Session binding', () => {
+    expect(DurableTurnMetadataSchema.parse(turn({}).metadata).workspaceFolderId).toBeNull();
+  });
+
+  test.each(['queued', 'running', 'completed'] as const)(
+    'a %s answer does not display a provider attempt as a terminal failure',
+    (status) => {
+      const projected = projectDurableHostTurn(
+        turn({
+          status,
+          error: {
+            code: 'provider_error',
+            message: 'Request timed out',
+            retryable: true,
+            origin: 'provider',
+          },
+        }),
+      );
+      expect(projected.turn.error).toBeNull();
+      expect(projected.assistant?.parts).toEqual([
+        expect.objectContaining({ type: 'text', text: 'Done' }),
+      ]);
+      expect(projected.assistant?.status).toBe(
+        status === 'running' ? 'streaming' : status === 'queued' ? 'pending' : 'success',
+      );
+    },
+  );
+
+  test.each(['failed', 'interrupted'] as const)(
+    'a %s answer displays the final provider failure',
+    (status) => {
+      const projected = projectDurableHostTurn(
+        turn({
+          status,
+          error: {
+            code: 'provider_error',
+            message: 'Request timed out',
+            retryable: true,
+            origin: 'provider',
+          },
+        }),
+      );
+      expect(projected.turn.error).toMatchObject({ code: 'EXECUTION_FAILED', retryable: true });
+      expect(projected.assistant?.parts.at(-1)).toMatchObject({
+        type: 'data-error',
+        data: { code: 'EXECUTION_FAILED', retryable: true },
+      });
+    },
+  );
+
+  test('a turn always states whether it is retrying', () => {
+    expect(
+      projectDurableHostTurn(turn({ status: 'running', isRetrying: true })).turn,
+    ).toMatchObject({ status: 'running', isRetrying: true });
+    expect(projectDurableHostTurn(turn({ status: 'running' })).turn.isRetrying).toBe(false);
+  });
+
+  test('a parked turn stays running and explicitly clears its pause when resumed', () => {
+    expect(projectDurableHostTurn(turn({ status: 'running', isPaused: true })).turn).toMatchObject({
+      status: 'running',
+      isPaused: true,
+      endedAt: null,
+    });
+    expect(projectDurableHostTurn(turn({ status: 'running' })).turn.isPaused).toBe(false);
+  });
+
+  test('a stopped answer retains its output and retryable status without an execution error', () => {
+    const projected = projectDurableHostTurn(
+      turn({
+        status: 'cancelled',
+        error: {
+          code: 'aborted',
+          message: 'The Agent run ended without an answer.',
+          retryable: false,
+          origin: 'runtime',
+        },
+      }),
+    );
+    expect(projected.turn).toMatchObject({
+      status: 'cancelled',
+      error: null,
+      endedAt: expect.any(String),
+    });
+    expect(projected.assistant).toMatchObject({
+      status: 'cancelled',
+      parts: [{ type: 'text', text: 'Done' }],
+    });
+  });
+  test('projects native usage and failures into the aligned transcript contract', () => {
+    const { user, assistant } = projectDurableHostTurn(
+      turn({
+        status: 'failed',
+        usage: { inputTokens: 12, outputTokens: 3, totalTokens: 15, reasoningTokens: 2 },
+        error: { code: 'PROVIDER_ERROR', message: 'Request failed', retryable: true },
+        parts: [
+          {
+            id: 'tool',
+            type: 'tool',
+            toolCallId: 'call',
+            toolRef: { source: 'builtin', capabilityId: 'agents' },
+            providerName: 'agent_get',
+            displayName: 'Get Agent',
+            state: 'output-available',
+            input: {},
+            output: { value: { ok: true }, artifacts: [] },
+          },
+          {
+            id: 'file',
+            type: 'file',
+            ref: { kind: 'managed-file', fileEntryId: 'file' },
+            mediaType: 'text/plain',
+            name: 'result.txt',
+            purpose: 'artifact',
+          },
+        ],
+      }),
+    );
+    expect(user).not.toHaveProperty('usage');
+    expect(assistant).not.toHaveProperty('usage');
+    expect(assistant?.stats).toEqual({ inputTokens: 12, outputTokens: 3, totalTokens: 15 });
+    expect(assistant?.parts).toEqual([
+      expect.objectContaining({ type: 'dynamic-tool', toolName: 'agent_get', title: 'Get Agent' }),
+      expect.objectContaining({ type: 'file', filename: 'result.txt' }),
+      expect.objectContaining({
+        type: 'data-error',
+        data: expect.objectContaining({ message: 'Request failed' }),
+      }),
+    ]);
+  });
+
+  test('restores tool execution and approval-wait spans for the processing duration', () => {
+    const { assistant } = projectDurableHostTurn(
+      turn({
+        timing: {
+          startedAt: 2_000,
+          completedAt: 10_000,
+          tools: [
+            { toolCallId: 'call', toolName: 'write_file', startedAt: 6_000, completedAt: 7_000 },
+          ],
+          approvals: [
+            {
+              approvalId: 'approval',
+              toolCallId: 'call',
+              toolName: 'Write file',
+              startedAt: 3_000,
+              completedAt: 6_000,
+            },
+          ],
+        },
+      }),
+    );
+    expect(assistant?.stats?.runtimeTiming).toEqual({
+      startedAt: 2_000,
+      completedAt: 10_000,
+      spans: [
+        {
+          id: 'approval:approval',
+          kind: 'approval-wait',
+          approvalId: 'approval',
+          toolCallId: 'call',
+          toolName: 'Write file',
+          startedAt: 3_000,
+          completedAt: 6_000,
+        },
+        {
+          id: 'tool:call',
+          kind: 'tool-execution',
+          toolCallId: 'call',
+          toolName: 'write_file',
+          startedAt: 6_000,
+          completedAt: 7_000,
+        },
+      ],
+    });
+  });
+
+  test('a running turn has an open wall clock and a queued input has no timing', () => {
+    expect(
+      projectDurableHostTurn(turn({ status: 'running', timing: { startedAt: 2_000, tools: [] } }))
+        .assistant?.stats?.runtimeTiming,
+    ).toEqual({ startedAt: 2_000, spans: [] });
+    expect(projectDurableHostTurn(turn({ status: 'queued' })).assistant?.stats).toBeNull();
+  });
+});
+
+test('durable userParts retain the snapshot and reject ambiguous carriers before recovery', () => {
+  const metadata = turn({}).metadata as Record<string, unknown>;
+  const quoted = {
+    id: 'p',
+    type: 'text',
+    text: 'Request',
+    state: 'done',
+    quotes: [
+      { id: 'q', sourceMessageId: '00000000-0000-7000-8000-000000000001', text: 'Snapshot' },
+    ],
+    quoteAuthor: { role: 'assistant' },
+  };
+  expect(DurableTurnMetadataSchema.parse({ ...metadata, userParts: [quoted] }).userParts).toEqual([
+    quoted,
+  ]);
+  expect(
+    DurableTurnMetadataSchema.safeParse({ ...metadata, userParts: [quoted, quoted] }).success,
+  ).toBe(false);
+});

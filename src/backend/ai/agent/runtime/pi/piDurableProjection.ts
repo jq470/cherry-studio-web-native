@@ -1,0 +1,670 @@
+import type { AssistantMessage, ToolResultMessage, Usage } from '@earendil-works/pi-ai';
+import {
+  ToolResultEntry,
+  type EntryRecord,
+  type JsonObject,
+  type SubmissionRecord,
+} from '@earendil-works/pi-durable';
+import { CODEMODE_TOOL_NAME } from '@earendil-works/pi-durable/codemode';
+import { TOOL_SEARCH_TOOL_NAME } from '@earendil-works/pi-durable/tool-search';
+import { z } from 'zod';
+
+import { McpAppReferenceSchema } from '@/shared/contracts/mcpApp';
+import { McpModelContentSchema, McpResultSourceSchema } from '@/shared/contracts/mcpContent';
+import { createTextPreview } from '@/shared/utils/textPreview';
+
+import {
+  DURABLE_IMAGE_TOOL_NAME,
+  type RuntimeDurableSubmission,
+  type RuntimeDurableTurn,
+  type RuntimeLane,
+} from '../durableTypes';
+import { RuntimeJsonValueSchema, RuntimeOptionsSchema } from '../runtimeSchemas';
+import {
+  createDeniedToolResult,
+  createErrorToolResult,
+  createInterruptedToolResult,
+} from '../toolResults';
+import type {
+  RuntimeError,
+  RuntimeOutputPart,
+  RuntimeTool,
+  RuntimeToolInputPreview,
+  RuntimeToolProgress,
+  RuntimeUsage,
+} from '../types';
+import { PiCodemodeArtifactsEntry } from './piCodemodeFiles';
+import { PiCodemodeMcpResultEntry } from './piCodemodeResults';
+import { readPiTerminalError } from './piModelError';
+import { applyPiReplyEdits, PI_REPLY_EDIT_KIND } from './piReplyEditing';
+import { readPiWebResult } from './PiWebResponse';
+import { PI_WEB_FAILURE_GROUP } from './piWebTools';
+
+/** The JavaScript capability. Code Mode is its only executor and inherits its approval setting. */
+export const PI_SCRIPT_CAPABILITY_NAME = 'run_js';
+
+const ToolRefSchema = z.discriminatedUnion('source', [
+  z.object({ source: z.literal('builtin'), capabilityId: z.string().min(1) }),
+  z.object({
+    source: z.literal('mcp'),
+    serverId: z.string().min(1),
+    rawToolName: z.string().min(1),
+  }),
+]);
+
+export const PiToolBlueprintSchema = z.object({
+  ref: ToolRefSchema,
+  providerName: z.string().min(1),
+  displayName: z.string(),
+  description: z.string(),
+  inputSchema: RuntimeJsonValueSchema,
+  outputSchema: RuntimeJsonValueSchema.optional(),
+  inputPreview: z.object({ textField: z.string(), nameField: z.string().optional() }).optional(),
+  approval: z.enum(['auto', 'ask', 'deny']),
+  failureGroup: z.string().optional(),
+  autoApprovalEligible: z.boolean().optional(),
+  deferred: z.boolean().optional(),
+});
+
+const WebToolRouteSchema = z.enum(['client', 'server', 'none']);
+
+export const PiConfigurationSchema = z
+  .object({
+    version: z.union([z.literal(1), z.literal(2)]),
+    kind: z.enum(['language', 'image']).default('language'),
+    model: z.object({ providerId: z.string().min(1), modelId: z.string().min(1) }),
+    instructions: z.string(),
+    initialInstructions: z
+      .array(z.object({ key: z.string().min(1).max(256), text: z.string().min(1).max(128_000) }))
+      .max(64)
+      .default([]),
+    options: RuntimeOptionsSchema,
+    tools: z.array(PiToolBlueprintSchema),
+    webTools: z
+      .object({
+        modelToolsPreferred: z.boolean(),
+        clientSearchAvailable: z.boolean(),
+        clientFetchAvailable: z.boolean(),
+      })
+      .optional(),
+    /** Selected with the configuration, so queued, retried and recovered requests share one route. */
+    webRoutes: z.object({ search: WebToolRouteSchema, fetch: WebToolRouteSchema }).optional(),
+  })
+  .transform(({ version, ...configuration }) => ({
+    ...configuration,
+    version: 2 as const,
+    // Released v1 configurations included this Host-owned block before the language rules.
+    // Replace only its first occurrence; an Agent's own instructions may quote the same text.
+    instructions:
+      version === 1 && configuration.instructions.startsWith('# Cherry Studio Mobile Runtime\n\n')
+        ? configuration.instructions.replace(
+            /\n\n## Current Date\n\nThe current local date is `\d{4}-\d{2}-\d{2}`\.(?=\n\n## Response Language\n)/,
+            '',
+          )
+        : configuration.instructions,
+  }));
+
+const PiSubmissionSchema = z.object({
+  kind: z.literal('cherry.input'),
+  version: z.literal(1),
+  requestId: z.string().min(1),
+  turnId: z.string().min(1),
+  userMessageId: z.string().min(1),
+  assistantMessageId: z.string().min(1),
+  createdAt: z.number().finite().nonnegative(),
+  metadata: z.record(z.string(), RuntimeJsonValueSchema),
+  tools: z.array(PiToolBlueprintSchema),
+});
+export type PiStoredSubmission = z.infer<typeof PiSubmissionSchema>;
+export type PiStoredConfiguration = z.infer<typeof PiConfigurationSchema>;
+
+const ErrorSchema = z.object({
+  code: z.string(),
+  message: z.string(),
+  retryable: z.boolean(),
+  origin: z.enum(['provider', 'runtime', 'host', 'tool']).optional(),
+  name: z.string().optional(),
+  context: z
+    .object({
+      statusCode: z.number().optional(),
+      providerId: z.string().optional(),
+      modelId: z.string().optional(),
+      finishReason: z.string().optional(),
+      responseBody: z.string().optional(),
+    })
+    .optional(),
+});
+const OutputSchema = z.object({
+  mcpSource: McpResultSourceSchema.optional(),
+  mcpApp: McpAppReferenceSchema.optional(),
+  modelContent: McpModelContentSchema.optional(),
+  value: RuntimeJsonValueSchema,
+  modelValue: RuntimeJsonValueSchema.optional(),
+  artifacts: z.array(
+    z.object({
+      ref: z.object({ kind: z.literal('managed-file'), fileEntryId: z.string() }),
+      mediaType: z.string(),
+      name: z.string(),
+      kind: z.enum(['created', 'derived']),
+    }),
+  ),
+  failure: z.object({ error: ErrorSchema, scope: z.enum(['call', 'tool']) }).optional(),
+});
+const ToolDetailsSchema = z.object({
+  kind: z.literal('cherry.tool-result'),
+  ref: ToolRefSchema,
+  providerName: z.string(),
+  displayName: z.string(),
+  output: OutputSchema,
+  failureGroup: z.string().optional(),
+});
+const MetaDetailsSchema = z.object({
+  kind: z.literal('cherry.meta-tool-result'),
+  providerName: z.string(),
+  displayName: z.string(),
+  output: OutputSchema,
+});
+
+export function piToolBlueprint(tool: RuntimeTool): z.infer<typeof PiToolBlueprintSchema> {
+  return PiToolBlueprintSchema.parse(tool);
+}
+
+export function piSubmissionMetadata(
+  input: RuntimeDurableSubmission,
+  tools: readonly RuntimeTool[],
+): JsonObject {
+  return detachedJson(
+    PiSubmissionSchema.parse({
+      ...input,
+      kind: 'cherry.input',
+      version: 1,
+      tools: tools.map(piToolBlueprint),
+    }),
+  );
+}
+
+export function readPiSubmission(value: JsonObject | undefined): PiStoredSubmission {
+  return PiSubmissionSchema.parse(value);
+}
+
+export function detachedJson(value: unknown): JsonObject {
+  return RuntimeJsonValueSchema.parse(JSON.parse(JSON.stringify(value))) as JsonObject;
+}
+
+export function failedPiToolGroups(entries: readonly EntryRecord[]): string[] {
+  const groups = new Set<string>();
+  for (const entry of entries)
+    for (const message of entry.model ?? []) {
+      if (message.role === 'assistant' && readPiWebResult(message)?.failed)
+        groups.add(PI_WEB_FAILURE_GROUP);
+      if (message.role !== 'toolResult') continue;
+      const details = ToolDetailsSchema.safeParse(message.details);
+      if (
+        details.success &&
+        details.data.failureGroup &&
+        details.data.output.failure?.scope === 'tool'
+      )
+        groups.add(details.data.failureGroup);
+    }
+  return [...groups];
+}
+
+/** Native tokens include cached input in total input; keep the existing analytics convention. */
+export function piDurableUsage(usage: Usage): RuntimeUsage {
+  const inputTokens = usage.input + usage.cacheRead + usage.cacheWrite;
+  return {
+    inputTokens,
+    outputTokens: usage.output,
+    totalTokens: usage.totalTokens || inputTokens + usage.output,
+    noCacheTokens: usage.input,
+    cacheReadTokens: usage.cacheRead,
+    cacheWriteTokens: usage.cacheWrite,
+    ...(usage.reasoning !== undefined ? { reasoningTokens: usage.reasoning } : {}),
+  };
+}
+
+const ContinuationUsageSchema = z.object({
+  inputTokens: z.number(),
+  outputTokens: z.number(),
+  totalTokens: z.number(),
+  noCacheTokens: z.number(),
+  cacheReadTokens: z.number(),
+  cacheWriteTokens: z.number(),
+  reasoningTokens: z.number().optional(),
+});
+const CONTINUATION_USAGE_DIAGNOSTIC = 'cherry.continuation-usage';
+
+/** Pi budgets context from the last request, while Cherry counts every billed continuation. */
+export function withPiContinuationUsage(
+  message: AssistantMessage,
+  lastUsage: Usage,
+): AssistantMessage {
+  return {
+    ...message,
+    usage: lastUsage,
+    diagnostics: [
+      ...(message.diagnostics ?? []),
+      {
+        type: CONTINUATION_USAGE_DIAGNOSTIC,
+        timestamp: Date.now(),
+        details: piDurableUsage(message.usage) as JsonObject,
+      },
+    ],
+  };
+}
+
+function responseUsage(message: AssistantMessage): RuntimeUsage {
+  const details = message.diagnostics?.find(
+    ({ type }) => type === CONTINUATION_USAGE_DIAGNOSTIC,
+  )?.details;
+  const total = ContinuationUsageSchema.safeParse(details);
+  return total.success ? total.data : piDurableUsage(message.usage);
+}
+
+/** Bound previews of growing tool inputs; completed results settle into the Cherry transcript. */
+function toolInputPreview(
+  fields: { textField: string; nameField?: string },
+  input: unknown,
+): RuntimeToolInputPreview | undefined {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) return undefined;
+  const values = input as Record<string, unknown>;
+  const text = values[fields.textField];
+  if (typeof text !== 'string') return undefined;
+  const name = fields.nameField ? values[fields.nameField] : undefined;
+  return {
+    ...createTextPreview(text),
+    ...(typeof name === 'string' ? { name: name.slice(0, 255) } : {}),
+  };
+}
+
+export function projectPiTurn(options: {
+  lane: RuntimeLane;
+  record: SubmissionRecord;
+  metadata: JsonObject | undefined;
+  entries: readonly EntryRecord[];
+  partial?: AssistantMessage;
+  partialId?: string;
+  active?: boolean;
+  continued?: boolean;
+  /** Active observations carry reasoning status; explicit detail reads retain the full text. */
+  fullReasoning?: boolean;
+  inherited?: boolean;
+  toolStates?: ReadonlyMap<string, 'running' | 'input-available' | 'interrupted'>;
+  nestedTools?: ReadonlyMap<
+    string,
+    { parentCallId: string } & Omit<RuntimeToolProgress['calls'][number], 'id'>
+  >;
+}): RuntimeDurableTurn {
+  const stored = readPiSubmission(options.metadata);
+  const { record } = options;
+  const entries = applyPiReplyEdits(options.entries);
+  const parts: RuntimeOutputPart[] = [];
+  const toolsByCall = new Map<string, Extract<RuntimeOutputPart, { type: 'tool' }>>();
+  const usage: RuntimeUsage = {};
+  let error: RuntimeError | null = null;
+  let updatedAt = stored.createdAt;
+  let contextTokens: number | undefined;
+  let startedAt: number | undefined;
+  let endedAt: number | undefined;
+  const toolTimes: NonNullable<RuntimeDurableTurn['timing']>['tools'][number][] = [];
+
+  function assistant(message: AssistantMessage, prefix: string, streaming: boolean) {
+    updatedAt = Math.max(updatedAt, message.timestamp);
+    // A response's timestamp is its request start; its duration ends it.
+    startedAt = Math.min(startedAt ?? message.timestamp, message.timestamp);
+    endedAt = Math.max(endedAt ?? 0, message.timestamp + (message.durationMs ?? 0));
+    if (!streaming) {
+      const measured = piDurableUsage(message.usage);
+      if ((measured.inputTokens ?? 0) > 0) contextTokens = measured.inputTokens;
+      const billed = responseUsage(message);
+      for (const key of Object.keys(billed) as (keyof RuntimeUsage)[])
+        usage[key] = (usage[key] ?? 0) + (billed[key] ?? 0);
+    }
+    const terminalError = readPiTerminalError(message);
+    if (terminalError) {
+      const imageTool =
+        message.api === 'cherry-image'
+          ? parts.findLast(
+              (part) => part.type === 'tool' && part.providerName === DURABLE_IMAGE_TOOL_NAME,
+            )
+          : undefined;
+      // The image scheduling message carries no new provider response. Its tool receipt owns
+      // the failure shown by the Host, including explicit-user-retry eligibility.
+      error = (imageTool?.type === 'tool' ? imageTool.error : undefined) ?? terminalError;
+    }
+    const web = readPiWebResult(message);
+    // Anthropic splits one answer at every citation; the fragments are a single paragraph flow.
+    let answer: Extract<RuntimeOutputPart, { text: string }> | undefined;
+    message.content.forEach((block, index) => {
+      if (index === web?.replayIndex) return;
+      const id = `${prefix}:block:${index}`;
+      if (block.type === 'text') {
+        const text = web?.texts.find((text) => text.contentIndex === index)?.text ?? block.text;
+        if (answer) answer.text += text;
+        else {
+          const part = {
+            id,
+            type: 'text' as const,
+            text,
+            state: streaming ? ('streaming' as const) : ('done' as const),
+          };
+          parts.push(part);
+          if (message.api === 'anthropic-messages') answer = part;
+        }
+        return;
+      }
+      answer = undefined;
+      if (block.type === 'thinking') {
+        const statusOnly = options.active && !options.fullReasoning;
+        const hasText = Boolean(block.thinking.trim());
+        const state = streaming && index === message.content.length - 1 ? 'streaming' : 'done';
+        const previous = parts.at(-1);
+        // Adjacent summaries remain one phase, including across provider retries.
+        // Keep a growing phase visible even before its first readable summary arrives.
+        if (previous?.type === 'reasoning') {
+          if (statusOnly) previous.hasText = previous.hasText || hasText;
+          else if (hasText) previous.text = `${previous.text}\n\n${block.thinking}`;
+          previous.state = state;
+        } else if (hasText || state === 'streaming') {
+          parts.push({
+            id,
+            type: 'reasoning',
+            text: statusOnly ? '' : block.thinking,
+            ...(statusOnly ? { hasText } : {}),
+            state,
+          });
+        }
+        return;
+      }
+      const binding = stored.tools.find(
+        (tool) =>
+          tool.providerName ===
+          (block.name === CODEMODE_TOOL_NAME ? PI_SCRIPT_CAPABILITY_NAME : block.name),
+      );
+      const target =
+        block.name === 'tool_call' && typeof block.arguments.name === 'string'
+          ? stored.tools.find(
+              (tool) => tool.ref.source === 'mcp' && tool.providerName === block.arguments.name,
+            )
+          : binding;
+      const args =
+        target && block.name === 'tool_call' ? (block.arguments.params ?? null) : block.arguments;
+      // A growing file body streams as a bounded preview instead of its full partial input.
+      const inputPreview =
+        streaming && target?.inputPreview ? toolInputPreview(target.inputPreview, args) : undefined;
+      const part: Extract<RuntimeOutputPart, { type: 'tool' }> = {
+        id,
+        type: 'tool',
+        toolCallId: block.id,
+        toolRef: target?.ref ?? { source: 'meta', name: block.name },
+        // Code Mode keeps its own name so the transcript tells it from stored run_js results.
+        providerName:
+          block.name === CODEMODE_TOOL_NAME ? block.name : (target?.providerName ?? block.name),
+        displayName: target?.displayName ?? block.name,
+        state: streaming
+          ? 'input-streaming'
+          : (options.toolStates?.get(block.id) ?? 'input-available'),
+        ...(inputPreview ? { inputPreview } : { input: RuntimeJsonValueSchema.parse(args) }),
+      };
+      parts.push(part);
+      toolsByCall.set(block.id, part);
+      if (options.active && options.nestedTools) {
+        const calls: RuntimeToolProgress['calls'] = [...options.nestedTools].flatMap(
+          ([callId, call]) => {
+            if (call.parentCallId !== block.id) return [];
+            const tool = stored.tools.find((item) => item.providerName === call.name);
+            return [
+              {
+                id: callId,
+                name: call.name,
+                // The client translates built-in names; an MCP alias needs its display name.
+                ...(tool?.ref.source === 'mcp' ? { title: tool.displayName } : {}),
+                args: call.args,
+                status: call.status,
+              },
+            ];
+          },
+        );
+        if (calls.length) part.progress = { calls };
+      }
+      if (part.state === 'interrupted')
+        part.output = createInterruptedToolResult('The tool ended without a confirmed result.');
+    });
+    if (!web) return;
+    for (const source of web.sources)
+      parts.push({ id: `${prefix}:source:${source.sourceId}`, type: 'source-url', ...source });
+    if (web.suggestions)
+      parts.push({
+        id: `${prefix}:search-suggestions`,
+        type: 'data-search-suggestions',
+        data: { html: web.suggestions },
+      });
+    if (web.failed)
+      parts.push({
+        id: `${prefix}:web-error`,
+        type: 'error',
+        error: {
+          code: 'web_lookup_failed',
+          message: 'The provider could not complete a web lookup.',
+          retryable: false,
+          origin: 'tool',
+        },
+      });
+  }
+
+  function toolResult(entry: EntryRecord, message: ToolResultMessage) {
+    const part = toolsByCall.get(message.toolCallId);
+    if (!part) return;
+    updatedAt = Math.max(updatedAt, message.timestamp);
+    endedAt = Math.max(endedAt ?? 0, message.timestamp);
+    if (message.durationMs !== undefined)
+      toolTimes.push({
+        toolCallId: message.toolCallId,
+        toolName: part.providerName,
+        startedAt: message.timestamp - message.durationMs,
+        completedAt: message.timestamp,
+      });
+    delete part.progress;
+    const details = ToolDetailsSchema.safeParse(message.details);
+    const meta = MetaDetailsSchema.safeParse(message.details);
+    if (details.success)
+      Object.assign(part, {
+        toolRef: details.data.ref,
+        providerName: details.data.providerName,
+        displayName: details.data.displayName,
+      });
+    const output = details.success
+      ? details.data.output
+      : meta.success
+        ? meta.data.output
+        : undefined;
+    const diagnostics = ToolResultEntry.is(entry) ? entry.data.diagnostics : [];
+    const diagnostic = diagnostics.find((item) => item.severity === 'error');
+    // An error result without a diagnostic states its reason in its own text, as a failed script
+    // does at the end of its output.
+    const text = message.content
+      .flatMap((block) => (block.type === 'text' ? [block.text] : []))
+      .join('\n');
+    const reason =
+      diagnostic?.message ??
+      (message.isError && text ? createTextPreview(text).text : 'The tool did not complete.');
+    if (diagnostic?.code === 'interrupted' || diagnostic?.code === 'aborted') {
+      part.state = 'interrupted';
+      part.output = createInterruptedToolResult(reason);
+    } else if (diagnostic?.code === 'blocked') {
+      part.state = 'denied';
+      part.output = createDeniedToolResult(reason);
+    } else if (message.isError || output?.failure) {
+      const failure = output?.failure?.error ?? {
+        code: diagnostic?.code ?? 'tool_execution_error',
+        message: reason,
+        retryable: false,
+        origin: 'tool' as const,
+      };
+      part.state = 'error';
+      part.error = failure;
+      // A result that failed without the application's failure envelope, such as a failed
+      // script, still carries display details; the error contract admits only the error.
+      part.output = output?.failure ? output : createErrorToolResult(failure);
+    } else {
+      part.state = 'output-available';
+      part.output = output ?? {
+        value:
+          part.providerName === TOOL_SEARCH_TOOL_NAME && message.details !== undefined
+            ? RuntimeJsonValueSchema.parse(message.details)
+            : message.content
+                .filter((block) => block.type === 'text')
+                .map((block) => block.text)
+                .join('\n'),
+        artifacts: [],
+      };
+    }
+    for (const artifact of part.output.artifacts)
+      parts.push({
+        id: `pi:${entry.id}:artifact:${artifact.ref.fileEntryId}`,
+        type: 'file',
+        ref: artifact.ref,
+        mediaType: artifact.mediaType,
+        name: artifact.name,
+        purpose: 'artifact',
+      });
+  }
+
+  for (const entry of entries) {
+    if (
+      PiCodemodeMcpResultEntry.is(entry) &&
+      toolsByCall.has(entry.data.parentCallId) &&
+      !toolsByCall.has(entry.data.callId)
+    ) {
+      const output = OutputSchema.parse(entry.data.output);
+      const part: Extract<RuntimeOutputPart, { type: 'tool' }> = {
+        id: `pi:${entry.id}:mcp-result`,
+        type: 'tool',
+        toolCallId: entry.data.callId,
+        toolRef: entry.data.ref,
+        providerName: entry.data.providerName,
+        displayName: entry.data.displayName,
+        input: entry.data.input,
+        output,
+        state: output.failure ? 'error' : 'output-available',
+        ...(output.failure ? { error: output.failure.error } : {}),
+      };
+      parts.push(part);
+      toolsByCall.set(part.toolCallId, part);
+    }
+    for (const message of entry.model ?? []) {
+      if (message.role === 'assistant') assistant(message, `pi:${entry.id}`, false);
+      else if (message.role === 'toolResult') toolResult(entry, message);
+    }
+  }
+  if (options.partial)
+    assistant(options.partial, options.partialId ?? `pi:live:${record.id}`, true);
+  // These verified receipts survive parent cancellation and task-document retirement. Keep the
+  // interrupted tool-result contract intact while retaining its confirmed file attachments.
+  const files = new Map(
+    parts.flatMap((part) => (part.type === 'file' ? [[part.ref.fileEntryId, part] as const] : [])),
+  );
+  for (const entry of entries) {
+    if (!PiCodemodeArtifactsEntry.is(entry) || !toolsByCall.has(entry.data.callId)) continue;
+    for (const artifact of entry.data.artifacts) {
+      const existing = files.get(artifact.ref.fileEntryId);
+      if (existing) {
+        existing.name = artifact.name;
+        existing.mediaType = artifact.mediaType;
+      } else {
+        const part = {
+          id: `pi:${entry.id}:artifact:${artifact.ref.fileEntryId}`,
+          type: 'file' as const,
+          ref: artifact.ref,
+          mediaType: artifact.mediaType,
+          name: artifact.name,
+          purpose: 'artifact' as const,
+        };
+        files.set(artifact.ref.fileEntryId, part);
+        parts.push(part);
+      }
+    }
+  }
+  const answerVisible =
+    record.type === 'input' &&
+    record.status === 'done' &&
+    entries.some((entry) => entry.id === record.answer);
+  const hasAssistant =
+    parts.length > 0 ||
+    options.active === true ||
+    options.continued === true ||
+    answerVisible ||
+    (!options.inherited && (record.status === 'unanswered' || record.status === 'queued'));
+  let status: RuntimeDurableTurn['status'];
+  if (options.continued) status = error ? 'failed' : 'completed';
+  else if (options.active) status = 'running';
+  else if (options.inherited && !answerVisible) {
+    status = hasAssistant ? 'interrupted' : 'completed';
+    error = null;
+  } else if (record.status === 'queued') status = 'queued';
+  else if (answerVisible) {
+    status = 'completed';
+    error = null;
+  } else if (record.status === 'unanswered') {
+    status =
+      record.reason === 'aborted'
+        ? 'cancelled'
+        : /interrupt|orphan/.test(record.reason)
+          ? 'interrupted'
+          : 'failed';
+    error ??= {
+      code: record.reason,
+      message:
+        typeof record.detail === 'string'
+          ? record.detail
+          : 'The Agent run ended without an answer.',
+      retryable: status !== 'cancelled',
+      origin: 'runtime',
+    };
+  } else status = hasAssistant ? 'interrupted' : 'completed';
+  // Recovery can read a terminal input whose last tool never produced a result entry. Persist a
+  // terminal pair, never a tool that appears to keep running in the Cherry transcript forever.
+  if (status !== 'running' && status !== 'queued')
+    for (const part of parts) {
+      if (part.type !== 'tool') continue;
+      delete part.progress;
+      if (!part.output) {
+        part.state = 'interrupted';
+        part.output = createInterruptedToolResult(
+          error?.message ?? 'The tool ended without a confirmed result.',
+        );
+      }
+    }
+  return {
+    identity: { ...options.lane, turnId: stored.turnId, requestId: stored.requestId },
+    userMessageId: stored.userMessageId,
+    assistantMessageId: stored.assistantMessageId,
+    inputBoundary: record.entry !== undefined ? `pi:${record.entry}` : null,
+    answerBoundary:
+      options.continued && entries.length
+        ? `pi:${entries.at(-1)!.id}`
+        : answerVisible && record.type === 'input' && record.status === 'done'
+          ? `pi:${entries.findLast((entry) => entry.kind === PI_REPLY_EDIT_KIND)?.id ?? record.answer}`
+          : null,
+    metadata: stored.metadata,
+    status,
+    parts,
+    usage: Object.keys(usage).length ? usage : null,
+    ...(contextTokens !== undefined ? { contextTokens } : {}),
+    error,
+    createdAt: stored.createdAt,
+    updatedAt,
+    ...(startedAt !== undefined
+      ? {
+          timing: {
+            startedAt,
+            ...(status !== 'running' && status !== 'queued' && endedAt !== undefined
+              ? { completedAt: Math.max(startedAt, endedAt) }
+              : {}),
+            tools: toolTimes,
+          },
+        }
+      : {}),
+    hasAssistant,
+  };
+}

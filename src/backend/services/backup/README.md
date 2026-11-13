@@ -1,0 +1,110 @@
+# Local backup and replacement restore
+
+Tracks [issue #1060](https://github.com/CherryHQ/cherry-studio-app/issues/1060).
+`BackupRuntime` owns operations, cancellation, progress and candidate lifetime. It is exposed as
+`Backend.backup`; the settings screen only chooses files, renders progress and requests confirmation.
+
+## Portable format v3
+
+A streaming ZIP contains `manifest.json`, `database/cherry.db`, `files/<id>.<ext>` and
+`avatars/{user,agents,providers}/<name>`, plus
+`skills/<folder>/<digest>/<package path>` for every live Skill package, and an optional
+`ssh/profiles.json` containing SSH configuration without device credential references.
+The manifest records product/version, migration SQL hashes,
+counts, relative paths, byte sizes and SHA-256 hashes. Every referenced resource is present. The whole database preserves
+chats, agents, settings, provider keys, tool bindings, paintings and file metadata.
+
+New exports use format v3 so older readers reject inline-quote data before replacing their storage.
+The reader still accepts portable v1 backups; experimental paired-database v2 remains rejected.
+The ZIP layout is unchanged. This is a mobile format. Desktop physical backups are rejected.
+Restore compatibility requires an exact prefix of bundled SQLite migrations; different migration
+lineage and future formats are rejected.
+Exports rebuild their private database copy from the running app's bundled migrations; imports use
+the validated backup prefix. Both copy known tables and columns by name. Missing nullable/defaulted
+columns use the standard schema's defaults, except message-tree columns required by the target
+version (`active_node_id`, `parent_id`, `siblings_group_id`). These must be present: defaults cannot
+replace the historical data backfill. Genuine pre-tree backups still normalize at their own version
+and run that migration during restore. Unknown
+tables, columns, indexes, views and triggers are omitted; indexes, triggers and search state are
+rebuilt from bundled definitions. Source SQL is never executed and its text is not compared.
+Missing required tables/columns, invalid records and broken references still fail rather than
+silently skipping data. The live source database and the user's selected archive remain unchanged.
+Normalization scratch databases stay inside the operation directory, so normal cleanup and the
+existing startup sweep of previous processes' backup directories also remove interrupted copies.
+
+Archives are unencrypted and include database-held model keys and remote server headers. They exclude
+SecureStore values, desktop pairing tokens, device permissions, caches, logs and extracted documents.
+System sharing presents save destinations; opening or dismissing the share sheet is not proof of
+successful saving.
+
+## Export
+
+The captured database's migration journal does not need to match the current bundle. Missing,
+partial, extra or modified journal entries are regenerated in the normalized copy, matching the
+export manifest. Required tables and columns, record constraints, references and managed files
+remain checked; the live database's journal is never repaired or rewritten by export.
+An incomplete message-tree schema fails export instead of being marked fully migrated with
+invisible conversation history.
+
+While a backup or restore runs, an app-wide progress dialog blocks every route; the user can only
+wait or cancel. Capture refuses active chat/job execution, and a freeze keeps new Agent turns and
+background jobs from starting while the SQLite backup API snapshots the database (including WAL
+data), the copy is normalized and managed resources are copied. Jobs resume before compression.
+Missing original files fail export rather than silently producing an incomplete full backup. Skill installation/update writes
+participate in the same capture exclusion and restored Skill packages follow the new generation.
+A finished export stays in the `exported` phase, carrying the archive URI and content counts,
+until `cancel()` dismisses it. Dismissing deletes the archive, as does starting the next export;
+the user keeps only copies saved or shared from it.
+
+Hashing uses the file module's shared native streaming hash. ZIP processing uses the restricted
+reader and streaming writer in `src/backend/utils` (shared with Skill packages and diagnostics), in
+bounded chunks. Export progress counts uncompressed payload bytes across two passes: hashing and
+packing, each weighted by the same fixed captured file sizes. The manifest contributes no progress
+bytes. Hash progress advances at file boundaries; packing reports after each successful chunk,
+with the terminal value deferred until archive finalization and handle cleanup succeed. Runtime
+publishes the real byte counters only when the integer percentage changes, plus the initial state
+and lifecycle transitions. An all-zero payload stays indeterminate. Reaching 100% means the archive
+was packed; it does not prove the user saved or shared it. Capture, copying and native hashing keep
+their existing liveness behavior.
+
+Limits are 1 GiB compressed, 1 GiB expanded and 10,000 payload entries, with a
+4 MiB manifest. Free space is checked while copying and extracting. Cancellation removes work
+owned by the operation before activation is committed.
+
+## Restore
+
+Selection reads the chosen archive in place, validates the ZIP central directory and paths, extracts
+to app-owned cache, checks payload sizes and hashes, imports the data into the standard schema for its
+migration version, then runs integrity/reference checks. Duplicate and case-colliding paths, traversal,
+encryption, symlinks, unexpected payloads, expansion limits and truncated archives fail before live data changes.
+
+Confirmation moves the verified payloads into a new generation, so a failed attempt requires
+selecting the backup again. Its database applies any remaining migrations to upgrade older data,
+cancels unfinished jobs, marks partial replies interrupted, drops desktop pairing, rotates plugin credential references
+without copying their secret values, and retains the target device's identity/privacy/onboarding/
+background-notification preferences. Other settings and content come from the backup. Plugin rows
+and their tool bindings remain so users can reconnect them. SSH profiles are loaded into the new
+generation's dedicated MMKV store before activation commits. Their credential references and
+revisions are regenerated; users re-enter passwords or private keys even on the same device.
+
+After durable staging, Android restarts the native process automatically. iOS and Android clients
+without a working restart helper ask the user to completely close and reopen the application. The
+[storage generation controller](../../data/storage/README.md) commits only after required bootstrap
+succeeds and rolls back interrupted activation. The first boot that settles a restore reports once
+whether it was applied or rolled back. Import does not merge records or replay prior tasks.
+
+WebDAV/S3, scheduled backups, encryption, partial restore and desktop interchange are outside v1.
+
+## Verification
+
+Focused suites cover mutation admission, runtime progress state, serialized paths and limits, a
+pack/unpack round trip, ZIP truncation/encryption (in the shared reader suite), native-process
+state transitions, standard-schema imports, rebuilt search indexes and SQLite normalization/rollback.
+Database regressions also cover exporting with missing or mismatched migration journals, preserving
+the live source, validating the regenerated journal, and retaining strict restore checks.
+Export regressions cover the two-pass payload scale, manifest exclusion, file-boundary hashing,
+chunk-level packing before a database-only entry finishes, monotonic counters and integer-percentage
+publication deduplication, source-size mismatches, and cancellation during a chunk yield.
+Device acceptance must also exercise export/save/import on both platforms, cancellation, low disk, native termination
+during each restore phase, and the native module's durability. Those checks and native builds are
+not implied by editing this code.

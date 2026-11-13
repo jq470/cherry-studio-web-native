@@ -1,0 +1,150 @@
+import { act, create, type ReactTestRenderer } from 'react-test-renderer';
+
+import { useFileOcrState } from '@/frontend/hooks/file';
+import type { CherryMessagePart } from '@/shared/data/types/message';
+
+import { isReadFileToolPart, ReadFileToolPart } from '../ReadFileToolPart';
+import type { ToolMessagePart } from '../toolPartState';
+
+jest.mock('@/frontend/hooks/file', () => ({ useFileOcrState: jest.fn() }));
+
+jest.mock('react-i18next', () => ({
+  useTranslation: () => ({ t: (key: string) => key }),
+}));
+
+jest.mock('@/frontend/components/MessageDetail', () => {
+  const { createElement } = jest.requireActual('react');
+  return {
+    MessageDetailText: (props: object) => createElement('TextSection', props),
+    MessageDetailValue: (props: object) => createElement('ValueSection', props),
+  };
+});
+
+jest.mock('@cherrystudio/ui/components', () => {
+  const { createElement } = jest.requireActual('react');
+  return {
+    MessagePart: {
+      TextSection: (props: object) => createElement('TextSection', props),
+      Tool: (props: object) => createElement('Tool', props),
+      ValueSection: (props: object) => createElement('ValueSection', props),
+    },
+  };
+});
+
+jest.mock('../GenericToolPart', () => {
+  const { createElement } = jest.requireActual('react');
+  return { GenericToolPart: (props: object) => createElement('GenericToolPart', props) };
+});
+
+describe('ReadFileToolPart', () => {
+  it('claims only read_file parts', () => {
+    expect(isReadFileToolPart(toolPart({ output: {} }))).toBe(true);
+    expect(isReadFileToolPart(toolPart({ output: {}, toolName: 'edit_file' }))).toBe(false);
+  });
+
+  it('shows recognition progress of the scanned PDF a running call reads', () => {
+    jest
+      .mocked(useFileOcrState)
+      .mockImplementation((key) =>
+        key === 'call-1'
+          ? { status: 'recognizing', kind: 'pdf', completedPages: 12, totalPages: 40 }
+          : undefined,
+      );
+    const running = toolPart({ input: { file_entry_id: 'entry-1' }, state: 'input-available' });
+    expect(render(running).root.findByType('GenericToolPart').props.runningStatusText).toBe(
+      'chat.builtinTool.file.recognizing',
+    );
+    const byPath = toolPart({ input: { path: 'docs/scan.pdf' }, state: 'input-available' });
+    expect(render(byPath).root.findByType('GenericToolPart').props.runningStatusText).toBe(
+      'chat.builtinTool.file.recognizing',
+    );
+    jest.mocked(useFileOcrState).mockReturnValueOnce({ status: 'queued' });
+    expect(render(running).root.findByType('GenericToolPart').props.runningStatusText).toBe(
+      'chat.builtinTool.file.processingQueued',
+    );
+    const done = toolPart({ input: { file_entry_id: 'entry-1' }, output: 'not an object' });
+    expect(render(done).root.findByType('GenericToolPart').props.runningStatusText).toBeUndefined();
+    jest.mocked(useFileOcrState).mockReset();
+  });
+
+  it('summarizes the returned line range instead of repeating the text', () => {
+    const renderer = render(
+      toolPart({
+        output: {
+          status: 'ok',
+          filename: 'notes.md',
+          startLine: 101,
+          lineCount: 20,
+          totalLines: 480,
+          text: 'x'.repeat(5000),
+        },
+      }),
+    );
+
+    expect(renderer.root.findAllByType('GenericToolPart')).toHaveLength(0);
+    expect(renderer.root.findByType('ValueSection').props.value).toEqual({
+      'chat.builtinTool.file.filename': 'notes.md',
+      'chat.builtinTool.file.lines': '101-120 / 480',
+    });
+  });
+
+  it('summarizes a character window, such as an AnyDoc JSON fragment', () => {
+    const renderer = render(
+      toolPart({
+        output: {
+          status: 'ok',
+          filename: 'report.docx',
+          format: 'json-fragment',
+          offset: 100_000,
+          characterCount: 100_000,
+          totalCharacters: 350_000,
+          nextOffset: 200_000,
+          complete: false,
+          text: '{"x":'.repeat(20_000),
+        },
+      }),
+    );
+
+    expect(renderer.root.findAllByType('GenericToolPart')).toHaveLength(0);
+    expect(renderer.root.findByType('ValueSection').props.value).toEqual({
+      'chat.builtinTool.file.filename': 'report.docx',
+      'chat.builtinTool.file.characters': '100001-200000 / 350000',
+    });
+  });
+
+  it('surfaces a rejection', () => {
+    const renderer = render(
+      toolPart({ output: { status: 'error', message: 'The managed file is unavailable.' } }),
+    );
+
+    expect(renderer.root.findByType('TextSection').props.value).toBe(
+      'The managed file is unavailable.',
+    );
+  });
+
+  it.each([
+    ['a non-object output', 'ok'],
+    ['a missing line count', { status: 'ok', filename: 'notes.md', startLine: 1, totalLines: 1 }],
+  ])('falls back to generic rendering for %s', (_case, output) => {
+    expect(render(toolPart({ output })).root.findByType('GenericToolPart')).toBeDefined();
+  });
+});
+
+function render(part: ToolMessagePart): ReactTestRenderer {
+  let renderer!: ReactTestRenderer;
+  act(() => {
+    renderer = create(<ReadFileToolPart part={part} />);
+  });
+  return renderer;
+}
+
+function toolPart(overrides: Partial<Record<string, unknown>>): ToolMessagePart {
+  return {
+    input: {},
+    state: 'output-available',
+    toolCallId: 'call-1',
+    toolName: 'read_file',
+    type: 'dynamic-tool',
+    ...overrides,
+  } as Extract<CherryMessagePart, { type: 'dynamic-tool' }>;
+}

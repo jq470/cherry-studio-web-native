@@ -1,0 +1,1037 @@
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+
+import { trackNativeAbortSignals } from '../../authorization/__tests__/_nativeAbortSignal';
+import { isBuiltInMcpToolAllowed } from '../../pluginRegistry';
+import { FEISHU_REQUESTED_TOOL_SCOPES } from '../../plugins/feishu/feishuTools';
+import { createBuiltInMcpClient as createClient } from '../createBuiltInMcpClient';
+import { validatePluginConnection } from '../validatePluginConnection';
+
+const mockFetch = jest.fn();
+const mockGetGrant = jest.fn();
+const mockResolveCredential = jest.fn();
+const authorizations = {
+  get: jest.fn(),
+  credentials: { getCredentialGrant: (...args: unknown[]) => mockGetGrant(...args) },
+};
+function createBuiltInMcpClient(pluginId: string, authorizationId: string, signal: AbortSignal) {
+  return createClient(pluginId, authorizationId, signal, authorizations);
+}
+jest.mock('@/backend/services/http', () => ({
+  createHttpClient: () => ({ request: jest.fn() }),
+  createFetchBridge: () => jest.fn(),
+  isHttpError: () => false,
+}));
+jest.mock('@modelcontextprotocol/client', () => {
+  const actual = jest.requireActual<typeof import('@modelcontextprotocol/client')>(
+    '@modelcontextprotocol/client',
+  );
+  return {
+    ...actual,
+    StreamableHTTPClientTransport: jest.fn(
+      (...args: ConstructorParameters<typeof actual.StreamableHTTPClientTransport>) =>
+        new actual.StreamableHTTPClientTransport(...args),
+    ),
+  };
+});
+const createTransport = jest.mocked(StreamableHTTPClientTransport);
+jest.mock('../../plugins/github/githubOauth', () => ({
+  ...jest.requireActual('../../plugins/github/githubOauth'),
+  getGithubApplication: () => ({
+    clientId: 'cherry_oauth_client',
+    clientSecret: 'public-client-secret',
+    redirectUrl: 'cherrystudio-dev://plugins/github/callback',
+  }),
+}));
+jest.mock('expo/fetch', () => ({ fetch: (...args: unknown[]) => mockFetch(...args) }));
+jest.mock('@/backend/data/services/PluginAuthorizationService', () => ({
+  pluginAuthorizationService: {
+    async getAuthorizedGrant(...args: unknown[]) {
+      const grant = await mockGetGrant(...args);
+      return {
+        id: grant.id,
+        authMethod: grant.authMethod,
+        credentialReference: {
+          storage: 'secure-store-v1',
+          id: '00000000-0000-4000-8000-000000000001',
+        },
+      };
+    },
+  },
+}));
+
+type RpcRequest = { id?: number; method: string; params?: Record<string, unknown> };
+const definitions = [
+  { name: 'get_me', inputSchema: { type: 'object', properties: {} } },
+  {
+    name: 'issue_write',
+    inputSchema: { type: 'object', properties: { method: { type: 'string' } } },
+  },
+  {
+    name: 'maps_weather',
+    inputSchema: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] },
+  },
+  { name: 'fetch-doc', inputSchema: { type: 'object', properties: {} } },
+  { name: 'create-doc', inputSchema: { type: 'object', properties: {} } },
+];
+
+function reply(request: RpcRequest, result: unknown): Response {
+  return new Response(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }), {
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
+function respond(_url: string, init?: RequestInit): Response {
+  if (init?.method === 'GET') return new Response(null, { status: 405 });
+  if (init?.method === 'DELETE') return new Response(null, { status: 204 });
+  const request: RpcRequest = JSON.parse(String(init?.body));
+  if (request.method === 'initialize') {
+    return reply(request, {
+      protocolVersion: request.params?.protocolVersion,
+      serverInfo: { name: 'official-fixture', version: '1' },
+      capabilities: { tools: {} },
+    });
+  }
+  if (request.id === undefined) return new Response(null, { status: 202 });
+  if (request.method === 'tools/list') return reply(request, { tools: definitions });
+  return reply(request, {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify(
+          request.params?.name === 'maps_weather'
+            ? { forecasts: [{ city: '北京' }] }
+            : { login: 'cherry' },
+        ),
+      },
+    ],
+  });
+}
+
+function toolRequests(): RpcRequest[] {
+  return mockFetch.mock.calls.flatMap(([, init]: [string, RequestInit]) => {
+    if (typeof init?.body !== 'string') return [];
+    const request: RpcRequest = JSON.parse(init.body);
+    return request.method === 'tools/call' ? [request] : [];
+  });
+}
+
+/** The SDK opens its optional GET stream after initialization resolves; let it land first. */
+const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+beforeEach(() => {
+  createTransport.mockClear();
+  mockFetch.mockReset().mockImplementation(respond);
+  mockGetGrant.mockReset().mockImplementation(async (pluginId: string) => ({
+    id: 'grant-1',
+    credential:
+      pluginId === 'amap'
+        ? { version: 1, key: 'private-key' }
+        : { version: 1, token: 'private-key' },
+    authMethod: pluginId === 'amap' ? 'api_key' : 'personal_token',
+  }));
+  authorizations.get.mockReset().mockReturnValue({ resolveCredential: mockResolveCredential });
+  mockResolveCredential.mockReset().mockResolvedValue(userCredential);
+});
+afterEach(() => jest.restoreAllMocks());
+
+const userCredential = {
+  version: 1,
+  application: { appId: 'cli_cherry', appSecret: 'private-app-secret' },
+  tokens: {
+    accessToken: 'user-token-first',
+    refreshToken: 'user-refresh',
+    expiresAt: 7200000,
+    refreshExpiresAt: 86400000,
+    scope: FEISHU_REQUESTED_TOOL_SCOPES.join(' '),
+  },
+};
+
+it.each([false, true])(
+  'releases real SDK request listeners while reusing the Feishu connection (caller: %s)',
+  async (withCaller) => {
+    const tracked = trackNativeAbortSignals();
+    mockGetGrant.mockResolvedValue({ id: 'grant-feishu', authMethod: 'feishu_user' });
+    const caller = new AbortController();
+    const client = await createBuiltInMcpClient('feishu', 'grant-feishu', caller.signal);
+    try {
+      const discovery = withCaller ? { options: { signal: caller.signal } } : undefined;
+      const options = withCaller ? { abortSignal: caller.signal } : undefined;
+      await client.listTools(discovery);
+      await settle();
+      expect(tracked.listeners.size).toBe(0);
+      expect(tracked.timers.size).toBe(0);
+
+      for (let index = 0; index < 25; index++) {
+        await client.listTools(discovery);
+        await expect(client.callTool({ name: 'fetch-doc', args: {}, options })).resolves.toEqual({
+          content: [{ type: 'text', text: JSON.stringify({ login: 'cherry' }) }],
+        });
+        expect(tracked.listeners.size).toBe(0);
+        expect(tracked.timers.size).toBe(0);
+      }
+
+      mockFetch.mockImplementation((url, init) => {
+        if (init?.body && JSON.parse(init.body).method === 'tools/call')
+          return new Response(null, { status: 500 });
+        return respond(url, init);
+      });
+      await expect(
+        client.callTool({ name: 'create-doc', args: {}, options }),
+      ).rejects.toMatchObject({
+        reason: 'unknown-write',
+      });
+      expect(tracked.listeners.size).toBe(0);
+      expect(tracked.timers.size).toBe(0);
+      expect(caller.signal.aborted).toBe(false);
+      expect(createTransport).toHaveBeenCalledTimes(1);
+      expect(
+        toolRequests().filter((request) => request.params?.name === 'create-doc'),
+      ).toHaveLength(1);
+    } finally {
+      await client.close();
+    }
+  },
+);
+
+it.each(['complete', 'cancel'] as const)(
+  'keeps an overlapping response stream alive until its own request ends (%s)',
+  async (ending) => {
+    const tracked = trackNativeAbortSignals();
+    mockGetGrant.mockResolvedValue({ id: 'grant-feishu', authMethod: 'feishu_user' });
+    const client = await createBuiltInMcpClient(
+      'feishu',
+      'grant-feishu',
+      new AbortController().signal,
+    );
+    let pending: Promise<unknown> | undefined;
+    let responseController: ReadableStreamDefaultController<Uint8Array> | undefined;
+    let requestSignal: AbortSignal | undefined;
+    try {
+      await client.listTools();
+      await settle();
+      const caller = new AbortController();
+      let requestId: number | undefined;
+      let received!: () => void;
+      const started = new Promise<void>((resolve) => {
+        received = resolve;
+      });
+      mockFetch.mockImplementation((url, init) => {
+        if (!init?.body) return respond(url, init);
+        const request: RpcRequest = JSON.parse(init.body);
+        if (request.method !== 'tools/call' || request.params?.name !== 'create-doc')
+          return respond(url, init);
+        requestSignal = init.signal;
+        requestId = request.id;
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            responseController = controller;
+            const onAbort = () => {
+              requestSignal!.removeEventListener('abort', onAbort);
+              responseController?.close();
+              responseController = undefined;
+            };
+            requestSignal!.addEventListener('abort', onAbort);
+          },
+        });
+        received();
+        const response = new Response(null, { headers: { 'content-type': 'text/event-stream' } });
+        // The SDK pipes the body through Jest's global stream polyfills, not Node's Response realm.
+        Object.defineProperty(response, 'body', { value: body });
+        return response;
+      });
+      pending = client.callTool({
+        name: 'create-doc',
+        args: {},
+        options: { abortSignal: caller.signal },
+      });
+      await started;
+      await expect(client.callTool({ name: 'fetch-doc', args: {} })).resolves.toHaveProperty(
+        'content',
+      );
+      expect(requestSignal!.aborted).toBe(false);
+
+      if (ending === 'complete') {
+        const result = { content: [{ type: 'text', text: 'created' }] };
+        responseController!.enqueue(
+          new TextEncoder().encode(
+            `event: message\ndata: ${JSON.stringify({ jsonrpc: '2.0', id: requestId, result })}\n\n`,
+          ),
+        );
+        await expect(pending).resolves.toEqual(result);
+        expect(caller.signal.aborted).toBe(false);
+      } else {
+        const outcome = expect(pending).rejects.toMatchObject({ reason: 'unknown-write' });
+        caller.abort();
+        await outcome;
+        await settle();
+        // Keep the legacy cancellation notification as well as cancelling this HTTP stream.
+        expect(
+          mockFetch.mock.calls.some(
+            ([, init]: [string, RequestInit]) =>
+              typeof init?.body === 'string' &&
+              JSON.parse(init.body).method === 'notifications/cancelled' &&
+              JSON.parse(init.body).params?.requestId === requestId,
+          ),
+        ).toBe(true);
+      }
+      expect(requestSignal!.aborted).toBe(true);
+      expect(responseController).toBeUndefined();
+      expect(tracked.listeners.size).toBe(0);
+      expect(tracked.timers.size).toBe(0);
+      await expect(client.callTool({ name: 'fetch-doc', args: {} })).resolves.toHaveProperty(
+        'content',
+      );
+      expect(createTransport).toHaveBeenCalledTimes(1);
+      expect(
+        toolRequests().filter((request) => request.params?.name === 'create-doc'),
+      ).toHaveLength(1);
+    } finally {
+      responseController?.close();
+      await client.close();
+      await pending?.catch(() => undefined);
+    }
+  },
+);
+
+it('rotates user tokens behind a stable grant reference without rejecting the grant', async () => {
+  mockGetGrant.mockResolvedValue({
+    id: 'user-grant',
+    credential: userCredential,
+    authMethod: 'feishu_user',
+  });
+  const client = await createBuiltInMcpClient('feishu', 'user-grant', new AbortController().signal);
+  try {
+    await settle();
+    mockResolveCredential.mockImplementation(async () => {
+      const credential = {
+        ...userCredential,
+        tokens: { ...userCredential.tokens, accessToken: 'user-token-rotated' },
+      };
+      mockGetGrant.mockResolvedValue({ id: 'user-grant', credential, authMethod: 'feishu_user' });
+      return credential;
+    });
+    mockFetch.mockClear();
+    await client.listTools();
+    expect(mockFetch).toHaveBeenCalled();
+    for (const [, init] of mockFetch.mock.calls as [string, RequestInit][]) {
+      const headers = new Headers(init.headers);
+      expect(headers.get('X-Lark-MCP-UAT')).toBe('user-token-rotated');
+    }
+    await client.listTools();
+    mockFetch.mockImplementation((url, init) => {
+      if (init?.body && JSON.parse(init.body).method === 'tools/call')
+        return new Response(null, { status: 401 });
+      return respond(url, init);
+    });
+    await expect(client.callTool({ name: 'create-doc', args: {} })).rejects.toMatchObject({
+      reason: 'authorization',
+    });
+    expect(toolRequests()).toHaveLength(1);
+  } finally {
+    await client.close();
+  }
+});
+
+it('does not send a user token if its durable authorization is revoked during refresh', async () => {
+  mockGetGrant.mockResolvedValue({
+    id: 'user-grant',
+    credential: userCredential,
+    authMethod: 'feishu_user',
+  });
+  mockResolveCredential.mockImplementation(async () => {
+    mockGetGrant.mockRejectedValue(new Error('revoked'));
+    return userCredential;
+  });
+  const client = await createBuiltInMcpClient('feishu', 'user-grant', new AbortController().signal);
+  try {
+    await expect(client.listTools()).rejects.toMatchObject({ reason: 'authorization' });
+  } finally {
+    await client.close();
+  }
+  expect(mockFetch).not.toHaveBeenCalled();
+});
+
+it('validates a calendar-only Feishu grant without requiring hosted document access', async () => {
+  const calendarCredential = {
+    ...userCredential,
+    tokens: { ...userCredential.tokens, scope: 'calendar:calendar:read' },
+  };
+  await expect(
+    validatePluginConnection('feishu', 'feishu_user', calendarCredential),
+  ).resolves.toMatchObject({
+    accountLabel: 'Feishu user',
+    catalog: {
+      discoveryWarnings: [],
+      tools: expect.arrayContaining([expect.objectContaining({ name: 'calendar_get_primary' })]),
+    },
+  });
+  expect(mockFetch).not.toHaveBeenCalled();
+  expect(toolRequests()).toEqual([]);
+});
+
+it('connects Feishu as the user without storing credentials in MCP configuration or calling business tools', async () => {
+  await expect(
+    validatePluginConnection('feishu', 'feishu_user', userCredential),
+  ).resolves.toMatchObject({
+    accountLabel: 'Feishu user',
+  });
+  expect(toolRequests()).toEqual([]);
+  const [, options] = createTransport.mock.calls[0];
+  expect(JSON.stringify(options)).not.toMatch(/private-app-secret|user-token-first|user-refresh/);
+  for (const [url, init] of mockFetch.mock.calls as [string, RequestInit][]) {
+    const headers = new Headers(init.headers);
+    expect(url).toBe('https://mcp.feishu.cn/mcp');
+    expect(headers.get('X-Lark-MCP-UAT')).toBe('user-token-first');
+    expect(headers.get('X-Lark-MCP-Allowed-Tools')?.split(',')).toContain('create-doc');
+    expect(headers.get('X-Lark-MCP-Allowed-Tools')).not.toMatch(
+      /base_|task_|calendar_|wiki_get_node/,
+    );
+    expect(headers.has('Authorization')).toBe(false);
+    expect(init.redirect).toBe('error');
+    expect(JSON.stringify(init)).not.toMatch(/private-app-secret|user-refresh/);
+  }
+  expect(isBuiltInMcpToolAllowed('feishu', 'search-doc')).toBe(true);
+  expect(isBuiltInMcpToolAllowed('feishu', 'search-user')).toBe(true);
+});
+
+it('rechecks user authorization before every Feishu request', async () => {
+  mockGetGrant.mockResolvedValue({ id: 'grant-feishu', authMethod: 'feishu_user' });
+  const client = await createBuiltInMcpClient(
+    'feishu',
+    'grant-feishu',
+    new AbortController().signal,
+  );
+  try {
+    await client.listTools();
+    mockGetGrant.mockRejectedValue(new Error('revoked'));
+    mockFetch.mockClear();
+    await expect(client.listTools()).rejects.toMatchObject({ reason: 'authorization' });
+    expect(mockFetch).not.toHaveBeenCalled();
+  } finally {
+    await client.close();
+  }
+});
+
+it.each([
+  ['github', 'https://api.githubcopilot.com/mcp/'],
+  ['amap', 'https://mcp.amap.com/mcp'],
+] as const)(
+  'connects %s through the real HTTP SDK without storing credentials in its config',
+  async (pluginId, endpoint) => {
+    const signal = new AbortController().signal;
+    const client = await createBuiltInMcpClient(pluginId, 'grant-1', signal);
+    try {
+      await client.listTools({ options: { signal } });
+      const [url, options] = createTransport.mock.calls[0];
+      expect(String(url)).toBe(endpoint);
+      expect(options).toMatchObject({
+        requestInit: { redirect: 'error' },
+        reconnectionOptions: { maxRetries: 0 },
+      });
+      expect(options).not.toHaveProperty('authProvider');
+      expect(JSON.stringify(options)).not.toContain('private-key');
+      for (const [url, init] of mockFetch.mock.calls as [string, RequestInit][]) {
+        const headers = new Headers(init.headers);
+        expect(init.redirect).toBe('error');
+        if (pluginId === 'github') {
+          expect(url).toBe(endpoint);
+          expect(headers.get('Authorization')).toBe('Bearer private-key');
+          expect(headers.get('X-MCP-Tools')?.split(',')).toContain('issue_write');
+        } else {
+          expect(new URL(url).searchParams.get('key')).toBe('private-key');
+          expect(headers.has('Authorization')).toBe(false);
+        }
+      }
+      expect(mockGetGrant).toHaveBeenCalledWith(pluginId, 'grant-1');
+    } finally {
+      await client.close();
+    }
+  },
+);
+
+it('rejects a retired credential reference before another HTTP request', async () => {
+  const client = await createBuiltInMcpClient('github', 'old-grant', new AbortController().signal);
+  try {
+    await client.listTools();
+    mockGetGrant.mockRejectedValue(new Error('private database details'));
+    mockFetch.mockClear();
+    await expect(client.listTools()).rejects.toMatchObject({
+      reason: 'authorization',
+      stack: undefined,
+    });
+    expect(mockFetch).not.toHaveBeenCalled();
+  } finally {
+    await client.close();
+  }
+});
+
+it('rejects unexpected tool names and targets before credential injection', async () => {
+  const client = await createBuiltInMcpClient('github', 'grant-1', new AbortController().signal);
+  try {
+    const [url, options] = createTransport.mock.calls[0];
+    const fetch = options!.fetch!;
+    await settle();
+    mockFetch.mockClear();
+    mockGetGrant.mockClear();
+    await expect(fetch('https://untrusted.example/mcp', {})).rejects.toMatchObject({
+      reason: 'request',
+    });
+    await expect(
+      fetch(url, {
+        method: 'POST',
+        body: JSON.stringify({ method: 'tools/call', params: { name: 'delete_repository' } }),
+      }),
+    ).rejects.toMatchObject({ reason: 'access' });
+    expect(mockFetch).not.toHaveBeenCalled();
+    expect(mockGetGrant).not.toHaveBeenCalled();
+    expect(isBuiltInMcpToolAllowed('github', 'issue_write')).toBe(true);
+    expect(isBuiltInMcpToolAllowed('github', 'delete_repository')).toBe(false);
+    expect(isBuiltInMcpToolAllowed('amap', 'maps_schema_take_taxi')).toBe(false);
+    expect(isBuiltInMcpToolAllowed('amap', 'search_district')).toBe(false);
+  } finally {
+    await client.close();
+  }
+});
+
+it.each([401, 403, 429, 500])(
+  'redacts HTTP %s diagnostics and never replays a write',
+  async (status) => {
+    const client = await createBuiltInMcpClient('github', 'grant-1', new AbortController().signal);
+    try {
+      await client.listTools();
+      mockFetch.mockImplementation((url, init) => {
+        if (init?.body && JSON.parse(init.body).method === 'tools/call') {
+          return new Response('private-key upstream stack', { status });
+        }
+        return respond(url, init);
+      });
+      const error = await Promise.resolve(
+        client.callTool({ name: 'issue_write', args: { method: 'create' } }),
+      ).catch((value: unknown) => value);
+      expect(error).toMatchObject({
+        reason:
+          status === 500
+            ? 'unknown-write'
+            : status === 401
+              ? 'authorization'
+              : status === 403
+                ? 'access'
+                : 'quota',
+      });
+      expect(JSON.stringify(error)).not.toMatch(/private-key|upstream stack/);
+      expect(toolRequests()).toHaveLength(1);
+    } finally {
+      await client.close();
+    }
+  },
+);
+
+it('reports an unknown write outcome after a connection failure without replay', async () => {
+  const client = await createBuiltInMcpClient('github', 'grant-1', new AbortController().signal);
+  try {
+    await client.listTools();
+    mockFetch.mockImplementation((url, init) => {
+      if (init?.body && JSON.parse(init.body).method === 'tools/call')
+        throw new Error('private-key');
+      return respond(url, init);
+    });
+    await expect(
+      client.callTool({ name: 'issue_write', args: { method: 'create' } }),
+    ).rejects.toMatchObject({ reason: 'unknown-write' });
+    expect(toolRequests()).toHaveLength(1);
+  } finally {
+    await client.close();
+  }
+});
+
+it('reports an unknown write outcome when closing the client aborts a submitted write', async () => {
+  mockFetch.mockImplementation(async (url, init) => {
+    const response = respond(url, init);
+    if (init?.body && JSON.parse(init.body).method === 'initialize')
+      response.headers.set('mcp-session-id', 'session-1');
+    return response;
+  });
+  const client = await createBuiltInMcpClient('github', 'grant-1', new AbortController().signal);
+  await client.listTools();
+  let submitted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    submitted = resolve;
+  });
+  mockFetch.mockImplementation((url, init) => {
+    if (!init?.body || JSON.parse(init.body).method !== 'tools/call') return respond(url, init);
+    submitted();
+    return new Promise((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(new Error('aborted')));
+    });
+  });
+  const result = Promise.resolve(
+    client.callTool({ name: 'issue_write', args: { method: 'create' } }),
+  );
+  const outcome = expect(result).rejects.toMatchObject({ reason: 'unknown-write' });
+  await started;
+  await client.close();
+  await outcome;
+  expect(toolRequests()).toHaveLength(1);
+});
+
+it('does not send a request cancelled while resolving credentials', async () => {
+  const client = await createBuiltInMcpClient('github', 'grant-1', new AbortController().signal);
+  try {
+    await client.listTools();
+    const controller = new AbortController();
+    mockGetGrant.mockImplementation(async () => {
+      controller.abort();
+      return {
+        id: 'grant-1',
+        credential: { version: 1, token: 'private-key' },
+        authMethod: 'personal_token',
+      };
+    });
+    mockFetch.mockClear();
+    await expect(client.listTools({ options: { signal: controller.signal } })).rejects.toThrow();
+    expect(mockFetch).not.toHaveBeenCalled();
+  } finally {
+    await client.close();
+  }
+});
+
+it('does not submit a write after cancellation releases the caller before credential storage', async () => {
+  const client = await createBuiltInMcpClient('github', 'grant-1', new AbortController().signal);
+  await client.listTools();
+  await settle();
+  const entered = deferred<void>();
+  const grant = {
+    id: 'grant-1',
+    credential: { version: 1, token: 'private-key' },
+    authMethod: 'personal_token',
+  };
+  const credential = deferred<typeof grant>();
+  mockGetGrant.mockImplementationOnce(() => {
+    entered.resolve();
+    return credential.promise;
+  });
+  const controller = new AbortController();
+  const outcome = client
+    .callTool({
+      name: 'issue_write',
+      args: { method: 'create' },
+      options: { abortSignal: controller.signal },
+    })
+    .catch((error: unknown) => error);
+  try {
+    await entered.promise;
+    controller.abort();
+    expect(await outcome).toMatchObject({ reason: 'cancelled' });
+    credential.resolve(grant);
+    await settle();
+    expect(toolRequests()).toHaveLength(0);
+    await expect(client.callTool({ name: 'get_me', args: {} })).resolves.toHaveProperty('content');
+    expect(createTransport).toHaveBeenCalledTimes(1);
+  } finally {
+    await client.close();
+    credential.resolve(grant);
+    await outcome;
+  }
+});
+
+it('does not send a write cancelled before the SDK reaches fetch', async () => {
+  const client = await createBuiltInMcpClient('github', 'grant-1', new AbortController().signal);
+  await settle();
+  const controller = new AbortController();
+  const outcome = client
+    .callTool({ name: 'issue_write', args: {}, options: { abortSignal: controller.signal } })
+    .catch((error: unknown) => error);
+  try {
+    controller.abort();
+    expect(await outcome).toMatchObject({ reason: 'cancelled' });
+    await settle();
+    expect(toolRequests()).toHaveLength(0);
+  } finally {
+    await client.close();
+  }
+});
+
+it.each(['complete', 'cancel'] as const)(
+  'tracks concurrent same-name writes independently when the later call ends first (%s)',
+  async (ending) => {
+    const client = await createBuiltInMcpClient('github', 'grant-1', new AbortController().signal);
+    await client.listTools();
+    await settle();
+    const entered = deferred<void>();
+    const grant = {
+      id: 'grant-1',
+      credential: { version: 1, token: 'private-key' },
+      authMethod: 'personal_token',
+    };
+    const credential = deferred<typeof grant>();
+    mockGetGrant.mockImplementationOnce(() => {
+      entered.resolve();
+      return credential.promise;
+    });
+    const firstAbort = new AbortController();
+    const secondAbort = new AbortController();
+    const first = client
+      .callTool({
+        name: 'issue_write',
+        args: { method: 'create', title: 'first' },
+        options: { abortSignal: firstAbort.signal },
+      })
+      .catch((error: unknown) => error);
+    await entered.promise;
+    const submitted = deferred<void>();
+    if (ending === 'cancel')
+      mockFetch.mockImplementation((url, init) => {
+        if (init?.body && JSON.parse(init.body).method === 'tools/call') {
+          submitted.resolve();
+          return new Promise<Response>((_, reject) => {
+            init.signal.addEventListener('abort', () => reject(new Error('aborted')), {
+              once: true,
+            });
+          });
+        }
+        return respond(url, init);
+      });
+    const second = client
+      .callTool({
+        name: 'issue_write',
+        args: { method: 'create', title: 'second' },
+        options: { abortSignal: secondAbort.signal },
+      })
+      .catch((error: unknown) => error);
+    try {
+      if (ending === 'cancel') {
+        await submitted.promise;
+        secondAbort.abort();
+        expect(await second).toMatchObject({ reason: 'unknown-write' });
+      } else {
+        expect(await second).toHaveProperty('content');
+      }
+      expect(toolRequests()).toHaveLength(1);
+      expect(toolRequests()[0].params?.arguments).toMatchObject({ title: 'second' });
+      firstAbort.abort();
+      expect(await first).toMatchObject({ reason: 'cancelled' });
+      credential.resolve(grant);
+      await settle();
+      expect(toolRequests()).toHaveLength(1);
+      for (const [, init] of mockFetch.mock.calls as [string, RequestInit][]) {
+        expect(new Headers(init.headers).has('X-Cherry-Plugin-Request')).toBe(false);
+      }
+    } finally {
+      await client.close();
+      credential.resolve(grant);
+      await Promise.all([first, second]);
+    }
+  },
+);
+
+it.each(['cancel', 'connect-timeout', 'validation-timeout'] as const)(
+  'ends initialization and aborts a stalled initialized notification (%s)',
+  async (ending) => {
+    jest.useFakeTimers();
+    const entered = deferred<void>();
+    const response = deferred<Response>();
+    let requestSignal: AbortSignal | undefined;
+    mockFetch.mockImplementation((url, init) => {
+      if (init?.body && JSON.parse(init.body).method === 'notifications/initialized') {
+        requestSignal = init.signal;
+        entered.resolve();
+        return new Promise<Response>((resolve, reject) => {
+          const onAbort = () => reject(new Error('aborted'));
+          requestSignal!.addEventListener('abort', onAbort, { once: true });
+          response.promise
+            .then(resolve, reject)
+            .finally(() => requestSignal!.removeEventListener('abort', onAbort));
+        });
+      }
+      return respond(url, init);
+    });
+    const controller = new AbortController();
+    let client: Awaited<ReturnType<typeof createBuiltInMcpClient>> | undefined;
+    const connecting =
+      ending === 'validation-timeout'
+        ? validatePluginConnection('github', 'personal_token', { version: 1, token: 'private-key' })
+        : createBuiltInMcpClient('github', 'grant-1', controller.signal).then((value) => {
+            client = value;
+          });
+    let state = 'pending';
+    const outcome = connecting.then(
+      () => {
+        state = 'connected';
+      },
+      () => {
+        state = 'rejected';
+      },
+    );
+    try {
+      await entered.promise;
+      if (ending === 'cancel') controller.abort();
+      await jest.advanceTimersByTimeAsync(ending === 'cancel' ? 0 : 15_001);
+      expect(state).toBe('rejected');
+      expect(requestSignal!.aborted).toBe(true);
+    } finally {
+      response.resolve(new Response(null, { status: 202 }));
+      await outcome;
+      await client?.close();
+      jest.useRealTimers();
+    }
+  },
+);
+
+it.each([
+  ['github', 'get_me', {}, 'cherry'],
+  ['amap', 'maps_weather', { city: '110000' }, 'Web Service'],
+] as const)(
+  'validates %s using only a read-only cloud tool',
+  async (pluginId, name, args, label) => {
+    await expect(
+      validatePluginConnection(
+        pluginId,
+        pluginId === 'github' ? 'personal_token' : 'api_key',
+        pluginId === 'github'
+          ? { version: 1, token: 'entered-key' }
+          : { version: 1, key: 'entered-key' },
+      ),
+    ).resolves.toMatchObject({ accountLabel: label, catalog: { discoveryWarnings: [] } });
+    expect(toolRequests().map((request) => request.params)).toEqual([{ name, arguments: args }]);
+    expect(mockGetGrant).not.toHaveBeenCalled();
+  },
+);
+
+it('rejects tool-reported credential failure without exposing upstream text', async () => {
+  mockFetch.mockImplementation((url, init) => {
+    if (init?.body && JSON.parse(init.body).method === 'tools/call') {
+      return reply(JSON.parse(init.body), {
+        isError: true,
+        content: [{ type: 'text', text: 'entered-key rejected' }],
+      });
+    }
+    return respond(url, init);
+  });
+  const error = await validatePluginConnection('amap', 'api_key', {
+    version: 1,
+    key: 'entered-key',
+  }).catch((value: unknown) => value);
+  expect(error).toMatchObject({ reason: 'request' });
+  expect(JSON.stringify(error)).not.toContain('entered-key');
+});
+
+it('follows tool-list pagination to find the validation tool', async () => {
+  mockFetch.mockImplementation((url, init) => {
+    const request: RpcRequest | undefined = init?.body ? JSON.parse(init.body) : undefined;
+    if (request?.method === 'tools/list' && !request.params?.cursor) {
+      return reply(request, { tools: [], nextCursor: 'next' });
+    }
+    return respond(url, init);
+  });
+  await expect(
+    validatePluginConnection('github', 'personal_token', { version: 1, token: 'entered-key' }),
+  ).resolves.toMatchObject({ accountLabel: 'cherry' });
+});
+
+it('keeps collecting pages after finding the validation tool and returns the admitted catalog', async () => {
+  mockFetch.mockImplementation((url, init) => {
+    const request: RpcRequest | undefined = init?.body ? JSON.parse(init.body) : undefined;
+    if (request?.method === 'tools/list') {
+      return reply(
+        request,
+        request.params?.cursor
+          ? { tools: [definitions[1], definitions[2]] }
+          : { tools: [definitions[0]], nextCursor: 'next' },
+      );
+    }
+    return respond(url, init);
+  });
+  const result = await validatePluginConnection('github', 'personal_token', {
+    version: 1,
+    token: 'entered-key',
+  });
+  expect(result.accountLabel).toBe('cherry');
+  expect(result.catalog.tools.map((tool) => tool.name)).toEqual(['get_me', 'issue_write']);
+  expect(result.catalog.serverInfo).toMatchObject({ name: 'official-fixture', version: '1' });
+  expect(JSON.stringify(result)).not.toContain('entered-key');
+  expect(toolRequests()).toHaveLength(1);
+  expect(createTransport).toHaveBeenCalledTimes(1);
+});
+
+it.each(['duplicate', 'repeated-cursor'])(
+  'rejects a %s catalog even when the first page already contains the validation tool',
+  async (kind) => {
+    mockFetch.mockImplementation((url, init) => {
+      const request: RpcRequest | undefined = init?.body ? JSON.parse(init.body) : undefined;
+      if (request?.method === 'tools/list') {
+        return reply(
+          request,
+          request.params?.cursor
+            ? kind === 'duplicate'
+              ? { tools: [definitions[0]] }
+              : { tools: [], nextCursor: 'next' }
+            : { tools: [definitions[0]], nextCursor: 'next' },
+        );
+      }
+      return respond(url, init);
+    });
+    await expect(
+      validatePluginConnection('github', 'personal_token', { version: 1, token: 'entered-key' }),
+    ).rejects.toMatchObject({ reason: 'request' });
+    expect(toolRequests()).toEqual([]);
+  },
+);
+
+it('preserves partial discovery warnings with the validated local Feishu tools', async () => {
+  mockFetch.mockRejectedValue(new Error('private upstream failure'));
+  const result = await validatePluginConnection('feishu', 'feishu_user', userCredential);
+  expect(result.catalog.tools).toEqual(
+    expect.arrayContaining([expect.objectContaining({ name: 'calendar_get_primary' })]),
+  );
+  expect(result.catalog.discoveryWarnings).toEqual([
+    expect.stringContaining('could not be loaded'),
+  ]);
+  expect(JSON.stringify(result)).not.toContain('private');
+});
+
+it.each([undefined, 'repeated'])(
+  'rejects missing validation tools with cursor %s instead of accepting an unverified grant',
+  async (nextCursor) => {
+    mockFetch.mockImplementation((url, init) => {
+      const request: RpcRequest | undefined = init?.body ? JSON.parse(init.body) : undefined;
+      if (request?.method === 'tools/list') return reply(request, { tools: [], nextCursor });
+      return respond(url, init);
+    });
+    await expect(
+      validatePluginConnection('github', 'personal_token', { version: 1, token: 'entered-key' }),
+    ).rejects.toMatchObject({
+      reason: 'request',
+    });
+    expect(toolRequests()).toEqual([]);
+  },
+);
+
+it('rejects an empty weather response even when the MCP envelope reports success', async () => {
+  mockFetch.mockImplementation((url, init) => {
+    if (init?.body && JSON.parse(init.body).method === 'tools/call') {
+      return reply(JSON.parse(init.body), {
+        content: [{ type: 'text', text: '{"forecasts":[]}' }],
+      });
+    }
+    return respond(url, init);
+  });
+  await expect(
+    validatePluginConnection('amap', 'api_key', { version: 1, key: 'entered-key' }),
+  ).rejects.toMatchObject({
+    reason: 'request',
+  });
+});
+
+it('keeps unregistered plugins inert without resolving grants or starting a client', async () => {
+  expect(isBuiltInMcpToolAllowed('vendor.future-plugin', 'get_me')).toBe(false);
+  await expect(
+    createBuiltInMcpClient('vendor.future-plugin', 'grant', new AbortController().signal),
+  ).rejects.toMatchObject({ reason: 'unavailable' });
+  expect(mockGetGrant).not.toHaveBeenCalled();
+  expect(createTransport).not.toHaveBeenCalled();
+  expect(mockFetch).not.toHaveBeenCalled();
+});
+
+it('rejects an unsupported stored authorization method before transmitting credentials', async () => {
+  mockGetGrant.mockResolvedValue({
+    credential: { version: 1, token: 'private-key' },
+    authMethod: 'future_method_v2',
+  });
+  await expect(
+    createBuiltInMcpClient('github', 'grant', new AbortController().signal),
+  ).rejects.toMatchObject({ reason: 'authorization' });
+  expect(mockFetch).not.toHaveBeenCalled();
+});
+
+it('returns a rejected interactive credential to its method with the bound grant and never replays the write', async () => {
+  const rejectCredential = jest.fn(async () => {});
+  mockGetGrant.mockResolvedValue({ id: 'grant-user', authMethod: 'feishu_user' });
+  authorizations.get.mockReturnValue({
+    resolveCredential: mockResolveCredential,
+    rejectCredential,
+  });
+  const client = await createBuiltInMcpClient('feishu', 'grant-user', new AbortController().signal);
+  try {
+    await client.listTools();
+    mockFetch.mockImplementation((url, init) => {
+      if (init?.body && JSON.parse(init.body).method === 'tools/call')
+        return new Response('private-rejected-token', { status: 401 });
+      return respond(url, init);
+    });
+    await expect(client.callTool({ name: 'create-doc', args: {} })).rejects.toMatchObject({
+      reason: 'authorization',
+    });
+    expect(rejectCredential).toHaveBeenCalledWith('grant-user', userCredential);
+    expect(toolRequests()).toHaveLength(1);
+  } finally {
+    await client.close();
+  }
+});
+
+it('injects the latest GitHub user credential for each independent request without putting it in SDK configuration', async () => {
+  const credential = {
+    version: 1,
+    application: {
+      clientId: 'cherry_oauth_client',
+      clientSecret: 'public-client-secret',
+      redirectUrl: 'cherrystudio-dev://plugins/github/callback',
+    },
+    account: { id: '42', login: 'cherry' },
+    tokens: { accessToken: 'github-access', refreshToken: 'github-refresh' },
+  };
+  mockGetGrant.mockResolvedValue({ id: 'github-grant', authMethod: 'github_user' });
+  mockResolveCredential.mockResolvedValue(credential);
+  const client = await createBuiltInMcpClient(
+    'github',
+    'github-grant',
+    new AbortController().signal,
+  );
+  try {
+    await settle();
+    mockResolveCredential.mockResolvedValue({
+      ...credential,
+      tokens: { ...credential.tokens, accessToken: 'new-github-access' },
+    });
+    mockFetch.mockClear();
+    await client.listTools();
+    expect(new Headers(mockFetch.mock.calls[0][1].headers).get('Authorization')).toBe(
+      'Bearer new-github-access',
+    );
+    expect(JSON.stringify(createTransport.mock.calls[0][1])).not.toMatch(
+      /github-access|github-refresh|public-client-secret/,
+    );
+  } finally {
+    await client.close();
+  }
+});
+
+it('limits the hosted Feishu allowlist to tools covered by the current user grant', async () => {
+  mockGetGrant.mockResolvedValue({ id: 'grant-user', authMethod: 'feishu_user' });
+  mockResolveCredential.mockResolvedValue({
+    ...userCredential,
+    tokens: { ...userCredential.tokens, scope: 'calendar:calendar:read contact:user:search' },
+  });
+  const client = await createBuiltInMcpClient('feishu', 'grant-user', new AbortController().signal);
+  try {
+    const catalog = await client.listTools();
+    expect(catalog.tools.some((tool) => tool.name === 'calendar_get_primary')).toBe(true);
+    expect(mockFetch).toHaveBeenCalled();
+    for (const [, init] of mockFetch.mock.calls as [string, RequestInit][]) {
+      expect(new Headers(init.headers).get('X-Lark-MCP-Allowed-Tools')).toBe('search-user');
+    }
+    await expect(client.callTool({ name: 'create-doc', args: {} })).rejects.toMatchObject({
+      reason: 'access',
+    });
+    expect(toolRequests()).toEqual([]);
+  } finally {
+    await client.close();
+  }
+});

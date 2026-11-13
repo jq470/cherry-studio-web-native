@@ -1,0 +1,700 @@
+import { AppState, Platform } from 'react-native';
+import type BackgroundService from 'react-native-background-actions';
+
+import {
+  AppStatePolicy,
+  BaseService,
+  DependsOn,
+  Injectable,
+  Phase,
+  ServicePhase,
+} from '@/backend/core/lifecycle';
+import type {
+  KeepAliveLease,
+  KeepAliveSource,
+} from '@/backend/services/keepAlive/KeepAliveCoordinator';
+import { KeepAliveInterruptionError } from '@/backend/services/keepAlive/KeepAliveInterruptionError';
+import type { BackgroundReplyActivityProps } from '@/shared/backgroundActivity/chatReply';
+import type { PaintingActivityProps } from '@/shared/backgroundActivity/painting';
+import { parseBackgroundTaskUrl } from '@/shared/backgroundActivity/taskLink';
+import type { BackgroundExecutionStatus } from '@/shared/contracts/backgroundExecution';
+import { loggerService } from '@/shared/core/logger/LoggerService';
+
+import {
+  getSystemIntegration,
+  type SystemIntegrationNativeModule,
+} from '../../../../modules/system-integration';
+import type { BackgroundActivityEnvironment } from './BackgroundActivityEnvironment';
+import type {
+  BackgroundActivityPresenter,
+  RemoteConnectionNotification,
+  RemoteConnectionNotices,
+} from './presenter';
+
+// Android 15 gives dataSync six background hours, reset on foreground entry.
+// Leave a minute for the domain's normal cancellation and notification drain.
+const BACKGROUND_EXECUTION_LIMIT_MS = (6 * 60 - 1) * 60_000;
+// Interrupted work drains under protection within that minute. A handler that never settles
+// must not keep the service or block later admissions.
+const INTERRUPT_DRAIN_GRACE_MS = 30_000;
+const logger = loggerService.withContext('AndroidBackgroundActivity');
+
+// background-actions owns the Headless JS task and wake lock until stop(). A
+// pending promise avoids its automatic task-return -> stop() path racing a
+// subsequent run. It holds no ApplicationHost or business-task references.
+const holdBackgroundExecution = () => new Promise<void>(() => {});
+
+type ActivityProps = BackgroundReplyActivityProps | PaintingActivityProps;
+type ActivityRecord = {
+  attention?: string;
+  cancelled?: boolean;
+  deepLinkUrl?: string;
+  id: number;
+  lastDelivered?: ActivityProps;
+  phaseStartedInBackground: boolean;
+  latestProps: ActivityProps;
+  props: ActivityProps;
+};
+type LeaseRecord = { onInterrupt?: (reason: Error) => void | Promise<void> };
+type Notifications = typeof import('expo-notifications');
+type ServiceContent = {
+  notificationId: number;
+  taskOngoing: boolean;
+  taskTitle: string;
+  taskDesc: string;
+  linkingURI?: string;
+};
+type ConnectionNotificationRecord = RemoteConnectionNotification & {
+  id: number;
+  delivered?: string;
+};
+
+/** Owns execution demand and conversation cards; background-actions owns the native service. */
+@Injectable('AndroidBackgroundActivityRuntime')
+@ServicePhase(Phase.PostReady)
+@DependsOn(['BackgroundActivityEnvironment'])
+@AppStatePolicy('background-presentation')
+export class AndroidBackgroundActivityRuntime
+  extends BaseService
+  implements KeepAliveSource, RemoteConnectionNotices
+{
+  private readonly activities = new Set<ActivityRecord>();
+  private connections: ConnectionNotificationRecord[] = [];
+  private readonly leases = new Set<LeaseRecord>();
+  private background?: typeof BackgroundService;
+  private notifications?: Notifications;
+  private backgroundStartedAt?: number;
+  private backgroundLimitReached = false;
+  private deadlineTimer?: ReturnType<typeof setTimeout>;
+  private disposed = false;
+  private interrupting = false;
+  private nextId = 0;
+  private operationTail: Promise<void> = Promise.resolve();
+  private permissionRequested = false;
+  private unprotected = false;
+  private interrupted = false;
+  private native?: SystemIntegrationNativeModule | null;
+  private readonly statusListeners = new Set<() => void>();
+  private lastServiceContent?: ServiceContent;
+
+  constructor(
+    private readonly environment: Pick<
+      BackgroundActivityEnvironment,
+      'isReplyCompletionNotificationEnabled' | 'translate' | 'onForegroundAttention'
+    >,
+  ) {
+    super();
+  }
+
+  getStatus = (): BackgroundExecutionStatus => {
+    if (this.interrupted) return 'interrupted';
+    if (this.leases.size === 0) return 'idle';
+    if (this.unprotected) return 'limited';
+    if (!this.background?.isRunning()) return 'starting';
+    return this.background.isProtected() && this.native?.showBackgroundTaskNotification
+      ? 'active'
+      : 'limited';
+  };
+
+  subscribe = (listener: () => void) => {
+    this.statusListeners.add(listener);
+    return () => {
+      this.statusListeners.delete(listener);
+    };
+  };
+
+  private publishStatus(): void {
+    for (const listener of this.statusListeners) listener();
+  }
+
+  /** Connection demand is held through KeepAliveCoordinator; this owns presentation only. */
+  setRemoteConnections(notifications: readonly RemoteConnectionNotification[]): Promise<void> {
+    return this.enqueue(async () => {
+      if (this.disposed) return;
+      const previous = this.connections;
+      this.connections = notifications.map((notification) => {
+        const existing = previous.find((record) => record.key === notification.key);
+        return {
+          ...notification,
+          id:
+            existing?.id ??
+            this.native?.getBackgroundTaskNotificationId?.(notification.key) ??
+            92902 + this.nextId++,
+          delivered: existing?.delivered,
+        };
+      });
+      const removed = previous.filter(
+        (record) => !this.connections.some((next) => next.id === record.id),
+      );
+      // Switch the service anchor before retiring its previous connection identity.
+      await this.reconcile();
+      for (const record of removed)
+        await this.native?.dismissBackgroundTaskNotification?.(record.id);
+    });
+  }
+
+  dismissCompletedTask = async (deepLinkUrl: string): Promise<void> => {
+    if ([...this.activities].some((record) => record.deepLinkUrl === deepLinkUrl)) return;
+    await this.native?.dismissCompletedBackgroundTaskNotification?.(deepLinkUrl);
+  };
+
+  protected async onInit(signal?: AbortSignal): Promise<void> {
+    if (Platform.OS !== 'android') return;
+    // Match the other native services' lazy loading so iOS never evaluates
+    // these modules and CommonJS test environments can use the native mocks.
+    const { default: background } =
+      // eslint-disable-next-line @typescript-eslint/no-require-imports -- lazy native-module load
+      require('react-native-background-actions') as typeof import('react-native-background-actions');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports -- lazy native-module load
+    const notifications = require('expo-notifications') as Notifications;
+    this.background = background;
+    this.notifications = notifications;
+    this.native = getSystemIntegration();
+    const handleProtectionChanged = () => this.publishStatus();
+    background.on('protectionChanged', handleProtectionChanged);
+    const protectionChanged = this.registerDisposable(() =>
+      background.off('protectionChanged', handleProtectionChanged),
+    );
+    const handleServiceStopped = () => {
+      void this.interruptLeases(new KeepAliveInterruptionError('service-stopped')).catch(
+        (error: unknown) => logger.warn('Background service interruption failed', { error }),
+      );
+    };
+    background.on('stopped', handleServiceStopped);
+    const serviceStopped = this.registerDisposable(() =>
+      background.off('stopped', handleServiceStopped),
+    );
+    const appState = this.registerAppStateListener((state) => {
+      if (state === 'active') {
+        this.backgroundStartedAt = undefined;
+        this.backgroundLimitReached = false;
+        this.unprotected = false;
+        this.clearDeadline();
+        this.scheduleReconcile();
+      } else {
+        this.backgroundStartedAt ??= Date.now();
+        this.armDeadline();
+      }
+    });
+    const cancel = () => {
+      this.disposed = true;
+      this.clearDeadline();
+      protectionChanged.dispose();
+      serviceStopped.dispose();
+      appState.dispose();
+      // Startup has not admitted dependent owners. Retire global registrations
+      // now; a late stop must not stop the replacement's native service.
+      this.background = undefined;
+      this.notifications = undefined;
+      this.native = undefined;
+    };
+    signal?.addEventListener('abort', cancel, { once: true });
+    try {
+      // Never restore a dead process's stream or replay paid work. The notification bridge
+      // posts every Android task notice, so its sweep covers them; channels are created at
+      // delivery, after locale initialization.
+      await this.native?.clearBackgroundTaskNotifications?.();
+      signal?.throwIfAborted();
+    } finally {
+      signal?.removeEventListener('abort', cancel);
+    }
+  }
+
+  acquire(_tag: string, onInterrupt?: (reason: Error) => void | Promise<void>): KeepAliveLease {
+    if (!this.background || this.disposed) return { release() {} };
+    if (this.backgroundLimitReached && AppState.currentState !== 'active') {
+      void Promise.resolve()
+        .then(() => onInterrupt?.(new KeepAliveInterruptionError('execution-limit')))
+        .catch((error: unknown) => logger.warn('Background task interruption failed', { error }));
+      return { release() {} };
+    }
+    this.interrupted = false;
+    const lease: LeaseRecord = { onInterrupt };
+    this.leases.add(lease);
+    this.publishStatus();
+    this.scheduleReconcile();
+    return {
+      release: () => {
+        if (!this.leases.delete(lease)) return;
+        // Later work gets its own admission attempt once the unprotected work has ended.
+        if (this.leases.size === 0) this.unprotected = false;
+        this.publishStatus();
+        this.scheduleReconcile();
+      },
+    };
+  }
+
+  createPresenter<Props extends ActivityProps>(): BackgroundActivityPresenter<Props> {
+    return {
+      // A notification represents a task the execution runtime already admitted,
+      // whether or not the user can see the app, and a queued task can join an
+      // already-running service in the background. Hold protection only through
+      // notification submission, never through presentation.
+      presentWhile: 'always',
+      shouldHoldLeaseUntilDelivery: true,
+      clearOrphans: async () => 0,
+      start: (props, deepLinkUrl) => {
+        const record: ActivityRecord = {
+          deepLinkUrl,
+          id:
+            this.native?.getBackgroundTaskNotificationId?.(
+              deepLinkUrl ?? `activity:${this.nextId++}`,
+            ) ?? 100000 + this.nextId++,
+          phaseStartedInBackground: AppState.currentState === 'background',
+          latestProps: props,
+          props,
+        };
+        if (!this.disposed) {
+          // A new generation owns this identity. Queued predecessors may no
+          // longer post a terminal update over its ongoing notification.
+          for (const previous of this.activities) {
+            if (previous.id === record.id) this.activities.delete(previous);
+          }
+          this.activities.add(record);
+        }
+        this.scheduleReconcile();
+        return {
+          // The posted notification outlives its task record; a focused surface
+          // clears it here as well as through App Shell's own acknowledgement.
+          dismiss: () =>
+            this.enqueue(async () => {
+              if ([...this.activities].some((current) => current.id === record.id)) return;
+              await this.native?.dismissBackgroundTaskNotification?.(record.id);
+            }),
+          update: (nextProps, context) => {
+            record.latestProps = nextProps;
+            const occurredInBackground =
+              context?.phaseStartedInBackground ?? AppState.currentState === 'background';
+            return this.enqueue(async () => {
+              if (!this.activities.has(record) || this.disposed) return;
+              const previousPhase = record.props.phase;
+              record.props = nextProps;
+              if (previousPhase !== nextProps.phase)
+                record.phaseStartedInBackground = occurredInBackground;
+              if (record.attention === 'terminal' && !isTerminal(nextProps.phase)) {
+                record.attention = undefined;
+              }
+              if (
+                (previousPhase === 'awaiting-approval' || previousPhase === 'awaiting-answer') &&
+                nextProps.phase !== previousPhase
+              ) {
+                record.attention = undefined;
+              }
+              // Even superseded phases must reset the previous turn's notification state.
+              if (record.latestProps !== nextProps) return;
+              await this.reconcile();
+            });
+          },
+          end: (policy, finalProps, context) => {
+            record.latestProps = finalProps;
+            record.cancelled = policy !== 'default' || finalProps.phase === 'cancelled';
+            const occurredInBackground =
+              context?.phaseStartedInBackground ?? AppState.currentState === 'background';
+            return this.enqueue(async () => {
+              if (!this.activities.has(record) || this.disposed) return;
+              if (record.props.phase !== finalProps.phase)
+                record.phaseStartedInBackground = occurredInBackground;
+              record.props = finalProps;
+              if (record.cancelled) {
+                this.activities.delete(record);
+                await this.reconcile();
+                await this.native?.dismissBackgroundTaskNotification?.(record.id);
+              } else {
+                // Settle the service notification in place first. Native code detaches a
+                // settled identity before handing service ownership to a survivor or
+                // stopping, so Android never cancels the result.
+                await this.settleAnchor(record);
+                await this.reconcile();
+                this.activities.delete(record);
+              }
+            });
+          },
+        };
+      },
+    };
+  }
+
+  protected async onStop(): Promise<void> {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.clearDeadline();
+    this.leases.clear();
+    this.publishStatus();
+    await this.enqueue(async () => {
+      await this.stopService();
+      await Promise.all(
+        [...this.activities].map(({ id }) => this.native?.dismissBackgroundTaskNotification?.(id)),
+      );
+      this.activities.clear();
+      for (const record of this.connections)
+        await this.native?.dismissBackgroundTaskNotification?.(record.id);
+      this.connections = [];
+    });
+  }
+
+  private scheduleReconcile(): void {
+    if (this.disposed) return;
+    void this.enqueue(() => this.reconcile()).catch((error: unknown) => {
+      logger.warn('Background service update failed', error as Error);
+    });
+  }
+
+  private async reconcile(): Promise<void> {
+    const background = this.background;
+    if (!background || this.interrupting) return;
+    if (this.disposed || this.leases.size === 0) {
+      await this.stopService();
+      if (!this.disposed) await this.publishNotifications();
+      return;
+    }
+    const content = this.runningContent();
+    try {
+      if (!background.isRunning()) {
+        if (this.unprotected) return;
+        // Android 12+: start only from a visible Activity, never from a background retry.
+        if (AppState.currentState !== 'active' || this.backgroundLimitReached) {
+          this.continueUnprotected();
+          return;
+        }
+        try {
+          await background.start(holdBackgroundExecution, {
+            ...content,
+            // Native execution stays foreground until the last task releases it.
+            taskName: 'CherryBackgroundGeneration',
+            taskIcon: { name: 'notification_icon', type: 'drawable' },
+            // Same notification brand red as the native notification bridge (DESIGN.md).
+            color: '#C74444',
+            // The notification bridge names the same channel; task content never does.
+            channelName: this.environment.translate('notifications.android.runningTitle'),
+            foregroundServiceType: ['dataSync'],
+            progressBar: { max: 1, value: 0, indeterminate: true },
+          });
+        } catch (error) {
+          this.continueUnprotected(error);
+          return;
+        }
+      }
+      if (JSON.stringify(content) !== JSON.stringify(this.lastServiceContent)) {
+        await background.updateNotification(content);
+        this.lastServiceContent = content;
+      }
+      this.publishStatus();
+      this.armDeadline();
+    } finally {
+      if (!this.disposed) await this.publishNotifications();
+      // Request after admission, including a failed attempt or a return while running.
+      // The permission sheet must not race admission or depend on its success.
+      if (!this.disposed && !this.permissionRequested && AppState.currentState === 'active') {
+        this.permissionRequested = true;
+        void this.notifications?.requestPermissionsAsync().catch((error: unknown) => {
+          this.permissionRequested = false;
+          logger.warn('Notification permission request failed', error as Error);
+        });
+      }
+    }
+  }
+
+  /**
+   * Protection is best effort: work that could not get it keeps running and ends through its
+   * own result or a real platform revocation. Returning to the foreground retries admission.
+   */
+  private continueUnprotected(cause?: unknown): void {
+    this.unprotected = true;
+    this.publishStatus();
+    const context = {
+      operation: 'background.start',
+      appState: AppState.currentState,
+      leaseCount: this.leases.size,
+    };
+    // A hidden request or a spent platform budget is an expected limit; only a failed start reports.
+    if (cause === undefined) logger.warn('Background execution is unprotected', context);
+    else logger.error('Background execution is unprotected', cause as Error, context);
+  }
+
+  private async stopService(): Promise<void> {
+    this.clearDeadline();
+    if (this.background?.isRunning()) await this.background.stop();
+    this.lastServiceContent = undefined;
+    this.publishStatus();
+  }
+
+  private runningContent(): ServiceContent {
+    const connection = this.connections[0];
+    if (connection)
+      return {
+        notificationId: connection.id,
+        taskOngoing: true,
+        taskTitle: connection.title,
+        taskDesc: this.connectionBody(connection),
+        linkingURI: connection.url,
+      };
+    const records = [...this.activities].filter((record) => !record.cancelled);
+    const first = records.find(({ props }) => !isTerminal(props.phase)) ?? records[0];
+    if (first) return this.serviceContent(first);
+    return (
+      this.lastServiceContent ?? {
+        notificationId: 92901,
+        taskOngoing: true,
+        taskTitle: this.environment.translate('notifications.android.runningTitle'),
+        taskDesc: this.environment.translate('notifications.android.preparing'),
+      }
+    );
+  }
+
+  private serviceContent(record: ActivityRecord): ServiceContent {
+    return {
+      notificationId: record.id,
+      taskOngoing: !isTerminal(record.props.phase),
+      taskTitle: record.props.title.slice(0, 120),
+      taskDesc: [record.props.detail, record.props.preview]
+        .filter(Boolean)
+        .join('\n')
+        .slice(0, 600),
+      linkingURI: record.deepLinkUrl,
+    };
+  }
+
+  private async settleAnchor(record: ActivityRecord): Promise<void> {
+    if (
+      this.interrupting ||
+      !this.background?.isRunning() ||
+      this.lastServiceContent?.notificationId !== record.id
+    )
+      return;
+    const content = this.serviceContent(record);
+    if (JSON.stringify(content) === JSON.stringify(this.lastServiceContent)) return;
+    try {
+      await this.background.updateNotification(content);
+      this.lastServiceContent = content;
+    } catch (error) {
+      logger.warn('Background service update failed', error as Error);
+    }
+  }
+
+  private async publishNotifications(): Promise<void> {
+    for (const connection of this.connections) {
+      const body = this.connectionBody(connection);
+      const content = JSON.stringify({ ...connection, body, delivered: undefined });
+      if (connection.delivered === content) continue;
+      try {
+        await this.native?.showBackgroundTaskNotification?.(
+          connection.id,
+          connection.title,
+          '',
+          connection.url,
+          true,
+          false,
+          this.environment.translate('notifications.android.runningTitle'),
+          {
+            subText: body,
+            connection: true,
+            actions: {
+              promoted: false,
+              token: connection.token,
+              prompt: '',
+              buttons: [{ id: 'disconnect', label: connection.disconnectLabel }],
+            },
+          },
+        );
+        connection.delivered = content;
+      } catch (error) {
+        logger.warn('Connection notification delivery failed', error as Error);
+      }
+    }
+    for (const record of this.activities) {
+      try {
+        await this.publishNotification(record);
+      } catch (error) {
+        logger.warn('Task notification delivery failed', error as Error);
+      }
+    }
+  }
+
+  private connectionBody(connection: ConnectionNotificationRecord): string {
+    const scheme = connection.url.split('://')[0] ?? '';
+    const hasRunningSession = [...this.activities].some((record) => {
+      if (record.cancelled || isTerminal(record.props.phase)) return false;
+      const task = parseBackgroundTaskUrl(record.deepLinkUrl, scheme);
+      return task?.kind === 'remote-chat' && task.connectionId === connection.connectionId;
+    });
+    return hasRunningSession
+      ? this.environment.translate('session.status.running')
+      : connection.body;
+  }
+
+  private async publishNotification(record: ActivityRecord): Promise<void> {
+    if (
+      this.disposed ||
+      record.cancelled ||
+      record.latestProps !== record.props ||
+      record.lastDelivered === record.props
+    )
+      return;
+    const { props } = record;
+    const phase = props.phase;
+    const terminal = isTerminal(phase);
+    const kind = terminal
+      ? 'terminal'
+      : phase === 'awaiting-approval' || phase === 'awaiting-answer'
+        ? JSON.stringify([phase, 'attentionId' in props ? props.attentionId : ''])
+        : undefined;
+    const requiresAttention =
+      phase === 'awaiting-approval' || phase === 'awaiting-answer' || phase === 'failed';
+    const shouldAlert =
+      kind !== undefined &&
+      record.attention !== kind &&
+      (requiresAttention ||
+        (phase === 'completed' && this.environment.isReplyCompletionNotificationEnabled())) &&
+      (requiresAttention || record.phaseStartedInBackground) &&
+      AppState.currentState === 'background';
+    if (
+      kind &&
+      record.attention !== kind &&
+      requiresAttention &&
+      AppState.currentState === 'active'
+    ) {
+      this.environment.onForegroundAttention({
+        detail: props.detail,
+        phase,
+        title: props.title,
+        url: record.deepLinkUrl,
+      });
+    }
+    if (kind) record.attention = kind;
+    record.lastDelivered = props;
+    await this.native?.showBackgroundTaskNotification?.(
+      record.id,
+      props.title.slice(0, 120),
+      [props.detail, props.preview].filter(Boolean).join('\n').slice(0, 600),
+      record.deepLinkUrl ?? null,
+      !terminal,
+      shouldAlert,
+      this.environment.translate(
+        shouldAlert
+          ? 'notifications.android.attentionChannel'
+          : 'notifications.android.runningTitle',
+      ),
+      {
+        // The title names the task; the header marks whether it runs on the PC or this phone.
+        subText: this.environment.translate(
+          parseBackgroundTaskUrl(record.deepLinkUrl, record.deepLinkUrl?.split('://')[0] ?? '')
+            ?.kind === 'remote-chat'
+            ? 'notifications.source.desktop'
+            : 'notifications.source.phone',
+        ),
+        ...('actions' in props && props.actions ? { actions: props.actions } : {}),
+      },
+    );
+  }
+
+  private armDeadline(): void {
+    if (
+      Number(Platform.Version) < 35 ||
+      !this.background?.isRunning() ||
+      AppState.currentState === 'active' ||
+      this.deadlineTimer
+    )
+      return;
+    this.backgroundStartedAt ??= Date.now();
+    const remaining = BACKGROUND_EXECUTION_LIMIT_MS - (Date.now() - this.backgroundStartedAt);
+    this.deadlineTimer = setTimeout(
+      () => {
+        this.deadlineTimer = undefined;
+        void this.interruptAtDeadline().catch((error: unknown) => {
+          logger.warn('Background execution deadline cleanup failed', error as Error);
+        });
+      },
+      Math.max(0, remaining),
+    );
+  }
+
+  private async interruptAtDeadline(): Promise<void> {
+    if (this.disposed || AppState.currentState === 'active') return;
+    this.backgroundLimitReached = true;
+    await this.interruptLeases(new KeepAliveInterruptionError('execution-limit'));
+  }
+
+  private async interruptLeases(reason: KeepAliveInterruptionError): Promise<void> {
+    if (this.disposed || this.interrupting) return;
+    this.clearDeadline();
+    this.interrupting = true;
+    this.interrupted = true;
+    this.publishStatus();
+    const leases = [...this.leases];
+    this.leases.clear();
+    if (leases.length > 0) {
+      // Platform budget and service revocations are expected cancellation paths; keep them
+      // visible in development diagnostics without sending them to Sentry as errors.
+      logger.warn('Background execution interrupted', reason, {
+        operation: 'background.execution.interrupt',
+        reason: reason.reason,
+        appState: AppState.currentState,
+        leaseCount: leases.length,
+      });
+    }
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const drained = Promise.allSettled(
+        leases.map((lease) => Promise.resolve().then(() => lease.onInterrupt?.(reason))),
+      ).then((results) => {
+        for (const result of results) {
+          if (result.status === 'rejected')
+            logger.warn('Background task interruption failed', result.reason);
+        }
+      });
+      const expired = new Promise<void>((resolve) => {
+        graceTimer = setTimeout(() => {
+          logger.warn('Background task interruption exceeded its grace', {
+            graceMs: INTERRUPT_DRAIN_GRACE_MS,
+            reason: reason.reason,
+          });
+          resolve();
+        }, INTERRUPT_DRAIN_GRACE_MS);
+      });
+      await Promise.race([drained, expired]);
+    } finally {
+      clearTimeout(graceTimer);
+      await this.enqueue(async () => {
+        this.interrupting = false;
+        // Foreground entry may reset the budget and admit new leases while
+        // old domain cancellation drains. Keep their existing service alive.
+        await this.reconcile();
+      });
+    }
+  }
+
+  private clearDeadline(): void {
+    if (this.deadlineTimer) clearTimeout(this.deadlineTimer);
+    this.deadlineTimer = undefined;
+  }
+
+  private enqueue(operation: () => Promise<void>): Promise<void> {
+    const result = this.operationTail.then(operation);
+    this.operationTail = result.catch(() => {});
+    return result;
+  }
+}
+
+function isTerminal(phase: ActivityProps['phase']): boolean {
+  return phase === 'completed' || phase === 'failed' || phase === 'cancelled';
+}

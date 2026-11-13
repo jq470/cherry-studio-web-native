@@ -1,0 +1,490 @@
+import type {
+  FileAttachmentContent,
+  FileAttachmentReport,
+} from '@/shared/contracts/fileAttachment';
+/**
+ * Agent Runtime contract types.
+ *
+ * These are the process-local execution primitives described in
+ * `docs/references/agent/agent-runtime.md`. The contract is deliberately
+ * independent of the Agent Protocol, persistence, React, and Expo: a Runtime
+ * knows prepared prompts, models, history, tools, input, and normalized
+ * execution events, and nothing about Cherry Agent or Session entities, SQLite,
+ * the Data API, navigation, or UI state.
+ *
+ * Tool callbacks and `AbortSignal` are permitted here precisely because this
+ * contract never crosses the JSON-safe application protocol boundary.
+ *
+ * Shapes mirror the design document exactly. Do not add, rename, or "improve"
+ * fields without updating the spec first.
+ */
+import type {
+  AiUsagePricingSnapshot,
+  ServingCredentialReceipt,
+} from '@/shared/data/types/aiUsageRecord';
+import type { Currency } from '@/shared/data/types/model';
+
+import type { TraceSpan } from '../../observability';
+
+/** A JSON-safe value. Tool schemas, tool input/output, and history payloads use it. */
+export type RuntimeJsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | RuntimeJsonValue[]
+  | { [key: string]: RuntimeJsonValue };
+
+export type RuntimeCapabilities = {
+  reasoning: boolean;
+  tools: boolean;
+  approvals: boolean;
+  attachments: boolean;
+};
+
+export type RuntimeDescriptor = {
+  id: string;
+  name: string;
+  capabilities: RuntimeCapabilities;
+};
+
+export interface AgentRuntime {
+  /** Persistent production sessions; short-lived open() remains for isolated model probes. */
+  readonly conversations?: import('./durableTypes').DurableAgentRuntime;
+  readonly descriptor: RuntimeDescriptor;
+  preflightModel(model: RuntimeModel): Promise<RuntimeModelPreflight>;
+  open(): Promise<AgentRuntimeSession>;
+}
+
+export interface AgentRuntimeSession {
+  execute(request: RuntimeExecutionRequest): AsyncIterable<RuntimeEvent>;
+  cancel(turnId: string): Promise<void>;
+  respondApproval(input: {
+    turnId: string;
+    approvalId: string;
+    decision: 'approve' | 'deny';
+  }): Promise<void>;
+  close(): Promise<void>;
+}
+
+/** One text-only provider invocation, without conversation storage, history, or tools. */
+export interface RuntimeTextGenerator {
+  generateText(
+    request: {
+      model: RuntimeModel;
+      instructions: string;
+      text: string;
+      options: RuntimeOptions;
+    },
+    options?: {
+      signal?: AbortSignal;
+      onText?: (text: string) => void;
+      onUsage?: (report: RuntimeUsageReport) => Promise<void>;
+    },
+  ): Promise<{ finishReason: string; text: string }>;
+}
+
+export type RuntimeModel = {
+  providerId: string;
+  modelId: string;
+};
+
+export type RuntimeInputModality = 'text' | 'image';
+
+/**
+ * JSON-safe model facts the Host may inspect before reserving a turn. Runtime
+ * implementations keep provider SDK model objects behind their own boundary.
+ */
+export type RuntimeModelPreflight = {
+  contextWindow: number;
+  inputModalities: RuntimeInputModality[];
+  maxInputTokens: number;
+  maxOutputTokens: number;
+  supportsTools: boolean;
+};
+
+export type RuntimeOptions = {
+  reasoningEffort?:
+    | 'default'
+    | 'none'
+    | 'auto'
+    | 'off'
+    | 'minimal'
+    | 'low'
+    | 'medium'
+    | 'high'
+    | 'xhigh'
+    | 'max';
+  maxOutputTokens?: number;
+  temperature?: number;
+};
+
+/** Host-authorized web access and local configuration, frozen for one turn. */
+export type RuntimeWebTools = {
+  modelToolsPreferred: boolean;
+  clientSearchAvailable: boolean;
+  clientFetchAvailable: boolean;
+};
+
+export type RuntimeToolRef =
+  | { source: 'builtin'; capabilityId: string }
+  | { source: 'mcp'; serverId: string; rawToolName: string };
+
+/** User-visible model-loop activity that is not an executable application capability. */
+export type RuntimeMetaToolRef = { source: 'meta'; name: string };
+
+export type RuntimeMessageToolRef = RuntimeToolRef | RuntimeMetaToolRef;
+
+export type RuntimeArtifact = {
+  ref: { kind: 'managed-file'; fileEntryId: string };
+  mediaType: string;
+  name: string;
+  kind: 'created' | 'derived';
+};
+
+export type RuntimeToolResult = {
+  mcpSource?: import('@/shared/contracts/mcpContent').McpResultSource;
+  mcpApp?: import('@/shared/contracts/mcpApp').McpAppReference;
+  /** Bounded model projection; value remains the user/app result. */
+  modelContent?: import('@/shared/contracts/mcpContent').McpModelContent;
+  value: RuntimeJsonValue;
+  artifacts: RuntimeArtifact[];
+  /** Compact built-in model value when the full display value is already supplied in instructions. */
+  modelValue?: RuntimeJsonValue;
+  /**
+   * Image bytes for the current provider call, never persisted in canonical tool details. Built-in
+   * vision output keeps file IDs in transcript parts; MCP images name the managed file that their
+   * `modelContent` block references. Pi context checkpoints may retain pixels.
+   */
+  modelImages?: { data: string; mediaType: string; fileEntryId?: string }[];
+  /**
+   * Trusted built-in callback instructions for subsequent requests in this execution.
+   * Kept outside compactable messages; the Host replaces them when configuring the next turn.
+   * Never inferred from value, accepted from MCP, or duplicated in model-facing result JSON.
+   */
+  instructions?: { key: string; text: string };
+  /** Preserve an already committed effect's receipt if its system instruction update fails. */
+  instructionsFailureValue?: RuntimeJsonValue;
+  /** Trusted callback metadata; never inferred from the JSON inside value. */
+  failure?: {
+    error: RuntimeError;
+    /** Stops this tool and its failure group for the current execution. */
+    scope: 'call' | 'tool';
+  };
+};
+
+export type RuntimeTextAttachmentPart = {
+  fileEntryId: string;
+  type: 'text-attachment';
+  mediaType: string;
+  name: string;
+  text: string;
+  truncated: boolean;
+  trust: 'untrusted-user-content';
+  attachmentReport?: FileAttachmentReport;
+};
+
+/** Original parser JSON plus prepared image channels; never a persisted protocol part. */
+export type RuntimeDocumentAttachmentPart = Omit<
+  Extract<FileAttachmentContent, { kind: 'document' }>,
+  'kind' | 'assets'
+> & {
+  type: 'document-attachment';
+  fileEntryId: string;
+  mediaType: string;
+  name: string;
+  trust: 'untrusted-user-content';
+  images: { assetRef: string; mediaType: string; uri: string }[];
+  attachmentReport?: FileAttachmentReport;
+};
+
+/** A managed image as pixels. `fileEntryId` lets the model read it again once they leave context. */
+export type RuntimeImagePart = {
+  type: 'file';
+  fileEntryId?: string;
+  mediaType: string;
+  name?: string;
+  uri: string;
+};
+
+export type RuntimeInputPart =
+  | { type: 'text'; text: string }
+  | RuntimeTextAttachmentPart
+  | RuntimeDocumentAttachmentPart
+  | RuntimeImagePart;
+
+export type RuntimeMessagePart =
+  | { type: 'text' | 'reasoning'; text: string }
+  | RuntimeTextAttachmentPart
+  | RuntimeDocumentAttachmentPart
+  | RuntimeImagePart
+  | {
+      type: 'tool-call';
+      toolCallId: string;
+      toolRef: RuntimeMessageToolRef;
+      providerName: string;
+      input: RuntimeJsonValue;
+    }
+  | {
+      type: 'tool-result';
+      toolCallId: string;
+      output: RuntimeToolResult;
+      isError: boolean;
+    };
+
+export type RuntimeMessage = {
+  role: 'user' | 'assistant' | 'system';
+  parts: RuntimeMessagePart[];
+  /**
+   * Provider-measured context size of the request that produced this assistant
+   * message: everything sent plus its output. Present only on the newest
+   * replayed assistant message, as the anchor for context estimation.
+   */
+  contextTokens?: number;
+};
+
+/** One persisted application turn, kept intact for Runtime-owned context policy. */
+export type RuntimeHistoryTurn = {
+  turnId: string | null;
+  messages: RuntimeMessage[];
+};
+
+/** Versioned, opaque Runtime context artifact persisted and replayed by the Host. */
+export type RuntimeContextCheckpoint = {
+  version: 1;
+  anchorTurnId: string;
+  payload: RuntimeJsonValue;
+};
+
+export type RuntimeContextCompaction = {
+  id: string;
+  phase: 'preflight' | 'tool-loop';
+  status: 'running' | 'completed' | 'failed' | 'cancelled';
+  startedAt: number;
+  completedAt?: number;
+  inputTokensBefore: number;
+  inputTokensAfter?: number;
+  reason?: 'summary-failed' | 'insufficient-reduction' | 'cancelled';
+};
+
+/**
+ * One tool invocation. A single object on purpose: a positional context
+ * parameter can be silently dropped by an implementation, while an ignored
+ * `signal` field stays visible at the destructuring site.
+ */
+export type RuntimeToolCall = {
+  input: RuntimeJsonValue;
+  signal: AbortSignal;
+  toolCallId: string;
+  /** The executing turn, so a Host-bound tool can correlate to its live turn state. */
+  turnId: string;
+  /** The Runtime's executor for a capability the Host only describes, such as Code Mode. */
+  run?(): Promise<RuntimeToolResult>;
+};
+
+export type RuntimeTool = {
+  ref: RuntimeToolRef;
+  providerName: string;
+  displayName: string;
+  description: string;
+  inputSchema: RuntimeJsonValue;
+  /** Built-in result.value JSON Schema, including business errors; MCP uses bounded content. */
+  outputSchema?: RuntimeJsonValue;
+  /** Opt-in text fields to preview while input is incomplete; never executable input. */
+  inputPreview?: { textField: string; nameField?: string };
+  approval: 'auto' | 'ask' | 'deny';
+  /** Escalate an auto-approved tool to a user decision for this exact input. */
+  requiresApproval?: (input: RuntimeJsonValue) => boolean;
+  /** Include backend-bound execution context in the human approval payload. */
+  approvalInput?: (input: RuntimeJsonValue) => RuntimeJsonValue;
+  /**
+   * `read` for application-owned tools known not to change anything outside the
+   * conversation, or a remote MCP tool its server annotates as read-only. `write`
+   * is a known change. Absent means unknown.
+   */
+  effect?: 'read' | 'write';
+  /** Tools in the same group stop together after a tool-scoped failure. */
+  failureGroup?: string;
+  /**
+   * False keeps the Agent's global auto mode from promoting this tool's `ask`
+   * (cost-bearing or permission-gated calls). Absent means eligible.
+   */
+  autoApprovalEligible?: boolean;
+  /** Refuse before approval until a trusted instruction section with this key is in context. */
+  requiredInstructions?: { key: string; refusal: string };
+  /** Low-frequency tools are found through tool_search instead of sent with every request. */
+  deferred?: boolean;
+  execute(call: RuntimeToolCall): Promise<RuntimeToolResult>;
+};
+
+export type RuntimeToolInputPreview = {
+  text: string;
+  truncated: boolean;
+  name?: string;
+};
+
+export type RuntimeExecutionRequest = {
+  /** Retained assistant tool-call/result prefix for a fresh manual retry execution. */
+  resume?: RuntimeMessagePart[];
+  /** Probe-only credential override. Never persist it or include it in traces or output events. */
+  apiKeyOverride?: string;
+  turnId: string;
+  /**
+   * Host-owned conversation identity. Providers that key requests on the conversation
+   * (OpenCode's `x-opencode-session`) receive the same value on every turn.
+   */
+  sessionId: string;
+  /** Host-prepared application prompt: Runtime rules, language, selected guides and Agent instructions. */
+  instructions: string;
+  model: RuntimeModel;
+  history: RuntimeHistoryTurn[];
+  contextCheckpoint: RuntimeContextCheckpoint | null;
+  input: RuntimeInputPart[];
+  tools: RuntimeTool[];
+  options: RuntimeOptions;
+  /** Optional, best-effort instrumentation; the Host owns collection and storage. */
+  trace?: TraceSpan;
+};
+
+export type RuntimeToolProgress = {
+  calls: {
+    id: string;
+    name: string;
+    title?: string;
+    args: string;
+    status: 'pending' | 'running' | 'ok' | 'error' | 'interrupted';
+  }[];
+};
+
+export type RuntimeOutputPart =
+  | { id: string; type: 'error'; error: RuntimeError }
+  | { id: string; type: 'data-search-suggestions'; data: { html: string } }
+  | {
+      id: string;
+      type: 'source-url';
+      sourceId: string;
+      url: string;
+      title?: string;
+    }
+  | {
+      id: string;
+      type: 'text' | 'reasoning';
+      text: string;
+      hasText?: boolean;
+      state: 'streaming' | 'done';
+    }
+  | {
+      id: string;
+      type: 'file';
+      ref: { kind: 'managed-file'; fileEntryId: string };
+      mediaType: string;
+      name: string;
+      purpose: 'artifact';
+    }
+  | {
+      id: string;
+      type: 'tool';
+      toolCallId: string;
+      toolRef: RuntimeMessageToolRef;
+      providerName: string;
+      displayName: string;
+      state:
+        | 'input-streaming'
+        | 'input-available'
+        | 'awaiting-approval'
+        | 'running'
+        | 'output-available'
+        | 'denied'
+        | 'error'
+        | 'interrupted';
+      input?: RuntimeJsonValue;
+      inputPreview?: RuntimeToolInputPreview;
+      progress?: RuntimeToolProgress;
+      output?: RuntimeToolResult;
+      approvalId?: string;
+      error?: RuntimeError;
+    };
+
+export type RuntimeApproval = {
+  id: string;
+  turnId: string;
+  toolCallId: string;
+  toolRef: RuntimeToolRef;
+  displayName: string;
+  input: RuntimeJsonValue;
+  status: 'pending' | 'approved' | 'denied';
+};
+
+export type RuntimeUsage = {
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  reasoningTokens?: number;
+  noCacheTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+};
+
+/**
+ * Provider-resolution snapshot captured before execution starts. JSON-safe and
+ * structurally aligned with the mobile usage-record capture context; the Host
+ * completes it with source and message attribution before recording.
+ */
+export type RuntimeUsageContext = {
+  providerId: string;
+  providerName: string | null;
+  modelId: string;
+  modelName: string | null;
+  pricingSnapshot: AiUsagePricingSnapshot | null;
+  trustProviderReportedCost: boolean;
+  reportedCostCurrency: Currency | null;
+  credentialReceipt: ServingCredentialReceipt;
+};
+
+/** One completed provider invocation, including context compaction; never a turn aggregate. */
+export type RuntimeUsageReport = {
+  requestId: string;
+  usage: RuntimeUsage;
+  context: RuntimeUsageContext;
+  completedAt: number;
+  metrics?: {
+    timeFirstTokenMs?: number;
+    timeCompletionMs?: number;
+    timeThinkingMs?: number;
+  };
+};
+
+export type RuntimeErrorContext = {
+  statusCode?: number;
+  providerId?: string;
+  modelId?: string;
+  finishReason?: string;
+  responseBody?: string;
+};
+
+export type RuntimeError = {
+  code: string;
+  message: string;
+  retryable: boolean;
+  origin?: 'provider' | 'runtime' | 'host' | 'tool';
+  name?: string;
+  context?: RuntimeErrorContext;
+};
+
+export type RuntimeEvent =
+  | { type: 'part.add'; index: number; part: RuntimeOutputPart }
+  | { type: 'text.delta'; partId: string; text: string }
+  | { type: 'tool.input.preview'; partId: string; preview: RuntimeToolInputPreview }
+  | { type: 'part.replace'; part: RuntimeOutputPart }
+  | { type: 'approval.requested'; approval: RuntimeApproval }
+  | { type: 'approval.resolved'; approval: RuntimeApproval }
+  | { type: 'context.checkpoint'; checkpoint: RuntimeContextCheckpoint }
+  | { type: 'context.compaction'; compaction: RuntimeContextCompaction }
+  | ({ type: 'usage' } & RuntimeUsageReport)
+  | {
+      type: 'completed';
+      /** Context size of the final request, when the provider reported its input. */
+      contextTokens?: number;
+    }
+  | { type: 'failed'; error: RuntimeError }
+  | { type: 'cancelled' };

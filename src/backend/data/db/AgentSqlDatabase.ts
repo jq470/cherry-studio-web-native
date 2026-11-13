@@ -1,0 +1,177 @@
+import { File } from 'expo-file-system';
+import { openDatabaseAsync, type SQLiteBindValue, type SQLiteDatabase } from 'expo-sqlite';
+
+import { databaseDirectory } from '@/backend/data/storage/storagePaths';
+
+import { captureDatabase } from './backupDatabase';
+
+export const AGENT_DATABASE_NAME = 'pi-agent.db';
+const AGENT_DATABASE_FILES = ['', '-wal', '-shm'].map((suffix) => AGENT_DATABASE_NAME + suffix);
+
+/** Bytes of the Agent database and its SQLite sidecars in the active store. */
+export function agentDatabaseSize(directory = databaseDirectory()): number {
+  return AGENT_DATABASE_FILES.reduce((total, name) => {
+    const file = new File(directory, name);
+    return total + (file.exists ? file.size : 0);
+  }, 0);
+}
+
+/** Removes the closed Agent database; the next open creates an empty file. */
+export function discardAgentDatabase(directory = databaseDirectory()): void {
+  for (const name of AGENT_DATABASE_FILES) {
+    const file = new File(directory, name);
+    if (file.exists) file.delete();
+  }
+}
+
+/** Portable values used by the Agent's storage; no upstream runtime types enter data. */
+export type AgentSqlValue = null | number | bigint | string | Uint8Array;
+
+export interface AgentSqlExecutor {
+  exec(sql: string): Promise<void>;
+  run(sql: string, ...params: AgentSqlValue[]): Promise<void>;
+  runCounted(sql: string, ...params: AgentSqlValue[]): Promise<number>;
+  get<T extends object>(sql: string, ...params: AgentSqlValue[]): Promise<T | undefined>;
+  all<T extends object>(sql: string, ...params: AgentSqlValue[]): Promise<T[]>;
+}
+
+/** Owns one connection. Unrelated reads and writes wait for an active transaction. */
+export class AgentSqlDatabase implements AgentSqlExecutor {
+  private tail: Promise<void> = Promise.resolve();
+  private closing: Promise<void> | undefined;
+  private failure: Error | undefined;
+
+  constructor(private readonly sqlite: SQLiteDatabase) {}
+
+  static async open(
+    options: { directory?: string; name?: string; journal?: 'wal' | 'preserve' } = {},
+  ): Promise<AgentSqlDatabase> {
+    const directory = options.directory ?? databaseDirectory();
+    const database = new AgentSqlDatabase(
+      await openDatabaseAsync(
+        options.name ?? AGENT_DATABASE_NAME,
+        { useNewConnection: true, finalizeUnusedStatementsBeforeClosing: false },
+        directory,
+      ),
+    );
+    try {
+      await database.exec(
+        `${options.journal === 'preserve' ? '' : 'PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; '}PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;`,
+      );
+      return database;
+    } catch (error) {
+      await database.close().catch(() => undefined);
+      throw error;
+    }
+  }
+
+  exec(sql: string): Promise<void> {
+    return this.enqueue(() => this.sqlite.execAsync(sql));
+  }
+
+  /** A sealed snapshot, ordered after earlier queued Pi writes; its source stays open. */
+  capture(destinationUri: string): Promise<void> {
+    return this.enqueue(() => captureDatabase(this.sqlite, new File(destinationUri)));
+  }
+
+  run(sql: string, ...params: AgentSqlValue[]): Promise<void> {
+    return this.enqueue(async () => {
+      await this.sqlite.runAsync(sql, bindings(params));
+    });
+  }
+
+  runCounted(sql: string, ...params: AgentSqlValue[]): Promise<number> {
+    return this.enqueue(async () => (await this.sqlite.runAsync(sql, bindings(params))).changes);
+  }
+
+  get<T extends object>(sql: string, ...params: AgentSqlValue[]): Promise<T | undefined> {
+    return this.enqueue(
+      async () => (await this.sqlite.getFirstAsync<T>(sql, bindings(params))) ?? undefined,
+    );
+  }
+
+  all<T extends object>(sql: string, ...params: AgentSqlValue[]): Promise<T[]> {
+    return this.enqueue(() => this.sqlite.getAllAsync<T>(sql, bindings(params)));
+  }
+
+  transaction<T>(callback: (transaction: AgentSqlExecutor) => Promise<T>): Promise<T> {
+    return this.enqueue(async () => {
+      await this.sqlite.execAsync('BEGIN IMMEDIATE');
+      let active = true;
+      const assertActive = () => {
+        if (!active) throw new Error('The Agent SQL transaction has already settled.');
+      };
+      const transaction: AgentSqlExecutor = {
+        exec: async (sql) => {
+          assertActive();
+          await this.sqlite.execAsync(sql);
+        },
+        run: async (sql, ...params) => {
+          assertActive();
+          await this.sqlite.runAsync(sql, bindings(params));
+        },
+        runCounted: async (sql, ...params) => {
+          assertActive();
+          return (await this.sqlite.runAsync(sql, bindings(params))).changes;
+        },
+        get: async <Row extends object>(sql: string, ...params: AgentSqlValue[]) => {
+          assertActive();
+          return (await this.sqlite.getFirstAsync<Row>(sql, bindings(params))) ?? undefined;
+        },
+        all: async <Row extends object>(sql: string, ...params: AgentSqlValue[]) => {
+          assertActive();
+          return this.sqlite.getAllAsync<Row>(sql, bindings(params));
+        },
+      };
+      try {
+        const result = await callback(transaction);
+        active = false;
+        await this.sqlite.execAsync('COMMIT');
+        return result;
+      } catch (error) {
+        active = false;
+        try {
+          await this.sqlite.execAsync('ROLLBACK');
+        } catch (rollbackError) {
+          this.failure = new AggregateError(
+            [error, rollbackError],
+            'The Agent SQL transaction failed and could not be rolled back.',
+          );
+          throw this.failure;
+        }
+        throw error;
+      }
+    });
+  }
+
+  close(): Promise<void> {
+    if (!this.closing) {
+      // Seal admission immediately, then drain every operation already accepted.
+      this.closing = this.tail.then(() => this.sqlite.closeAsync());
+    }
+    return this.closing;
+  }
+
+  private enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.closing) return Promise.reject(new Error('The Agent database is closing.'));
+    const result = this.tail.then(() => {
+      if (this.failure) throw this.failure;
+      return operation();
+    });
+    this.tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+}
+
+function bindings(values: AgentSqlValue[]): SQLiteBindValue[] {
+  return values.map((value) => {
+    if (typeof value !== 'bigint') return value;
+    const number = Number(value);
+    if (!Number.isSafeInteger(number))
+      throw new RangeError('The Agent SQL integer exceeds JavaScript integer precision.');
+    return number;
+  });
+}

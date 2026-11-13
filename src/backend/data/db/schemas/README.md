@@ -1,0 +1,34 @@
+# Data DB Schemas
+
+Mobile Drizzle schemas migrated from the desktop `src/main/data/db/schemas` directory.
+
+## Scope
+
+- Keep table names, column names, indexes, constraints, and schema comments aligned with desktop
+  unless mobile has a documented runtime compatibility reason to diverge.
+- `_columnHelpers.ts` mirrors desktop `_columnHelpers.ts` but keeps Expo-compatible UUID generation
+  for drizzle-kit and React Native runtime loading.
+- Agent, Agent tool binding, Agent Session, Skill, MCP, file, job, painting, provider/model, preference,
+  and AI usage tables are the active mobile subset. Knowledge, translate, miniapp, and Agent
+  workspace domains are not migrated yet.
+- Skill tables match desktop except that `agent_global_skill` omits `namespace` and appends the
+  mobile `manifest`, `profile`, and `invocation` columns; see
+  [Agent Skills](../../../../../docs/references/agent/agent-skills.md#persistence-and-lifecycle).
+- Mobile adds `agent_session_message_created_id_idx` to support bounded global history scans for
+  short search terms that cannot use the trigram index. It changes no persisted message fields.
+- Mobile adds `agent_session_forked_from_created_id_idx` to paginate an expanded conversation's
+  direct children in stable creation order. It changes no persisted session fields.
+
+- Native SSH connection configuration uses a dedicated MMKV store, outside the SQLite schema.
+  See [SSH connections](../../../../../docs/references/ssh.md).
+
+## Migration Flow
+
+Released databases upgrade from the initial schema baseline through journaled migrations. See
+[Database Migrations](../../../../../migrations/README.md) for the upgrade rules.
+
+After changing a schema file, run `pnpm db:generate` and add the generated SQL import to
+`src/backend/data/db/migrations.ts` so Expo can bundle the migration.
+
+Custom SQL that Drizzle cannot generate, such as Agent Session message FTS5 and triggers, is
+executed idempotently through `src/backend/data/db/customSql.ts`.

@@ -1,0 +1,5 @@
+/** App-owned bootstrap Skill: available even before the user has installed any packages. */
+export const FIND_SKILLS_INSTRUCTIONS = `## Built-in Skill: find-skills
+Check local Skill names and descriptions by task meaning, across languages; follow list_local_skills pagination if the catalog is truncated. Pass supplied URLs unchanged to find_skills or install_skill; otherwise search with concise keywords. Never invent URLs, run package managers or fetch installation scripts through another tool.
+Choose by task fit and source, not popularity. Ask when choices materially differ. Install only when the user intends to add a Skill, never for a search-only or comparison request. install_skill validates, saves and enables the package for this Agent; saved scripts provide no interpreter or proof of execution.
+Report the installed name and source. If availableThisTurn is true, call load_skill with its skill_id and continue with available tools; otherwise explain it cannot load automatically this turn. Explain missing capabilities; never claim a saved or read script ran.`;

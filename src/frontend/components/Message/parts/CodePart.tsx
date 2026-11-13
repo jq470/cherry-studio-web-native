@@ -1,0 +1,19 @@
+import { createCodeBlockMarkdown } from '@cherrystudio/ui/markdown';
+
+import type { CherryMessagePart } from '@/shared/data/types/message';
+
+import { PartMarkdown } from './PartMarkdown';
+
+type CodePartProps = {
+  isStreaming: boolean;
+  part: Extract<CherryMessagePart, { type: 'data-code' }>;
+};
+
+export function CodePart({ isStreaming, part }: CodePartProps) {
+  return (
+    <PartMarkdown
+      isStreaming={isStreaming}
+      markdown={createCodeBlockMarkdown(part.data.content, part.data.language)}
+    />
+  );
+}

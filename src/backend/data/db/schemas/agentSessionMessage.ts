@@ -1,0 +1,167 @@
+import { sql } from 'drizzle-orm';
+import {
+  type AnySQLiteColumn,
+  check,
+  index,
+  integer,
+  sqliteTable,
+  text,
+  uniqueIndex,
+} from 'drizzle-orm/sqlite-core';
+
+import type {
+  AgentErrorView,
+  AgentInferenceSnapshotV1,
+  AgentMessagePart,
+  JsonValue,
+} from '@/shared/contracts/agent';
+import type { MessageStats } from '@/shared/data/types/message';
+import type { MessageTranslations } from '@/shared/data/types/messageTranslation';
+
+import { createUpdateTimestamps, uuidPrimaryKeyOrdered } from './_columnHelpers';
+import { agentSessionTable } from './agentSession';
+import { userModelTable } from './userModel';
+
+/** Protocol parts and optional reading aids. The migration journal owns format upgrades. */
+export type AgentMessageData = {
+  parts: AgentMessagePart[];
+  translations?: MessageTranslations;
+};
+
+/**
+ * Agent Session Message table - one row per message-tree node
+ * (docs/references/agent/agent-persistence.md).
+ *
+ * Messages form an adjacency-list tree aligned with Desktop's `message` table:
+ * `parentId` points at the previous message, and the Session's `activeNodeId`
+ * selects the leaf whose ancestor chain is the visible and model-facing
+ * history. There is no turn table: `turnId` correlates one question with all of
+ * its answers, and the Host projects `AgentTurnView` from an assistant row plus
+ * its live in-memory state.
+ * searchableText is the visible plain text the store writes for FTS5
+ * indexing; see AGENT_SESSION_MESSAGE_FTS_STATEMENTS below.
+ */
+export const agentSessionMessageTable = sqliteTable(
+  'agent_session_message',
+  {
+    id: uuidPrimaryKeyOrdered(),
+    // FK to agent_session - CASCADE: delete messages when the session is deleted
+    sessionId: text()
+      .notNull()
+      .references(() => agentSessionTable.id, { onDelete: 'cascade' }),
+    // Previous message in the tree; NULL only for a Session's first question.
+    // CASCADE matches Desktop: turn deletion reparents surviving children first.
+    parentId: text().references((): AnySQLiteColumn => agentSessionMessageTable.id, {
+      onDelete: 'cascade',
+    }),
+    // 0 = ordinary branch; >0 = answers of one multi-model question under the same parent.
+    siblingsGroupId: integer().notNull().default(0),
+    // Correlation id for one question and its answers; nullable per protocol (system rows)
+    turnId: text(),
+    // Message role: user, assistant, system — no virtual root row
+    role: text().notNull(),
+    // Main content - protocol parts (inline JSON)
+    data: text({ mode: 'json' }).$type<AgentMessageData>().notNull(),
+    // Protocol message lifecycle status
+    status: text().notNull(),
+    // Message-owned runtime timing and desktop-aligned materialized statistics.
+    stats: text({ mode: 'json' }).$type<MessageStats>(),
+    // Terminal turn diagnostics, including cancellation reasons that have no
+    // inline data-error part. Historical Turn views are not reconstructed today.
+    error: text({ mode: 'json' }).$type<AgentErrorView>(),
+    // Runtime-owned opaque context artifact. The Host validates its version,
+    // anchor, and byte size before saving or replaying it.
+    contextCheckpoint: text({ mode: 'json' }).$type<unknown>(),
+    // Model identifier: FK to user_model(id) — UniqueModelId "providerId::modelId"
+    modelId: text().references(() => userModelTable.id, { onDelete: 'set null' }),
+    // Versioned Agent inference snapshot. Keep raw JSON so unknown future
+    // versions can be projected as unsupported without losing the message.
+    inferenceSnapshot: text({ mode: 'json' }).$type<AgentInferenceSnapshotV1 | JsonValue>(),
+    // Visible plain text of data.parts' text parts, written by the store and
+    // mirrored into FTS5 by triggers; mid-stream snapshots leave it unchanged.
+    searchableText: text().notNull().default(''),
+    // Stable integer surrogate for the FTS5 content_rowid: trigger-assigned,
+    // local-only, and nullable because the AFTER INSERT trigger fills it.
+    ftsRowid: integer(),
+    ...createUpdateTimestamps,
+  },
+  (t) => [
+    index('agent_session_message_session_created_idx').on(t.sessionId, t.createdAt),
+    // Mobile short-word search scans bounded global history windows between input events.
+    index('agent_session_message_created_id_idx').on(t.createdAt, t.id),
+    index('agent_session_message_turn_id_idx').on(t.turnId),
+    // Children lookups for branch switchers and the FK cascade; the Session column finds a
+    // Session's first questions, whose parent is NULL.
+    index('agent_session_message_parent_id_idx').on(t.parentId, t.sessionId),
+    // Backs boot reconciliation of unsettled messages. Plain, not partial —
+    // Drizzle binds `status = ?`, which SQLite can't match to a partial index.
+    index('agent_session_message_status_idx').on(t.status),
+    // Pending rows include queued follow-ups; Pi serializes execution within each working copy.
+    // FTS5 content_rowid key — UNIQUE so its index keeps the per-row
+    // MAX(fts_rowid)+1 assignment O(log N) (see ftsRowid and FTS SQL below).
+    uniqueIndex('agent_session_message_fts_rowid_uniq').on(t.ftsRowid),
+    check('agent_session_message_role_check', sql`${t.role} IN ('user', 'assistant', 'system')`),
+    check(
+      'agent_session_message_status_check',
+      sql`${t.status} IN ('pending', 'streaming', 'success', 'error', 'cancelled', 'interrupted')`,
+    ),
+  ],
+);
+
+export type AgentSessionMessageRow = typeof agentSessionMessageTable.$inferSelect;
+export type InsertAgentSessionMessageRow = typeof agentSessionMessageTable.$inferInsert;
+
+/**
+ * FTS5 SQL statements for agent session message full-text search.
+ *
+ * Drizzle does not manage virtual tables or triggers, so these run through
+ * `customSql.ts` after migrations. The index is keyed on the stable
+ * `fts_rowid` column (NOT the implicit rowid, which a table rebuild or VACUUM
+ * would reshuffle).
+ *
+ * The store writes `searchable_text` as the visible plain text of `text` parts
+ * (`toSearchableText`); SQL cannot strip Markdown. The triggers only mirror
+ * that column into the index, so a write that leaves it untouched, such as a
+ * mid-stream snapshot, does not re-tokenize the row.
+ */
+export const AGENT_SESSION_MESSAGE_FTS_STATEMENTS: string[] = [
+  `CREATE VIRTUAL TABLE IF NOT EXISTS agent_session_message_fts USING fts5(
+    searchable_text,
+    content='agent_session_message',
+    content_rowid='fts_rowid',
+    tokenize='trigram'
+  )`,
+
+  // DROP+CREATE so trigger-body changes take effect on existing DBs.
+  `DROP TRIGGER IF EXISTS agent_session_message_ai`,
+  `DROP TRIGGER IF EXISTS agent_session_message_ad`,
+  `DROP TRIGGER IF EXISTS agent_session_message_au`,
+
+  // Trigger: assign fts_rowid and index searchable_text on INSERT. MAX+1 is
+  // race-free under withWriteTx serialization and O(log N) via
+  // agent_session_message_fts_rowid_uniq.
+  `CREATE TRIGGER agent_session_message_ai AFTER INSERT ON agent_session_message BEGIN
+    UPDATE agent_session_message SET
+      fts_rowid = (SELECT COALESCE(MAX(fts_rowid), 0) + 1 FROM agent_session_message)
+    WHERE id = NEW.id;
+    INSERT INTO agent_session_message_fts(rowid, searchable_text)
+    SELECT fts_rowid, searchable_text FROM agent_session_message WHERE id = NEW.id;
+  END`,
+
+  // Trigger: sync FTS on DELETE
+  `CREATE TRIGGER agent_session_message_ad AFTER DELETE ON agent_session_message BEGIN
+    INSERT INTO agent_session_message_fts(agent_session_message_fts, rowid, searchable_text)
+    VALUES ('delete', OLD.fts_rowid, OLD.searchable_text);
+  END`,
+
+  // Trigger: re-index when searchable_text changes. fts_rowid is stable after
+  // insert, so the index always holds the column's current value and the
+  // delete below removes exactly what was indexed.
+  `CREATE TRIGGER agent_session_message_au AFTER UPDATE OF searchable_text ON agent_session_message
+  WHEN OLD.searchable_text IS NOT NEW.searchable_text BEGIN
+    INSERT INTO agent_session_message_fts(agent_session_message_fts, rowid, searchable_text)
+    VALUES ('delete', OLD.fts_rowid, OLD.searchable_text);
+    INSERT INTO agent_session_message_fts(rowid, searchable_text)
+    VALUES (NEW.fts_rowid, NEW.searchable_text);
+  END`,
+];

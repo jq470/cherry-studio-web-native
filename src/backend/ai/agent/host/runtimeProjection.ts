@@ -1,0 +1,118 @@
+/**
+ * Runtime output projected onto the Agent Protocol. The Host is the only
+ * adapter between the two; neither side's shape leaks through the other.
+ * `turnRuntimeInput.ts` owns the opposite direction.
+ */
+
+import {
+  AgentApprovalViewSchema,
+  AgentMessagePartSchema,
+  type AgentApprovalView,
+  type AgentErrorView,
+  type AgentMessagePart,
+} from '@/shared/contracts/agent';
+import { createAiFailure } from '@/shared/utils/createAiFailure';
+
+import type { RuntimeApproval, RuntimeError, RuntimeOutputPart } from '../runtime';
+
+export function toAgentErrorView(error: RuntimeError): AgentErrorView {
+  return { code: 'EXECUTION_FAILED', ...createAiFailure(error) };
+}
+
+export function toAgentMessagePart(part: RuntimeOutputPart): AgentMessagePart {
+  if (part.type === 'error')
+    return AgentMessagePartSchema.parse({
+      id: part.id,
+      type: 'data-error',
+      data: toAgentErrorView(part.error),
+    });
+  if (part.type === 'source-url' || part.type === 'data-search-suggestions')
+    return AgentMessagePartSchema.parse(part);
+  if (part.type === 'file') {
+    return AgentMessagePartSchema.parse({
+      id: part.id,
+      type: 'file',
+      fileEntryId: part.ref.fileEntryId,
+      mediaType: part.mediaType,
+      filename: part.name,
+      purpose: part.purpose,
+    });
+  }
+  if (part.type === 'tool') {
+    const runtimeOutput = part.output
+      ? (() => {
+          const { modelImages: _images, ...persistent } = part.output;
+          return persistent;
+        })()
+      : undefined;
+    const output = runtimeOutput?.failure
+      ? {
+          value: {
+            status: 'error',
+            error: {
+              code: runtimeOutput.failure.error.code,
+              message: runtimeOutput.failure.error.message,
+              retryable: runtimeOutput.failure.error.retryable,
+            },
+            details: runtimeOutput.value,
+          },
+          artifacts: runtimeOutput.artifacts,
+        }
+      : runtimeOutput
+        ? {
+            value: runtimeOutput.value,
+            artifacts: runtimeOutput.artifacts,
+            ...(part.toolRef.source === 'builtin' && runtimeOutput.modelValue !== undefined
+              ? { modelValue: runtimeOutput.modelValue }
+              : {}),
+            ...(part.toolRef.source === 'mcp'
+              ? {
+                  ...(runtimeOutput.modelContent
+                    ? { modelContent: runtimeOutput.modelContent }
+                    : {}),
+                  ...(runtimeOutput.mcpApp ? { mcpApp: runtimeOutput.mcpApp } : {}),
+                  ...(runtimeOutput.mcpSource ? { mcpSource: runtimeOutput.mcpSource } : {}),
+                }
+              : {}),
+          }
+        : undefined;
+    return AgentMessagePartSchema.parse({
+      id: part.id,
+      type: 'dynamic-tool',
+      toolCallId: part.toolCallId,
+      toolRef: part.toolRef,
+      toolName: part.providerName,
+      title: part.displayName,
+      state: part.state,
+      ...(part.input !== undefined ? { input: part.input } : {}),
+      ...(part.inputPreview !== undefined ? { inputPreview: part.inputPreview } : {}),
+      ...(part.progress !== undefined ? { progress: part.progress } : {}),
+      ...(output !== undefined ? { output } : {}),
+      ...(part.approvalId !== undefined ? { approvalId: part.approvalId } : {}),
+      ...(part.error !== undefined ? { error: toAgentErrorView(part.error) } : {}),
+    });
+  }
+  return AgentMessagePartSchema.parse({
+    id: part.id,
+    type: part.type,
+    text: part.text,
+    ...(part.type === 'reasoning' && part.hasText !== undefined ? { hasText: part.hasText } : {}),
+    state: part.state,
+  });
+}
+
+export function toAgentApprovalView(
+  approval: RuntimeApproval,
+  sessionId: string,
+): AgentApprovalView {
+  return AgentApprovalViewSchema.parse({
+    id: approval.id,
+    sessionId,
+    turnId: approval.turnId,
+    toolCallId: approval.toolCallId,
+    toolRef: approval.toolRef,
+    displayName: approval.displayName,
+    input: approval.input,
+    status: approval.status,
+  });
+}

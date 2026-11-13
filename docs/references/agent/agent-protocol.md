@@ -1,0 +1,1038 @@
+# Cherry Agent Protocol
+
+The experimental [Pi Durable migration](./pi-durable-migration.md) adopts native forks, queued
+input, and archive. Existing local sessions retain their business identity when their history is
+handed to Pi. Regenerating a completed answer adds a sibling answer in the same Session, while
+retrying a failed leaf answer stays in place; deleting a turn hides it and omits it from later model
+context; session removal archives after explicit stop. Ordinary submissions can queue while an
+answer streams; retries, deletion, and forks still require idle. The per-turn local
+behavior descriptions below are historical where they conflict with the migration document. The PC
+adapter keeps its existing operations and transport.
+
+> Status: Version 1 is as-built for device-local execution. A PC Agent Controller extension is
+> implemented as the separate application-facing version 2 contract; device verification is pending.
+
+This document defines the application-facing contract consumed by the Agent Client. Today that
+contract is provided in process by the Mobile Agent Host. The PC Agent Controller keeps the
+contract next to the application while a separate adapter translates between it and a PC-owned
+Agent Runtime. This document does not define either the local [Agent Runtime](./agent-runtime.md) or
+the separately versioned PC connection protocol.
+
+## Scope
+
+The protocol owns the product meaning the mobile application consumes: Session and message views,
+turn and tool lifecycle, approval presentation, user commands, and recovery of visible state from
+an authoritative snapshot. It does not own model execution or the transport used to reach the
+execution owner.
+
+Version 1 uses an in-process interface. Operation inputs, results, snapshots, and events are
+JSON-safe values validated at the boundary. Subscription callbacks and unsubscribe handles are
+process-local transport mechanics, not protocol data. JSON safety keeps application values
+portable; this document does not define a network wire protocol.
+
+For the PC Agent Controller, the PC owns the Agent, Session, conversation, execution, tool,
+approval, task, and persistence state. Mobile consumes normalized application events, maintains
+only the projection needed by its UI, and sends user intent such as a message, cancellation, or
+approval decision back through the adapter. The adapter may eventually use WebSocket, WebRTC, or
+another transport; that choice does not change the Agent Protocol.
+
+Version 1 remains local-only and its TypeScript shapes below are still the as-built contract. The
+PC extension is documented separately in [PC Agent Controller extension](#pc-agent-controller-extension).
+The implemented subset and PC gaps are specified in [PC Agent Controller](./pc-agent-controller.md).
+See also [Agent Architecture](./README.md#pc-agent-controller-boundary).
+
+The protocol does not expose provider SDK objects, Runtime-native events, SQLite rows,
+`AbortSignal`, streams, callbacks inside values, or implementation-specific Pi/provider-SDK state.
+
+## Ownership
+
+| Layer | Owns | Does not own |
+| --- | --- | --- |
+| PC Agent Runtime | Agent execution, authoritative Session state, tools, approvals, tasks, and persistence | Mobile rendering and network adaptation |
+| Mobile PC Agent Adapter | Transport, authentication handoff, ordering, reconnection, replay, and mapping PC data into application values | Agent execution semantics and UI presentation |
+| Agent Protocol | Normalized views, application events, user commands, capabilities, and application-level errors | WebSocket/WebRTC frames, acknowledgements, heartbeats, or Runtime-native events |
+| Mobile UI | Rendering a temporary projection and collecting user intent | Authoritative conversation or execution state |
+
+The local path still uses the Mobile Agent Host and Pi Runtime in process. The PC adapter is a
+separate path; the table does not retroactively describe Version 1 internals.
+
+## PC Agent Controller extension
+
+This section records the broader target contract. The implemented version 2 contract is
+`src/shared/contracts/agent/controller.ts`, translated by `RemoteAgentAdapter`. Current PC wire v1
+provides full snapshots, admission receipts and on-demand details rather than deltas, replay, or
+background-task control. Those differences are explicit in [the implementation](./pc-agent-controller.md);
+the requirements below must not be interpreted as already supported PC capabilities.
+
+### Required application semantics
+
+The full target protocol covers the following mobile-visible behavior:
+
+- An authoritative Session snapshot containing the visible transcript window, active turn,
+  streaming message, pending approvals, background work, and a cursor for older messages. Mobile
+  must not depend on its local Agent Data API to reconstruct a PC-owned Session.
+- Incremental message and tool lifecycle events normalized into stable application parts. A tool
+  may expose input generation, execution, progress, streamed output, final output, denial, failure,
+  or interruption without sending an ever-growing argument or output object on every delta.
+- A submission disposition of `started`, `queued`, `redirected`, or `rejected`. The result must say
+  whether the PC opened a turn, queued a follow-up, or injected the input into active work instead
+  of assuming every accepted message creates a new turn immediately.
+- Approval states for `pending`, `approved`, `denied`, `cancelled`, and `expired`. Responding to an
+  approval must distinguish an accepted decision from an already-resolved or stale request.
+- Opaque PC resource references for attachments and generated artifacts. Mobile receives stable
+  display metadata and asks the adapter to open or download content; a PC path never becomes mobile
+  authority and a mobile `fileEntryId` never identifies a PC-owned file.
+- Runtime activities that have a mobile consumer: API retry, context compaction, context usage,
+  supported commands, autonomous turns, background work, background-task progress, and parented
+  subagent output. Internal PC events remain hidden when the mobile product has no presentation or
+  command for them.
+- Dynamic capabilities describing which commands the connected PC Session accepts, including
+  redirect, queue, cancellation, approval response, task stop, attachments, and optional Session
+  management operations.
+- Application-level failures such as unavailable Session, rejected command, stale approval, and
+  unavailable resource. Transport failure remains adapter connection state rather than a
+  conversation event.
+
+The minimum mobile-to-PC command surface is message submission, active-turn cancellation, approval
+response, and background-task stop. Session creation, rename, deletion, fork, retry, and command
+execution enter the protocol only when the corresponding mobile feature is planned and the PC
+advertises support.
+
+### Adapter boundary
+
+The adapter maps PC Runtime DTOs and events into the normalized snapshots and deltas above, and maps
+mobile commands back into PC operations. It exclusively owns:
+
+- WebSocket, WebRTC, HTTP, or any later transport choice;
+- pairing, authentication, encryption, and endpoint discovery;
+- event sequence numbers, acknowledgements, replay cursors, resume tokens, and idempotency keys;
+- connection heartbeat, reconnect policy, framing, compression, and backpressure; and
+- compatibility with the PC Runtime's native event names and payload versions.
+
+If the UI needs a connection banner, the adapter may expose connection state beside the Agent
+Protocol. Connection mechanics do not become conversation events. One adapter instance may bind one
+PC source; the application protocol does not introduce a global source registry until a concrete
+multi-PC product flow requires one.
+
+### Version 1 migration constraints
+
+The PC extension must be introduced as a versioned contract rather than reinterpreting local-only
+fields:
+
+- keep PC Agent control separate from the Mobile Agent Runtime;
+- do not use mobile `UniqueModelId` or local inference snapshots as PC execution authority;
+- do not use mobile managed-file ids for PC attachments or artifacts;
+- do not restrict PC tools to the current local built-in/MCP identity union; and
+- do not copy PC-owned Session rows into the local Host store as a second source of truth.
+
+The sections below describe the current Version 1 implementation unless they explicitly say
+otherwise.
+
+## Values
+
+```ts
+type JsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | JsonValue[]
+  | { [key: string]: JsonValue }
+
+type AgentView = {
+  id: string
+  name: string
+}
+
+type AgentToolRef =
+  | { source: 'builtin'; capabilityId: string }
+  | { source: 'mcp'; serverId: string; rawToolName: string }
+
+type AgentMessageToolRef = AgentToolRef | { source: 'meta'; name: string }
+
+type AgentSessionView = {
+  id: string
+  agentId: string
+  name: string
+  isNameManuallyEdited: boolean
+  forkBoundaryMessageId: string | null
+  forkedFromSessionId: string | null
+  createdAt: string
+  updatedAt: string
+}
+```
+
+Mobile Agent always runs in this app through the Host-owned Runtime. No execution-target field
+is sent or persisted. Runtime ids and Pi/provider-SDK implementation details remain private.
+
+`agentId` identifies the application-owned Agent configuration — the definition the user edits in the
+application (instructions, model, tool-approval preference, and MCP extensions). That configuration
+is live: before each turn, the Host resolves its current state and builds the Runtime execution
+request from it, so an application-level edit applies from the next turn. Shared system
+capabilities are not Agent configuration. The frontend selects web search per Session and snapshots
+that selection into each submission, while image generation is selected by the submission that
+needs it. Configuration never selects a different engine or device: `local` always means Pi running
+in this mobile app. The client does not duplicate configuration or select an implementation.
+
+### Turn
+
+One submitted user input creates one turn and one assistant response.
+
+```ts
+type AgentTurnView = {
+  id: string
+  sessionId: string
+  status:
+    | 'running'
+    | 'awaiting-approval'
+    | 'awaiting-input'
+    | 'cancelling'
+    | 'completed'
+    | 'failed'
+    | 'cancelled'
+    | 'interrupted'
+  assistantMessageId: string
+  error: AgentErrorView | null
+  isRetrying?: boolean
+  startedAt: string
+  endedAt: string | null
+}
+```
+
+`isRetrying` marks a running turn whose provider attempt failed and is being retried
+automatically. A failed attempt does not produce `error` or a transcript error until the run ends
+with a failure or interruption.
+
+Version 1 has one execution per turn and at most one active turn per Session. It has no execution
+entity, follow-up queue, steering, autonomous turn, or background task.
+
+### Message
+
+```ts
+type AgentMessageView = {
+  id: string
+  sessionId: string
+  turnId: string | null
+  role: 'user' | 'assistant' | 'system'
+  status: 'pending' | 'streaming' | 'success' | 'error' | 'cancelled' | 'interrupted'
+  parts: AgentMessagePart[]
+  stats: MessageStats | null
+  modelId: UniqueModelId | null
+  inferenceSnapshot: AgentInferenceSnapshotView | null
+  createdAt: string
+  updatedAt: string
+}
+
+type AgentMessagePart =
+  | { id: string; type: 'source-url'; sourceId: string; url: string; title?: string }
+  | { id: string; type: 'data-search-suggestions'; data: { html: string } }
+  | {
+      id: string
+      type: 'data-compaction-anchor'
+      data: CompactionAnchorData
+    }
+  | {
+      id: string
+      type: 'text' | 'reasoning'
+      text: string
+      state: 'streaming' | 'done'
+    }
+  | {
+      id: string
+      type: 'file'
+      fileEntryId: string
+      mediaType: string
+      filename?: string
+      purpose: 'input-attachment' | 'artifact'
+    }
+  | {
+      id: string
+      type: 'dynamic-tool'
+      toolCallId: string
+      toolRef: AgentMessageToolRef
+      toolName: string
+      title: string
+      state:
+        | 'input-streaming'
+        | 'input-available'
+        | 'awaiting-approval'
+        | 'running'
+        | 'output-available'
+        | 'denied'
+        | 'error'
+        | 'interrupted'
+      input?: JsonValue
+      progress?: { calls: { id: string; name: string; title?: string; args: string;
+        status: 'pending' | 'running' | 'ok' | 'error' | 'interrupted' }[] }
+      output?: JsonValue
+      approvalId?: string
+      error?: AgentErrorView
+    }
+  | {
+      id: string
+      type: 'data-error'
+      data: AgentErrorView
+    }
+
+type AgentInferenceSnapshotV1 = {
+  version: 1
+  model: {
+    uniqueModelId: UniqueModelId
+    providerId: string
+    modelId: string
+    apiModelId?: string
+    name: string
+  }
+  reasoningEffort?: string
+  parameters: { temperature?: number; maxOutputTokens?: number }
+  tools: Array<{
+    ref: AgentToolRef
+    providerName: string
+    displayName: string
+    approval: 'auto' | 'ask' | 'deny'
+  }>
+}
+
+type AgentInferenceSnapshotView =
+  | { status: 'supported'; snapshot: AgentInferenceSnapshotV1 }
+  | { status: 'unsupported'; raw: JsonValue }
+```
+
+Part ids are stable within a message. The protocol owns these normalized parts; neither Pi nor a
+provider SDK shape leaks through the boundary. Text parts may contain Markdown, but tool calls and
+results remain structured protocol parts and are not flattened into display Markdown.
+
+Application tool failures use the ordinary error result envelope:
+`{ value: { status: 'error', error: { code, message, retryable }, details? }, artifacts: [] }`.
+Optional `details` retains the application's result, including successful sources and per-input
+lookup failures. Runtime-only stop policy is not persisted or replayed as execution authority.
+
+Every file part records a managed `fileEntryId` that existed when the part was written, together
+with stable display metadata such as name and media type; protocol values never use absolute device
+paths or transient import URIs as authority. The managed entry may later be deleted, in which case
+the historical part remains visible but its content is unavailable. User input is imported before
+submission. Before reservation, the Host verifies the live entry and managed blob, rejects client
+metadata that differs from the entry, and persists the authoritative name and media type with
+`purpose: 'input-attachment'`. A tool that produces an Office
+document, image, or edited file keeps its structured tool result and also emits a part with
+`purpose: 'artifact'` so the assistant message durably owns the reference. Artifact content is not
+automatically projected as a model attachment in later history. MCP results can separately retain
+explicit managed image references in `modelContent`; only those verified artifacts may be
+rehydrated for an image-capable model. `modelImages` bytes never cross this persisted protocol. See
+[Agent Tools And Controlled Resources](./agent-tools-and-resources.md#tool-results-and-artifacts).
+
+Current JPEG, PNG, GIF, and WebP inputs are admitted only when the authoritative entry and blob,
+selected model capability, Pi endpoint adapter, and centralized request limits all pass before
+reservation. Available historical user images are projected again for an image-capable model;
+missing historical content is omitted without deleting or rewriting the message. The temporary
+Data URL exists only inside the Host-to-Runtime request.
+
+Text inputs accept authoritative `text/*` media types and an explicit application/source-code
+media-type and extension allowlist. The Host reads managed bytes before reservation, accepts and
+strips a leading UTF-8 BOM, rejects invalid UTF-8, NUL, unsupported types, and
+oversized current files, then projects a temporary structured Runtime part. Pi JSON-escapes that
+part as untrusted user text with the authoritative name, media type, and `[complete]` or
+`[truncated]` state; its body cannot alter the system/tool instruction layer or expand the Turn
+resource ledger. Historical text read failures are omitted without rewriting the persisted file
+part. Extracted text never enters protocol values or persistence.
+
+`AgentToolRef` is the stable application capability identity used by configuration, approval,
+snapshots, persistence, and audit. A message-only `meta` ref records a user-visible model-loop
+activity such as catalog search without claiming that an application capability ran; meta refs
+cannot enter configuration, approval, or inference snapshots. `providerName` is the deterministic
+function alias used in model history; `displayName` is a snapshot for historical UI. For every
+persisted tool call, `output-available`, `denied`, `error`, and `interrupted` are terminal states with
+a paired normalized `RuntimeToolResult` JSON projection. A built-in result may retain a full display
+`value` plus an optional compact `modelValue` for replay when its instructions are already supplied
+in the system context; runtime-only instruction contribution metadata is not a protocol field.
+Optional MCP `modelContent`, host-issued `mcpApp` linkage, and `mcpSource` resource fingerprints
+survive persistence; these grant no authority without current connection and Agent checks.
+No finalized message contains a tool left
+in `input-streaming`, `input-available`, `awaiting-approval`, or `running`. A failed catalog dispatch
+persists only its requested target name and normalized error, never unresolved parameters.
+
+`input-streaming` is a live lifecycle signal and may omit `input`; consumers must not interpret it as
+an executable call until the part advances to `input-available`.
+
+Assistant token counts are exposed once, in `stats`. The invocation ledger materializes those
+counts; finalization uses the Host's Runtime aggregate only when no ledger projection exists.
+`message.finalized` and subsequent transcript reads carry the same persisted statistics.
+
+Display reads preserve valid parts when another part is malformed or unsupported, replacing only
+that part with a `data-error` carrying `MESSAGE_UNREADABLE`. The stored JSON remains unchanged.
+Runtime history reads remain strict and never replay these display-only placeholders.
+
+Image-model submissions may include `imageGeneration: { mode, paramValues }` on both
+`startSession` and `submitMessage`. The Host resolves the selected model, validates the image mode
+and attachments, and captures these settings in the ordinary assistant inference snapshot. Image
+results are assistant artifact file parts in the same Session; they do not enter painting history.
+
+Every accepted assistant placeholder carries the selected `modelId` and a versioned inference
+snapshot committed in the same reservation transaction. The snapshot is Agent-owned and does not
+reuse the Chat `MessageSnapshot`: it records only request model facts, explicit inference options,
+and the frozen tool identity/policy catalog. It never records credentials, endpoints, headers,
+tool schemas, callbacks, Data URLs, or device paths. A missing value is a pre-snapshot message and
+stays `null`; an unknown or invalid persisted version is projected as `unsupported` with its raw
+JSON preserved rather than making the message unreadable or reconstructing it from current Agent
+configuration.
+
+### Input and approval
+
+```ts
+type AgentInputPart =
+  | { type: 'text'; text: string }
+  | { type: 'file'; fileEntryId: string; mediaType: string; filename?: string }
+
+type AgentApprovalView = {
+  id: string
+  sessionId: string
+  turnId: string
+  toolCallId: string
+  toolRef: AgentToolRef
+  displayName: string
+  input: JsonValue
+  status: 'pending' | 'approved' | 'denied' | 'cancelled'
+}
+
+type AgentCapabilities = {
+  reasoning: boolean
+  tools: boolean
+  approvals: boolean
+  attachments: boolean
+}
+```
+
+`assistant` remains the standard message role; the configurable product entity is always `Agent`.
+
+Every pending approval ends with `approval.resolved`. When its execution is interrupted, the status
+is `cancelled`; this withdraws the request without recording a user denial, even while sibling
+answers continue running.
+
+Cancellation is required by the Runtime contract and is therefore not a capability flag.
+Capabilities are a stable projection of what the Host's local engine contract can
+represent. `tools: true` means Pi supports tool-loop protocol parts; it does not mean the Agent has a
+tool configured, that OS permission is granted, or that execution is approved. The Host resolves
+those effective gates for every turn. The Agent Client may branch on protocol capabilities, never on
+Runtime identity.
+
+## Operations
+
+```ts
+interface AgentProtocol {
+  getSessionStatus(sessionId: string): AgentSessionStatus | null
+  subscribeSessionStatus(sessionId: string, listener: () => void): () => void
+  getSessionStatusIds(): readonly string[]
+  subscribeSessionStatuses(listener: () => void): () => void
+
+  renameSession(input: { sessionId: string; name: string }): Promise<AgentSessionView>
+  deleteSession(input: { sessionId: string }): Promise<void>
+  deleteTurn(input: { sessionId: string; turnId: string }): Promise<void>
+  forkSession(input: {
+    sessionId: string
+    fromMessageId: string
+    name?: string
+  }): Promise<AgentSessionView>
+
+  startSession(input: {
+    sessionId: string
+    userMessageId: string
+    assistantMessageId: string
+    agentId: string
+    parts: AgentInputPart[]
+    modelId?: UniqueModelId
+    additionalReplies?: { modelId: UniqueModelId; assistantMessageId: string }[]
+    reasoningEffort?: ReasoningEffortOption
+  }): Promise<AgentSessionView>
+
+  submitMessage(input: {
+    sessionId: string
+    userMessageId: string
+    assistantMessageId: string
+    parts: AgentInputPart[]
+    modelId?: UniqueModelId
+    additionalReplies?: { modelId: UniqueModelId; assistantMessageId: string }[]
+    reasoningEffort?: ReasoningEffortOption
+  }): Promise<{ turnId: string; userMessageId: string; assistantMessageId: string }>
+
+  retryMessage(input: { sessionId: string; messageId: string; modelId?: UniqueModelId }): Promise<AgentSessionView | void>
+  editUserMessage(input: {
+    sessionId: string
+    messageId: string
+    text: string
+    modelId?: UniqueModelId
+    additionalReplies?: { modelId: UniqueModelId; assistantMessageId: string }[]
+    reasoningEffort?: ReasoningEffortOption
+    imageGeneration?: AgentImageGeneration
+    skillIds?: string[]
+    skillAction?: SkillAction
+  }): Promise<void>
+  editMessage(input: { sessionId: string; messageId: string; parts: { id: string; expectedText: string; text: string }[] }): Promise<AgentMessageView>
+  selectMessage(input: { sessionId: string; messageId: string }): Promise<AgentSessionView>
+
+  cancelTurn(input: { sessionId: string; turnId: string; messageId?: string }): Promise<void>
+  cancelQueuedInput(input: { sessionId: string; turnId: string }): Promise<'withdrawn' | 'already-started' | 'not-found'>
+  cancelSubmission(input: { sessionId: string }): Promise<void>
+
+  respondApproval(input: {
+    sessionId: string
+    turnId: string
+    approvalId: string
+    decision: 'approve' | 'deny'
+  }): Promise<void>
+
+  observeSession(
+    sessionId: string,
+    listener: (event: AgentEvent) => void,
+  ): Promise<AgentSessionObservation>
+}
+
+type AgentSessionObservation = {
+  snapshot: AgentSessionSnapshot
+  unsubscribe(): void
+}
+
+type AgentSessionStatus = Readonly<{
+  turnId: string
+  status: AgentTurnView['status']
+}>
+```
+
+`getSessionStatus` returns a stable, immutable snapshot of the latest turn run in the current Host
+generation, or `null` if there is none. `subscribeSessionStatus` notifies only when that snapshot
+changes; consumers subscribe and then read the snapshot. These in-process list observers do not
+load messages or open Runtime sessions. Terminal status remains available after chat observers
+unsubscribe, clears on Session deletion, and resets with the Host generation. Completion read
+receipts are frontend-owned, per turn, and live only for the app process, matching Desktop.
+`getSessionStatusIds` enumerates the Sessions with such a snapshot; `subscribeSessionStatuses`
+notifies when any snapshot changes or is removed. Collapsed catalog groups combine these status
+values with metadata paths and read receipts, without opening transcripts or Runtime sessions.
+
+`startSession` is the Draft-to-Session boundary. It performs the same write-free turn preparation
+as `submitMessage`, opens the Runtime, and then atomically creates the durable Session together with
+the first user message and assistant placeholder. A failed Draft submission therefore leaves no
+empty Session. The client observes and navigates to the returned Session only after this operation
+succeeds. The chat Draft does not create a Session directly.
+
+The chat send action allocates UUID v7 message IDs, and a Session ID for a new conversation,
+before awaiting either operation. It immediately displays the submitted text, files, and assistant
+waiting row with those IDs. The store uses the supplied IDs only after preparation succeeds;
+allocating an ID does not create a record. Turn IDs and record timestamps remain backend-owned.
+
+Normal return means admission succeeded; execution continues through the existing events. Events
+and history use the same IDs as the immediate rows, so the UI merges them regardless of whether an
+event arrives before or after the function returns. The current composer keeps one pending send
+until both messages have formal data. Its preallocated Session ID also keeps the first message list
+mounted through navigation and history loading. Admission rejection restores the draft; execution
+errors belong to the accepted transcript.
+
+Stop works before a turn exists. Preparation (tool discovery, attachment reading, model preflight,
+and Runtime open) has no turn id, so the client stops it with `cancelSubmission`, which aborts the
+Session's submission, retry, or Draft start still in admission. The pending call rejects with
+`CANCELLED` and the composer restores the draft without a failure notice. A stop that lands while
+the reservation commits leaves a reserved turn that settles as `cancelled` without running. Once
+the turn is reserved, the client uses `cancelTurn`.
+
+`modelId` and `reasoningEffort` are immutable snapshots of the composer state for that submission.
+The model snapshot closes the gap while the same selection is persisted to the Agent. The reasoning
+snapshot is turn-local and is never written to Agent configuration. Omitting either field inherits
+the Agent definition loaded for that turn; an explicit reasoning `default` uses the selected model's
+default instead of the Agent's configured effort.
+
+Built-in tool availability is resolved from model support, platform, permissions and service
+configuration when the Host freezes the turn's tool snapshot; it has no per-Agent capability
+switches or submission flags. The assistant's inference snapshot
+records the concrete tools frozen for the turn, so history does not depend on reconstructing
+configuration state.
+
+`forkSession` copies the selected branch up to and including `fromMessageId` into a new idle Session,
+and is the only operation that creates a Session from existing history. It is refused with
+`SESSION_BUSY` while the source Session has an active turn, so the fork point is always a clean cut
+(see [Branching](#branching)). The new Session is not observed by the operation; the client
+navigates to it and observes it like any other Session.
+
+`name` defaults to the source's. The client supplies it because a derived name is localized copy
+and the Host has no locale: it resolves the app language only to tell a naming model which language
+to write in, and never composes user-visible text itself.
+For a fork created during this Host's lifetime, its first admitted user message triggers the
+existing first-message title and summary naming policy once. This is runtime-only workflow state;
+no naming marker is stored in the database. Later submissions do not reset the title, and a manual
+rename of the fork cancels the pending reset.
+
+`deleteTurn` removes one settled turn from a Session. The unit is the turn because replayed
+history pairs every `tool-call` with its `tool-result`; the client resolves the pressed message to
+its turn rather than deleting a row, and offers the action from the assistant toolbar rather than
+the long-press menu, which stays non-destructive. The Host refuses the operation while the Session has an
+active turn — the same clean-cut rule a fork applies — and refuses a turn whose own rows have not
+settled. It clears any context checkpoint that may have summarized the removed turn, then
+publishes `turn.deleted` so observers drop the rows from live state.
+When the client also names a `messageId` and that answer has siblings, deletion removes only that
+answer and its descendants. The shared question and other answers remain, and observers receive
+`messages.deleted` with the exact removed ids. A single-answer question keeps turn deletion.
+
+Deletion is not an undo. A turn's tool calls already changed the one real world, and erasing their
+record does not reverse them; the Agent simply no longer sees that it made them. Replacing an
+answer is [Manual answer retry](#manual-answer-retry), and reopening an earlier question is a fork
+(see [Branching](#branching)); neither undoes side effects either.
+
+`observeSession` registers the listener and captures the snapshot as one Host operation, so an
+event cannot fall into a snapshot/subscription gap. Calling it again replaces stale frontend state;
+the protocol does not need event sequence, host epoch, replay buffers, or revision counters in
+version 1. Observation admission is serialized with Session deletion: an observation already
+loading must finish or fail before rows are removed, and one overlapping the deletion barrier fails
+with `SESSION_BUSY` rather than returning a snapshot for a deleted Session.
+
+## Events
+
+```ts
+type AgentEvent =
+  | { type: 'context.updated'; status: 'compacting' | 'compaction-failed' | null }
+  | { type: 'context.usage.updated'; usages: AgentContextUsage[] }
+  | { type: 'runtime.failed' }
+  | { type: 'question.updated'; question: AgentPendingQuestion | null }
+  | { type: 'session.updated'; session: AgentSessionView }
+  | { type: 'turn.updated'; turn: AgentTurnView }
+  | { type: 'message.created'; message: AgentMessageView }
+  | { type: 'message.delta'; messageId: string; delta: AgentMessageDelta }
+  | { type: 'message.finalized'; message: AgentMessageView }
+  | { type: 'message.edited'; message: AgentMessageView }
+  | { type: 'turn.deleted'; turnId: string; messageIds: string[] }
+  | { type: 'approval.requested'; approval: AgentApprovalView }
+  | { type: 'approval.resolved'; approval: AgentApprovalView }
+
+type AgentMessageDelta =
+  | { op: 'part.add'; index: number; part: AgentMessagePart }
+  | { op: 'text.append'; partId: string; text: string }
+  | { op: 'tool.input.preview'; partId: string; preview: AgentToolInputPreview }
+  | { op: 'part.replace'; part: AgentMessagePart }
+
+type AgentContextUsage = { messageId: string; tokens: number; estimated?: boolean }
+```
+
+`text.append` applies only to text and reasoning parts. State changes replace the addressed part;
+there is no untyped patch object.
+
+Durable facts commit before their events publish. Streaming deltas are ephemeral; a fresh observer
+gets the accumulated streaming message from the snapshot.
+
+`context.updated` and `runtime.failed` describe the local engine, not a turn, and persist nothing.
+`context.updated` reports a running or failed context compaction; the snapshot repeats the current
+value as `contextStatus`. `runtime.failed` means the engine's storage session closed after a failure:
+the client shows a retry action, and refreshing the Session reopens the engine and resumes
+unfinished work.
+
+`context.usage.updated` replaces the current working-context counts for the Session. Each value is
+anchored to the answer of its newest placed input, so a selected branch cannot consume another
+copy's count. Pi derives occupancy from effective model context, including retained output and
+compaction summaries, rather than cumulative consumption. Background compaction publishes a new
+count while idle; the snapshot repeats the current list as `contextUsages`. Without a matching Pi
+copy, the Host estimates the saved checkpoint and normalized history without creating runtime
+storage or executing a model. Such values, and native content estimates, carry `estimated: true`.
+Runtime failure clears these values until observation is restored.
+
+Compaction history uses Desktop-compatible `data-compaction-anchor` parts, in transcript order:
+
+```ts
+type CompactionAnchorData = {
+  status: 'compacting' | 'done' | 'skipped'
+  phase: 'turn-start' | 'in-loop' | 'agent-session'
+  trigger?: 'manual' | 'auto'
+  startedAt?: string // ISO timestamp
+  completedAt?: string // ISO timestamp
+  preTokens?: number
+  postTokens?: number
+  durationMs?: number
+  foldedCount?: number
+}
+```
+
+The local Pi Durable runtime reports a running or failed compaction through `context.updated` and
+adds no anchor; anchors remain the PC Agent's vocabulary and the stored form of earlier local
+transcripts. Where a Host does insert them, it adds one `compacting` part per attempt using
+`part.add`, then replaces that same id with `done` or `skipped`. Every `part.add` index is the Host transcript position, so parts that follow an
+anchor keep their order for live observers. Each attempt has a distinct id. Only completed anchors enter streaming snapshots
+and terminal persistence; skipped, cancelled, or still-running attempts leave no historical marker.
+Completed anchors survive later turn failure or interruption. Recovery also removes transient anchors.
+`turn-start` marks a preflight fold and `in-loop` one between tool batches, with `trigger: 'auto'`;
+`agent-session` and `manual` retain their Desktop vocabulary without adding commands.
+Optional measurements are omitted when unavailable; Mobile does not infer `foldedCount` from tool parts.
+
+Turn-start anchors render as a dashed separator outside the process disclosure. In-loop anchors remain
+inside the process at their original position. The marker has no detail disclosure and never contains
+summary text or tool payloads. The model-history adapter excludes these presentation parts. A marker
+records an event; it does not turn an execution-local summary into a durable checkpoint.
+
+## Snapshot and recovery
+
+```ts
+type AgentSessionSnapshot = {
+  agent: AgentView
+  session: AgentSessionView
+  capabilities: AgentCapabilities
+  activeTurn: AgentTurnView | null
+  queuedInputs: { turnId: string; userMessage: AgentMessageView; assistantMessageId: string }[]
+  activeUserMessage: AgentMessageView | null
+  hasHistoryBeforeActiveTurn: boolean | null
+  streamingMessage: AgentMessageView | null
+  additionalMessages?: AgentMessageView[] // includes settled siblings of active answers
+  pendingApprovals: AgentApprovalView[]
+  pendingQuestion: AgentPendingQuestion | null
+  contextStatus?: 'compacting' | 'compaction-failed' | null
+  contextUsages?: AgentContextUsage[]
+}
+```
+
+Persisted transcript pagination remains a normal data read and is not duplicated in the runtime
+snapshot. The snapshot contains only live state that must be composed over persisted messages. An
+active turn includes its user row and whether older history precedes it, so a newly created
+Session can render its first exchange immediately without waiting behind the history-layout cover.
+
+`queuedInputs` is the durable follow-up inbox in submission order; `queue.updated` replaces its
+membership. These inputs appear above the composer and do not create transcript rows in the live
+projection. Local history requests `settledOnly`, excluding unsettled message pairs before paging
+and render-window selection; observation supplies each active turn's question and all its answers,
+including completed siblings, until the turn settles. `cancelQueuedInput`
+atomically withdraws only waiting work: `already-started` preserves the active run and asks the
+client to reconcile observation. Withdrawal cleans up only its own reservation, so another input
+being admitted cannot be mistaken for an interrupted submission. The active-turn stop operation
+retains its existing semantics.
+
+`steerQueuedInput({ sessionId, turnId })` promotes one waiting input to **Steer** (**引导** in
+Chinese). Pi replaces its follow-up submission with a steer submission in one native commit,
+preserving display message IDs and using a stable replacement request ID for deduplication.
+Acceptance removes the composer queue item and exposes its question followed by a pending
+assistant placeholder in the transcript. The current invocation finishes at Pi's execution
+boundary; subsequent output fills that same assistant message below the steer question. An input that
+already started returns `already-started` without aborting anything; a failed commit leaves the
+follow-up queued. Native admission handles the idle race by starting the accepted input.
+
+Accepted steers form an inbox prefix in their acceptance order. Pi uses `steeringMode: 'all'`
+and `followUpMode: 'one-at-a-time'`, so a final boundary can take that prefix and one follow-up
+without reversing the transcript. Inputs coalesced at the same boundary share generation;
+earlier empty assistant placeholders settle in place and output belongs to the last input.
+
+Parent links follow execution order, including steering a later queue item ahead of earlier ones.
+Live rendering, pagination, history reconstruction and forks use that order rather than reservation
+timestamps. Earlier output stays with its original question, and accepted steer questions remain
+visible across remounts while awaiting their execution boundary.
+
+Steering and confirmed withdrawal maintain predecessor metadata in the same Pi commit as the
+inbox mutation. Withdrawal resolves the current predecessor and repairs surviving successors;
+it does not reuse the parent captured before the operation. The Host reads these confirmed
+relationships directly, in per-lane ordered reconciliation, before writing Cherry history.
+Delayed observations cannot persist their older display parents. Display projection is not an
+authority for stored relationships, and recovery reconciles each execution chain independently.
+
+Relationship reconciliation does not infer or select a queue tail. A successful reorder may
+explicitly request an old-tail-to-new-tail selection change, applied with the relationship writes
+only if the old tail is still selected. Recovery and parallel model siblings preserve the user's
+selection. If Cherry persistence fails after native acceptance, the operation remains accepted;
+unsettled receipts allow subsequent reconciliation without submitting the input again.
+
+`contextStatus: 'compacting'` means the reply is waiting for context compaction. Compaction that
+runs ahead of the threshold in the background does not delay the reply and is not reported.
+
+On route remount or foreground transition, the client creates a new observation and replaces its
+live projection with the returned snapshot. On process restart, the Host reconciles unfinished
+local turns to `interrupted`, replaces their non-terminal tool parts with `interrupted` parts carrying
+normalized results, and removes live approvals; version 1 does not resume execution. Recovery runs
+after the first paint, so the Host publishes `message.finalized` for every reconciled assistant
+message: an observer attached before recovery refreshes in place instead of showing a stale
+pending placeholder until the Session is reopened.
+
+## Errors
+
+```ts
+type AgentErrorView = {
+  code:
+    | 'AGENT_NOT_FOUND'
+    | 'SESSION_NOT_FOUND'
+    | 'MESSAGE_NOT_FOUND'
+    | 'MESSAGE_UNREADABLE'
+    | 'SESSION_BUSY'
+    | 'CAPABILITY_UNSUPPORTED'
+    | 'ATTACHMENT_INVALID'
+    | 'ATTACHMENT_UNAVAILABLE'
+    | 'ATTACHMENT_METADATA_MISMATCH'
+    | 'APPROVAL_NOT_FOUND'
+    | 'EXECUTION_UNAVAILABLE'
+    | 'EXECUTION_FAILED'
+    | 'CANCELLED'
+    | 'INTERRUPTED'
+  message: string
+  retryable: boolean
+  failure?: AgentFailureSnapshot
+}
+
+type AgentFailureSnapshot = {
+  version: 1
+  reasonCode:
+    | 'auth'
+    | 'permission'
+    | 'region'
+    | 'model_not_found'
+    | 'quota'
+    | 'rate_limit'
+    | 'context_length'
+    | 'payload_too_large'
+    | 'network'
+    | 'proxy_tls'
+    | 'stream_interrupted'
+    | 'content_filter'
+    | 'provider_unavailable'
+    | 'timeout'
+    | 'invalid_input'
+    | 'tool_limit'
+    | 'tool_failed'
+    | 'mcp'
+    | 'parse'
+    | 'internal'
+    | 'unknown'
+  source: {
+    layer: 'provider' | 'runtime' | 'host' | 'tool'
+    name?: string
+    code?: string
+  }
+  context?: {
+    statusCode?: number
+    providerId?: string
+    modelId?: string
+    finishReason?: string
+    responseBody?: string
+  }
+}
+```
+
+`EXECUTION_FAILED` remains the closed protocol envelope. New execution failures carry the
+versioned `failure` snapshot so source identity is not overwritten by that envelope. The outer
+`message` and `retryable` fields are the single authoritative facts; the nested snapshot does not
+duplicate them. `failure` is optional so historical persisted rows remain readable. Native errors,
+request bodies, credentials, and stack traces stay behind the Host boundary.
+
+`message` is diagnostic text, not user-facing copy. The Host writes it in English for logs and
+tests, and the frontend derives every displayed string from the closed vocabulary instead: the
+composer maps a rejected submission's `code` to a translation, the transcript error part maps
+`failure.reasonCode` (or `code` for `INTERRUPTED` and `MESSAGE_UNREADABLE`) to a translated title, and a tool part translates
+its status. The error part never renders `message` inline. Tapping it opens a detail sheet that
+shows `message`, the failure snapshot facts, and `context.responseBody` verbatim: diagnostic
+detail the user explicitly asked for, kept so a provider failure can be investigated in place.
+
+## Invariants
+
+1. A Session has at most one active turn.
+2. An admitted submission reserves the user message and assistant placeholder before execution.
+3. Every admitted turn reaches exactly one terminal state.
+4. No content event is accepted after the turn becomes terminal.
+5. Terminal message and turn state commit before terminal events publish.
+6. Cancellation is idempotent and settles as `cancelled` or `interrupted`, not `failed`.
+7. Approval responses correlate to the active Session, turn, and approval and fail closed.
+8. A new observation is sufficient to reconstruct all live UI state.
+9. Every protocol value survives a JSON round trip and re-validates against its schema.
+10. The client supplies an Agent identity; the Host owns the local Runtime binding.
+11. Tool identity is a stable `AgentToolRef`; provider aliases and display names are not authority.
+12. Every finalized tool call is terminal and reconstructs as a paired model tool call/result.
+13. Every file part uses a managed id rather than a raw path; deleted content remains an unavailable
+    historical reference, and artifact parts are not implicit model attachments.
+14. A Draft Session becomes durable in the same transaction that reserves its first message pair.
+
+## Editing an answer
+
+`editMessage` replaces text parts of any successful answer, including answers with later turns or
+on another branch: the prose between tool calls as well as the final result. Each part names its
+current `expectedText`; reasoning, files and tool receipts cannot be edited, because a changed
+reasoning block either breaks its provider signature or never reaches the model, and tool records
+describe what actually ran. The Session must be idle. Empty text, duplicate parts and stale text are
+rejected; a `MESSAGE_CONFLICT` asks the client to read the message again. The operation preserves
+message/turn/part IDs, reasoning and billed usage; it clears the old translation and updates search
+text. It never starts a model request, reruns a tool or regenerates later answers: they stay as they
+were, and later model requests see the edited text in their place.
+
+The authoritative edit, context checkpoints and history revision commit together. The
+[Pi Durable editing flow](./pi-durable-migration.md#editing-a-completed-reply) either keeps native
+copies current with a context replacement or fences them out for reconstruction. A committed
+`message.edited` event replaces the client's row and invalidates its transcript query. Local answers
+offer **Edit reply** in their menu, which opens the `/edit-reply` page; remote sources do not
+advertise this capability.
+
+## Manual answer retry
+
+`retryMessage({ sessionId, messageId, modelId? })` answers a settled question again.
+
+**A successful answer, or one that later questions continue, is regenerated as a sibling.** The
+Host reserves a new answer below the same question, selects it, and submits the original input with
+the original model; the earlier answer and its continuations stay in the tree (see
+[Branching](#branching)). **Naming a `modelId` answers with that model and always adds a sibling**,
+even below a failed answer: the user asked for another answer, not a repair. It submits the original
+question without the original reasoning effort or image settings, which belong to the original
+model. **A failed, interrupted or cancelled leaf answer is retried in place**: no
+later message responds to it, so replacing it rewrites nothing. The store checks the leaf inside the
+reservation transaction. The Host holds the Session's admission guard throughout preparation and
+reservation; running, awaiting-approval, cancelling, and admitting Sessions reject retry with
+`SESSION_BUSY`, and the frontend disables the action while the Session is busy.
+
+An in-place replacement keeps the answer's message id and tree position and takes a fresh turn id,
+which its sibling answers share. The original user message is reused; retry never creates a
+Session or navigates away. Model context stops at that original question.
+
+A **resumed** retry applies to a failed, interrupted, or cancelled answer that completed at least
+one tool call. Its recorded prefix through the last completed tool result survives; the unfinished
+model response after it is discarded. Pi continues from the original input and those
+tool-call/result pairs without a synthetic user message. Tool errors stay visible so the model can
+recover; interrupted calls have unknown outcomes and must not be blindly repeated. The prefix keeps
+the tool record alone: the previous attempt's compaction anchors are dropped, because the
+replacement plans context afresh and emits its own. The prefix is budgeted as current-turn input,
+so compaction can summarize history around it but never the prefix itself.
+
+A **restarted** retry applies to a successful answer, and to an unfinished one with no completed
+tool call. The old answer is discarded outright and the message restarts empty. Because that
+discarded attempt may already have changed the outside world without leaving any trace the model
+can read, the system prompt tells it to inspect current state before repeating an externally
+visible action. Retry does not undo tool effects and promises nothing about exactly-once execution.
+
+Approvals and tool availability are resolved afresh. The original model and inference parameters
+are reused when the snapshot is supported; current credentials, instructions, permissions, and
+attachment availability are revalidated. Preparation failure leaves the original transcript
+unchanged. Each retry has fresh runtime timing; the replaced answer retains cumulative provider
+usage and costs, because the invocation ledger is immutable and both attempts really were billed.
+Recovery uses persisted facts, not provider stream offsets: process death can lose unflushed
+output, and retry does not promise byte-level continuation.
+
+Retry reads history through the same checkpoint path as a submission, skipping the checkpoint on
+the answer it replaces: a retry in a compacted Session neither rereads the summarized transcript
+nor resumes from a summary of content it is discarding. Admission is therefore as slow as a
+submission's, and it has no new rows to show for it. When retrying an unfinished answer without
+choosing a model, the frontend renders it as empty and pending from the press until the reserved
+one arrives — the same state a just-sent message shows — so a rejected admission restores the
+untouched answer. A successful answer or an explicit model selection keeps the original answer
+visible while its sibling is prepared. Admission makes the Session busy immediately and remains
+cancellable before a turn is reserved.
+
+## Editing a question
+
+`editUserMessage` answers a settled user question anew with edited `text` and the composer's
+current model and send settings. It never rewrites the question in place.
+
+**The edit branches beside the original question.** The Host validates the stored user row,
+rejects busy Sessions with `assertIdle` and `syncSession(requireIdle)`, and owns one admission
+boundary. It passes the question's parent explicitly into shared submission: `null` selects the
+root for a first-question edit, while an omitted parent on normal sends means the current selected
+leaf. Normal target planning, `chooseLanes(parent)` and `submitTargets` prepare one or several
+answers. The shared `reserveSubmission` transaction inserts the sibling question and its pending
+answer or answers and selects the first answer. No dedicated edit reservation is used.
+
+The original question, its answers and all descendants remain unchanged. Editing does not create
+another Session, invalidate unrelated working copies or advance `runtimeRevision`. Native
+continuation or Pi `fork(at)` uses the shared lane planner with its normal rebuild fallback.
+A missing/non-user question is rejected with `MESSAGE_NOT_FOUND`; unfinished work is rejected with
+`SESSION_BUSY` rather than entering the normal-send queue.
+
+The content payload stays text-based. The Host derives retained input from the stored question,
+remaps each original plugin, Skill and selection reference independently to non-overlapping
+occurrences in the edited text, then sorts by new offset. Removed mentions are dropped, so reordering
+A/B to B/A does not lose B. Stored file parts are carried unchanged through normal submission
+admission. Missing or mismatched managed files reject preparation rather than being silently
+filtered from the edit. Preparation failure leaves the original exchange unchanged.
+
+The composer's `modelId`, `additionalReplies`, reasoning effort, image-generation and applicable
+Skill settings define the new answers. Omitted model/effort/image-generation overrides use current
+Agent defaults, not the original answer's inference snapshot. Stored Skill selections/actions are
+inherited only when neither corresponding composer field is supplied; supplied Skill settings go
+through normal validation. Current credentials, instructions, permissions and attachment availability
+are revalidated by the shared submission path.
+
+The local message actions distinguish `editQuestion` (branch and resubmit) from `editAnswer`
+(in-place reply prose editing). Question editing is not added to remote contracts. Edit remains
+visible but disabled while the Session is busy, awaiting approval or admitting work. It loads and
+focuses the existing composer, with an Editing question row, cancel action and retained-file count.
+Attachment actions are hidden; model, reasoning and multi-model controls stay available. Switching
+to another question reloads that question's text without replacing the original interrupted draft
+stash. Re-selecting the same question preserves its in-progress revision.
+
+Entry stashes the complete prior composer draft and attachments. Cancellation or accepted submission
+restores that stash; failed admission keeps the edited text and editing state. Blank, unchanged and
+busy edits cannot send, including direct invocation. Dismissing the keyboard does not end editing.
+The transcript outlines the edited question and labels its original continuation while keeping
+readable descendant text and controls at full contrast. The continuation label adds layout height.
+
+There are no optimistic question rows: the new question and pending answers arrive through Host
+events. Live projection includes question sibling metadata immediately, consistent with history.
+The right-aligned previous/position/next pager remains available during generation. Selecting an old
+version restores that branch's latest continuation without cancelling the running answer or deleting
+either exchange. Native light/dark, keyboard/focus/scroll and screen-reader acceptance remain to be
+verified on a device; source-derived web fixtures do not establish those results.
+
+## Branching
+
+A Session's messages form a tree (see [Agent Persistence](./agent-persistence.md)). The Session's
+selected leaf decides both the visible transcript and the next submission's history; the answers a
+question has, and the questions an answer has, are alternatives the client can switch between.
+
+- **Parallel answers.** A submission with `additionalReplies` asks several models the same question.
+  The question gets one answer per model in one sibling group, sharing the turn id; the first is
+  selected. Each runs separately, can be stopped alone with `cancelTurn({ messageId })`, and may use
+  only tools declared read-only. Read-only means a declared
+  `effect: 'read'`: built-in web, calendar, reminder and location reads, workspace listing, search
+  and file reads, Office file inspection and content reads, and file-library search, reads and
+  listings; a plugin tool its bundled policy declares a read; a third-party MCP tool its server
+  annotates with `readOnlyHint`. Remote annotations are server claims, not an enforced sandbox;
+  execution refuses a frozen read when the latest catalog revokes that annotation. MCP and plugin
+  reads follow the Agent's approval mode. Built-in
+  reads that still ask after it are consents, such as location or health data, and stay out, as do
+  `ask_user_question`, `run_js` and Code Mode. The Session's one background reply surfaces the
+  first pending decision of any answer. Skills and image generation are refused. The Session
+  stays busy until every answer settles; a selected completed answer's send control is disabled
+  while another answer runs. Observation includes the completed siblings of active answers because
+  settled history omits their shared turn until all answers finish. Every parallel submission
+  meanwhile is rejected with
+  `SESSION_BUSY`. Only a follow-up to the newest answer of a running single-answer copy can queue,
+  in that copy's native Pi inbox. Pi queues input, not configuration: a follow-up to a parallel
+  answer needs a different model and tool set, and changing a copy's configuration applies from its
+  next request, which would reach the answer still running. Cherry does not emulate a queue around
+  this.
+- **Switching.** `selectMessage` selects the branch containing a message. Switching never calls a
+  model and never stops work on another branch; it restores the newest continuation below the chosen
+  alternative.
+- **Continuing.** A submission always continues the selected leaf: the answer the client shows is
+  the one the next question follows. To continue an earlier answer, the client selects it first.
+- **Regeneration.** Regenerating a settled answer reserves a sibling answer to the same question and
+  selects it. Answering with another model (`retryMessage` with `modelId`) does the same with the
+  chosen model, adding one more answer to the question.
+- **Editing.** Editing a settled question (`editUserMessage`) reserves a sibling question under the
+  same parent, reserves its requested answer or answers below it, and selects the first answer; the original question and its
+  continuations stay in the tree as an alternative branch. The edited question shows its sibling
+  versions in the transcript, so either exchange can be selected.
+- **Fork.** `forkSession({ sessionId, fromMessageId })` still creates a new Session and copies the
+  selected branch up to the fork point, without its sibling alternatives, inside one transaction.
+  Turns and approvals are not copied; the new Session starts idle.
+- **Workspace.** The workspace binding belongs to the Session, not to a branch. Every branch and
+  every parallel answer uses it, switching never changes it, and rebinding applies to every branch
+  from the next submission. Each admitted answer records the folder it captured, so recovery after a
+  restart uses that folder. A fork copies the binding.
+
+Rules:
+
+1. A fork point must be a clean cut: a message boundary whose turn is terminal. The Host rejects
+   the operation outright while the source Session has an active turn, and the store rejects an
+   anchor whose own row has not settled. Unsettled rows before the anchor are skipped rather than
+   copied, so a fork never carries a placeholder that will never resolve.
+2. Sessions record `forkedFromSessionId` so clients can name and open the direct source, plus
+   `forkBoundaryMessageId`, which names the copied Message inside the new Session that closes its
+   inherited prefix. The client synthesizes a display-only divider after that Message when the
+   paginated history window contains it; no annotation Message or Message Part enters persistence
+   or model context. Deleting the source clears both fields and leaves the fork intact.
+3. History keeps past tool calls and results verbatim. A branch, switch or fork opens or shows
+   another future; it does not undo executed side effects, and results in a branch reflect the world
+   when they ran. Copied messages keep their original `createdAt` for the same reason.
+
+Branches present alternatives in one conversation even though tool side effects were real in each
+of them; parallel answers are limited to reads for that reason, and the transcript never claims a
+switch reverted anything.
+
+### User-question responses
+
+`respondQuestion({ sessionId, turnId, toolCallId, answer })` resolves the active question only.
+The answer contains `selectedOptionIds`, `text`, and `skipped`; selection membership/cardinality,
+nonempty responses, and skip exclusivity are validated before consuming the waiter. Duplicate,
+stale, or cross-turn responses cannot execute the continuation again. `question.updated` carries
+an `AgentPendingQuestion` or `null`; observation snapshots include the pending question so returning
+to a live conversation can reopen its sheet. The question belongs to the current Host generation,
+not a durable queue. After process restart, ordinary interrupted-tool reconciliation applies.

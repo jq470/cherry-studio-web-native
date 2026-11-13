@@ -1,0 +1,152 @@
+import { queryOptions, useQueries, useQueryClient } from '@tanstack/react-query';
+import { useCallback, useMemo } from 'react';
+
+import { fileEntryPreviewKind } from '@/frontend/components/FileEntryPreview';
+import { queryKeys, useBackendModule, useInfiniteQuery } from '@/frontend/data';
+import type { FileEntry } from '@/shared/data/types/file';
+import type { LibraryFile } from '@/shared/data/types/fileLibrary';
+
+const FILE_ENTRY_PAGE_SIZE = 30;
+
+export type ResolvedFileEntry = {
+  libraryFile?: LibraryFile;
+  entry: FileEntry;
+  previewUri: string | undefined;
+  uri: string | undefined;
+};
+
+type FileUriPageResult = {
+  data: ResolvedFileEntry[] | undefined;
+  error: Error | null;
+  isPending: boolean;
+  refetch: () => Promise<unknown>;
+};
+
+type FilePreviewResult = {
+  data: ResolvedFileEntry | undefined;
+};
+
+/** Shared cursor pages and batched previews for the library and attachment picker. */
+export function useFileEntryPages({
+  enabled,
+  folderId,
+}: {
+  enabled: boolean;
+  folderId?: string | null;
+}) {
+  const file = useBackendModule('file');
+  const queryClient = useQueryClient();
+  const query = useInfiniteQuery('/files/library', {
+    enabled,
+    query: { folderId },
+    limit: FILE_ENTRY_PAGE_SIZE,
+  });
+  const pages = useMemo(
+    () => query.pages.map((page) => ({ ...page, items: page.items.map((item) => item.entry) })),
+    [query.pages],
+  );
+  const libraryFiles = useMemo(
+    () =>
+      new Map(
+        query.pages.flatMap((page) => page.items.map((item) => [item.entry.id, item] as const)),
+      ),
+    [query.pages],
+  );
+  const uriPageQueries = useMemo(
+    () =>
+      pages.map((page) =>
+        queryOptions({
+          enabled,
+          // Page membership changes after deletion. Keep surviving files visible
+          // while the new page resolves, using their existing per-file previews.
+          placeholderData: () => {
+            const cachedEntries = page.items.flatMap((entry) => {
+              const cached = queryClient.getQueryData<ResolvedFileEntry>(
+                queryKeys.files.previewUri(entry),
+              );
+              return cached ? [{ ...cached, entry }] : [];
+            });
+            return cachedEntries.length > 0 ? cachedEntries : undefined;
+          },
+          queryFn: async (): Promise<ResolvedFileEntry[]> => {
+            const uris = await file.resolveUris(page.items);
+            return page.items.map((entry, index) => ({
+              entry,
+              previewUri: uris[index]?.previewUri,
+              uri: uris[index]?.uri,
+            }));
+          },
+          queryKey: queryKeys.files.previewUriPage(page.items),
+          retry: false,
+          staleTime: Infinity,
+        }),
+      ),
+    [enabled, file, pages, queryClient],
+  );
+  const combineUriPages = useCallback((results: readonly FileUriPageResult[]) => {
+    return {
+      entries: results.flatMap((result) => result.data ?? []),
+      failedPages: results.filter((result) => result.error),
+      isPending: results.some((result) => result.isPending),
+    };
+  }, []);
+  const uriPages = useQueries({ combine: combineUriPages, queries: uriPageQueries });
+  const previewQueries = useMemo(
+    () =>
+      uriPages.entries.map((item) => {
+        const needsPreview =
+          Boolean(item.uri) && fileEntryPreviewKind(item.entry) === 'image' && !item.previewUri;
+        return queryOptions({
+          enabled: enabled && needsPreview,
+          // Retain the original URI even before an image thumbnail is ready.
+          initialData: item,
+          initialDataUpdatedAt: needsPreview ? 0 : undefined,
+          queryFn: async (): Promise<ResolvedFileEntry> => ({
+            ...item,
+            previewUri: await file.generatePreviewUri(item.entry),
+          }),
+          queryKey: queryKeys.files.previewUri(item.entry),
+          retry: false,
+          staleTime: (query) => (query.state.dataUpdatedAt === 0 ? 0 : Infinity),
+        });
+      }),
+    [enabled, file, uriPages.entries],
+  );
+  const combinePreviews = useCallback(
+    (results: readonly FilePreviewResult[]) =>
+      results.map((result, index) => {
+        const item = uriPages.entries[index];
+        return fileEntryPreviewKind(item.entry) === 'image' ? (result.data ?? item) : item;
+      }),
+    [uriPages.entries],
+  );
+  const previews = useQueries({ combine: combinePreviews, queries: previewQueries });
+  const attachLibraryMetadata = useMemo(() => {
+    const cache = new WeakMap<ResolvedFileEntry, ResolvedFileEntry>();
+    return (item: ResolvedFileEntry, libraryFile: LibraryFile | undefined) => {
+      const previous = cache.get(item);
+      if (previous && previous.libraryFile === libraryFile) return previous;
+      const resolved = { ...item, libraryFile };
+      cache.set(item, resolved);
+      return resolved;
+    };
+  }, []);
+  const entries = useMemo(
+    () => previews.map((item) => attachLibraryMetadata(item, libraryFiles.get(item.entry.id))),
+    [previews, libraryFiles, attachLibraryMetadata],
+  );
+  const refreshPages = query.refresh;
+  const refresh = useCallback(async () => {
+    await Promise.all([refreshPages(), ...uriPages.failedPages.map((page) => page.refetch())]);
+  }, [refreshPages, uriPages.failedPages]);
+
+  return {
+    entries,
+    error: query.error ?? uriPages.failedPages[0]?.error ?? undefined,
+    hasNext: query.hasNext,
+    isLoading: entries.length === 0 && (!enabled || query.isLoading || uriPages.isPending),
+    isLoadingMore: query.isLoadingMore,
+    loadNext: query.loadNext,
+    refresh,
+  };
+}

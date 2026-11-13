@@ -1,0 +1,444 @@
+# Messages
+
+This module owns the shared rendering of structured user and assistant messages. Chat and
+painting provide domain state and composer layout; this module renders the virtualized message
+history, message rows and parts, viewport following, and scroll restoration.
+
+## Public Interface
+
+- `MessageList` renders a virtualized history from `MessageListItem` values and delegates
+  every row to the feature-owned `renderMessage` function.
+- `useMessageListDisclosureToggle` leaves live-edge following before a reader changes inline
+  content, including switching answers. Call it before the content-changing action; the list
+  retains ownership of reading position and scroll compensation.
+- `MessageListItem` contains only the persistence-neutral fields needed for rendering. Its optional
+  `stats.runtimeTiming` carries message-owned execution timing; `partKeys` carries source-owned part
+  identity beside the projected visual parts; `systemEvent` carries a feature-synthesized timeline
+  row such as a fork origin. Renderers never synthesize positional part identity when source
+  identity is available.
+- `MessageListProps` accepts layout measurements plus optional pagination, readiness, dataset
+  identity, bottom-accessory inputs, the feature renderer, and optional `extraData` for rendered
+  state that is not carried by message items. Optional `rowInsets` belongs to the list frame and
+  explicitly invalidates mounted rows when a selection layout changes their gutters or spacing.
+  `MessageListHandle` exposes begin/end direct interaction and bounded `scrollBy` so a feature's
+  edge drag reuses the list's follow state, reading anchors and scroll limits.
+  `bottomAccessoryHeight` reserves a floating composer's space through the keyboard adapter's
+  content inset; it also positions the return button and participates in visible-bottom checks.
+  The viewport remains fixed while the composer grows. Focus grows the composer while the keyboard
+  opens, so the keyboard-controller patch keeps a list that was at its end there: on Android the
+  keyboard frames include the composer inset and the inset reaction yields to them until the
+  keyboard settles. Closing rewinds only the keyboard's share of that pinned shift, so composer
+  growth during the open never pulls the list below its end.
+- `AssistantMessage` owns standard assistant content: the pending placeholder and structured parts.
+  Optional per-message `imageGeneration` settings select the shared image loader and its dimensions;
+  completed generated images use the same managed file renderer as other assistant artifacts.
+  Its `children` render after the message body, so a feature composes its own
+  accessory (a toolbar, for example) without teaching this module about that feature's state. The
+  slot is unconditional, including while the placeholder is up; an accessory holds the message and
+  decides for itself when to appear.
+- `UserMessage` owns standard user content, including managed attachments and the text bubble.
+  Its attachment slot accepts source-owned cards without a layout wrapper. Both local and remote
+  cards pass through `UserMessageAttachments`, which owns right alignment, wrapping, spacing, and
+  gesture exclusion above the bubble. Local cards draw a scanned PDF's recognition progress, and
+  a line under them lists what the model did not receive (unrecognized pages, truncation) from the
+  attachment reports. A pending reply's `inputFileEntryIds` lets it name that wait.
+  Its `quote` slot renders under the bubble in the same right-aligned column. The explicit
+  `selection` variant uses the narrower design-specified bubble column without changing normal rows.
+- `MessageSelectionActionProvider` adds one feature action beside Copy in the native menu of
+  selected Markdown in a message body; the action receives the message id and the selected plain
+  text. Text outside a message body (translations, previews, user plain text) offers none.
+- `getBuiltInToolDisplay` exposes the shared title and platform-specific icon used by
+  feature-owned tool approval UI.
+- `ToolRendererProvider` lets a source supply tool detail loading and presentation inside the
+  shared process layout, including localized titles for group summaries. Without a provider, tools keep the local built-in dispatch. Source-owned
+  renderers compose `MessagePart.Tool`; remote data never enters the local tool adapters.
+
+A feature composes an explicit role variant and gives `MessageList` a stable `renderMessage`.
+LegendList refreshes mounted rows through `itemKey`, `data`, and `extraData`; changing the renderer
+identity alone is not a data channel. Dynamic rendered state therefore arrives through changed
+message items, `extraData`, or a feature-owned context/store read inside the row.
+
+Each row renders inside an `ErrorBoundary`. A message that throws while rendering shows a short
+notice in its place instead of taking the conversation down, and renders again when its item,
+`extraData`, or the renderer changes.
+
+Part renderers, animation providers, and platform controls remain private implementation details.
+Callers import only from `@/frontend/components/Message`.
+
+A tool that returns managed artifacts already has them in the message: the Host persists each one
+as its own file part, right after the tool result that produced it. A per-tool renderer therefore
+renders the *call*, never the artifact, or the same file appears twice.
+
+`MessageParts` renders managed assistant outputs through `GeneratedFileStrip`. Images stay in the
+body in transcript order, so an image produced by a tool appears before its following explanation.
+Other files collect after the answer. `UserMessage` separately uses `UserMessageAttachments` for input
+attachments above its bubble. Two rules hold the assistant-result shape:
+
+- **Images are visible results.** They appear as soon as their file parts arrive and retain their
+  position relative to the final text when the message settles. They never enter the collapsed
+  process or repeat in the footer. Non-image files appear together at the end once the message
+  reaches a terminal status.
+- **Layout never reads `purpose`.** A file's purpose is a Runtime fact used to decide model replay,
+  not a presentation input. A transcript that arrives from a peer without one must lay out
+  identically, so the split keys on part and media type. Only assistant messages reach `MessageParts`
+  with files, because `UserMessage` lifts its own attachments out first.
+
+The model receives generated file ids, not public image URLs. Before rendering Markdown,
+`omitGeneratedImageReferences` removes standalone image paragraphs whose destination ends in an
+image file id already present in the same message. This prevents an invented preview URL from
+leaving an empty native image placeholder beside the real generated image. Code examples, inline
+prose, nested blocks, unrelated URLs, and stored transcript text remain unchanged.
+
+Neither file group carries a heading: whether a file was attached or produced follows from the role
+of the message it sits in.
+
+## Message Disclosure Contract
+
+Interactive message parts separate their compact presentation, interaction state, and expanded
+content. Tool renderers must compose these layers through the shared `MessagePart` primitives
+instead of creating feature-owned rows or sheets:
+
+| Layer | Owner | Contract |
+| --- | --- | --- |
+| Summary | `MessagePart.Summary` | Renders the title, status text, tone, running shimmer, and disclosure chevron. |
+| Interaction | `MessagePart.Tool` | Owns local open/close state and connects the summary press to its detail. Business renderers do not lift this transient state. |
+| Process | `MessagePart.Process` | After streaming settles, renders one neutral total-duration disclosure before the answer. Successful replies follow the process auto-collapse preference; interrupted replies retain the existing tool-group expansion rule. |
+| Grouping | `MessagePart.ToolGroup` | Owns the group summary row and inline step container. Defaults closed during both streaming and completion; the message retains manual group state across completion and outer folding. |
+| Detail shell | `MessagePart.Detail` | Owns the `BottomSheet`, title, dismissal, scrolling, content insets, and spacing. Tool and source details share this shell. |
+| Detail content | The part renderer | Supplies business content through shared sections; source cards and media retain their specialized renderers. |
+
+Tool summaries deliberately omit decorative icons and implementation-specific arguments. The
+adapter derives a localized action title and status text plus the semantic status tone; URLs,
+queries, and other invocation arguments remain available in the detail sheet instead of competing
+with the answer. It must not recreate the shared row geometry.
+
+`MessagePart.Tool` is the required outer composition for generic, MCP, web-search, write-file, and
+Meta tool calls. Those tool renderers remain separate while their detail semantics differ. A common
+summary row is not by itself a reason to merge their business adapters. Merge adapters only when
+they have the same dispatch rules, state interpretation, and detail-content contract.
+
+Tool details open at the shared compact height and can be dragged to the shared large height. Their
+reading order is outcome first and invocation arguments second. Running tools without an outcome
+show their available arguments, while failures put the error before those arguments. Artifact files
+stay in their own message parts and are never duplicated in the tool sheet. A successful file tool
+may summarize user-facing metadata such as its filename and size, but it does not expose internal
+entry ids or repeat the file body.
+
+Inline file content uses lightweight, read-only text without Markdown parsing or syntax highlighting.
+During generation, four stable line slots show the latest source text with a small per-line character
+budget. This live preview passes gestures to the message list and stays out of accessibility
+navigation because the tool summary already announces its state.
+
+Once input generation ends, completed arguments supply the full content in a height-capped scroll
+area. Long content uses virtualized text chunks with character and line budgets, so even minified
+files do not create one unbounded native text layout. Chunks preserve the full source and stable
+offset keys; only the viewport height is capped. Short content sizes naturally up to the same cap.
+The finished content supports scrolling and accessibility reading without selection, copying,
+editing, or link actions. Dragging it detaches the message list from live-edge following through
+the same reading-interaction boundary used by inline disclosures. If an interrupted call has no
+complete input, only its retained partial preview is available; completed input always takes
+precedence over that fallback.
+
+Reasoning expands inline: `MessagePart.Reasoning` owns the toggle and the left-rail container its
+markdown renders into, so a reader keeps their place in the transcript. While a response streams,
+its process has no total-duration wrapper. Narration, reasoning, and in-loop compaction markers
+between tool calls share one collapsed tool group; other visible parts separate groups. Reasoning
+without tools retains its existing disclosure. Once the response settles, every
+visible transcript part except the final result text moves into one `MessagePart.Process`
+row whose label is the message's total wall-clock duration. The `chat.process.auto_collapse`
+preference defaults to `true`: a successfully completed reply starts with its entire process
+collapsed, including any tool groups the reader opened while it streamed. Turning the preference
+off starts that outer process expanded. Paused and failed replies retain an already opened tool
+group's outer expansion. Later manual toggles are never overwritten by rerenders or preference
+changes. Inner reasoning and tool disclosures keep their existing manual behavior. Expanding the
+outer process reveals narration and tool groups in their original order.
+Messages without timing metadata use a plain process title instead of an invented duration. Source
+groups use a borderless row of overlapping favicons and their source count, while their expanded
+views must use `MessagePart.Detail`. The source group stays out of layout while the assistant is
+streaming and appears once the message reaches any terminal status. New
+interactive message parts may introduce a distinct compact trigger only when their semantics cannot
+be expressed by `MessagePart.Summary`; they must not introduce another bottom-sheet shell.
+
+A process uses tighter internal spacing than the separation between the process and the answer,
+both during streaming and when expanded after completion. Settled blank text parts are excluded
+from the visual partition so they cannot insert empty layout rows between status summaries.
+
+Local and remote messages use the same grouping. One or two action titles describe settled groups;
+larger mixtures use a neutral tool-activity title. Live activity labels remain visible for at least
+1.2 seconds while fast calls coalesce to the latest activity. Approval and error status changes
+bypass that delay. Pending approvals remain visible on tool groups. Individual tool rows retain
+their own failure and denial states; neither those states nor operation counts are promoted to the
+group or completed process. Opening a group mounts its single-line tool rows; only opening a remote
+tool's detail sheet reads its argument/result resources.
+
+A manual inline disclosure toggle is a reading interaction. Before changing local disclosure state,
+the part adapter notifies the list scroll controller, which leaves live-edge following and cancels
+any scheduled end correction. LegendList's size anchoring then keeps the tapped summary in place so
+the detail expands below it, even when the viewport started at the bottom.
+
+`partitionMessageParts` finds the last visible text part and leaves it alongside images in the
+article body. Earlier prose, reasoning, and tool calls enter the timed process disclosure. A text part
+followed by a tool is therefore treated as intermediate narration, not as the result. Provider-
+executed web searches render nothing; sources and non-image files retain their footer rows.
+
+An approved `generate_image` call that is still running leaves the process disclosure for the body,
+where `PendingImagePart` holds the requested shape with the shared `ImageGenerationLoader`. The
+image's own file part replaces it on success; a settled or failed call returns to the process
+disclosure as an ordinary tool row. Direct image-model turns use the same placeholder until their
+first part arrives.
+
+Automatic context compaction uses the Desktop-compatible `data-compaction-anchor` part. Turn-start
+markers stay visible as dashed separators before the process disclosure; in-loop markers remain
+between the corresponding tool steps inside it. Running markers show progress, completed markers
+show the estimated tokens saved when available, and skipped markers render nothing. The marker
+itself has no press target or detail disclosure. Summary text remains private to the Runtime.
+The local runtime adds no marker for its own compaction: a running or failed compaction is session
+status shown below the transcript, and stored completed markers still render.
+
+A script's tool calls render inside its tool part as a list of names, statuses and cut arguments:
+live while the script runs, and from the result's summaries once it finishes. Code Mode and stored
+`run_js` results share the JavaScript part, which shows the code as code.
+
+### Detail Content Status
+
+Default details align with the sheet header's horizontal inset and separate sections with spacing.
+CherryUI's `MessagePart.Section` owns the quiet heading, error indicator, and optional action;
+`SectionBody` owns the neutral rounded reading surface. Text, code, and metadata share the
+`code-block` surface token without nested cards. Metadata uses `MessagePart.ValueSection` fact rows;
+source lists keep their own card spacing and inset.
+
+The app's [MessageDetail](../MessageDetail/README.md) adapters render arguments as highlighted JSON,
+prose as selectable text, and scripts as highlighted code. Every text section has a compact copy
+action beside its heading. Copy uses the full original value, including beyond the visible preview.
+Generic and MCP output retain one shared text preview budget across all blocks and one copy action
+for the complete response. Image-only output has no text-copy action. Arbitrary tool text is not
+automatically treated as Markdown.
+
+Business adapters own output-before-arguments ordering, translations, and media. Errors mark the
+heading and keep the body readable in the normal foreground color. Long sections use bounded
+previews with a localized notice; full text stays available through copy. Extend these shared
+content primitives rather than introducing parallel sheet shells.
+
+### Renderer Inventory And Visual Acceptance
+
+The visible non-tool part adapters are Text, Reasoning, Code, Compact, Error, Translation, File,
+Compaction Anchor, Source URL/group, and Unknown. Pending is an assistant-row state rather than a persisted part
+adapter. Video data, source-document, step-start, and provider-owned web-search parts intentionally
+render no separate message-list content.
+
+An unfinished assistant row shows the pending indicator only before any visible reply content.
+`MessageParts` uses the same normalized body/process split it renders: text, reasoning, tools,
+questions, compaction markers, and images replace the initial connection feedback. Finishing a
+part or waiting between steps does not restore it. Empty text does not create a process row;
+an empty streaming reasoning block supplies its own thinking feedback. Reasoning stops animating
+when a later activity arrives or the message settles, even if the part still says streaming.
+
+The tool content adapters are Generic, MCP, Web Search, Write File, Meta Search, Meta Inspect, Meta
+Invoke, and Meta Exec. Count renderer families, disclosure layers, and visual states separately; combining them
+into one component total obscures ownership and does not measure duplication.
+
+Use the following Storybook stories as the visual inventory:
+
+- `Message Parts / Tools / States` covers the shared summary slot in running, complete, and error
+  states in light and dark themes.
+- `Messages / Playground / Light` and `Messages / Playground / Dark` exercise the production
+  message-part dispatch, including Generic, MCP, Web Search, Write File, and all Meta tool adapters.
+
+When adding or changing an interactive renderer, add a production-shaped fixture for each relevant
+state, inspect both themes on a device, open the detail, and confirm that the summary uses the shared
+slot and the expanded content uses the shared shell. Follow
+[`UI Development`](../../../../docs/guides/ui-development.md) and
+[`Parallel Device Testing`](../../../../docs/guides/parallel-device-testing.md) for the general visual
+and workspace acceptance rules.
+
+## Ownership
+
+The module accepts only visible `user` and `assistant` messages. A feature that stores additional
+roles must explicitly filter or adapt them before crossing this interface. Feature runtime,
+persistence entities, composer state, and tool-approval orchestration remain with their owners.
+
+### Composition And Layout Contract
+
+The screen composes the message history and composer as sibling regions. Within the history, layout
+ownership flows from the list toward intrinsic content:
+
+```text
+ChatScreen
+├── message workspace
+│   └── MessageList
+│       └── list-owned row frame
+│           └── feature role renderer
+│               └── UserMessage or AssistantMessage
+│                   └── MessageParts
+│                       └── individual part renderers
+└── ComposerDock
+```
+
+- The screen owns whether the message list and composer exist and passes their measured top and
+  bottom insets across the list API.
+- `MessageList` owns scrolling, content insets, row gutters, role-level row spacing, anchoring, and
+  the placement of every rendered message. The feature renderer supplies content; it does not
+  recreate list spacing. Its trailing content inset comes only from the screen-owned layout; the
+  floating scroll button does not reserve persistent space after the final row and remains hidden
+  unless the content exceeds the viewport.
+- `UserMessage` and `AssistantMessage` own role presentation inside the row frame. They may define
+  intrinsic width, internal grouping, bubbles, and surfaces, but do not add list or
+  screen gutters.
+- `MessageParts` owns part order and spacing. Each part renderer owns only its internal visual and
+  interaction contract; it does not position sibling parts or reach into the row frame.
+- Feature-owned accessories, such as the assistant toolbar, compose after the message body. Their
+  spacing from the body belongs to the assistant composition, not to an individual part.
+- Parent layout must not copy private child padding. Message rows keep their intrinsic measured
+  height; the list does not cap a user row or reserve synthetic space around it.
+
+Exact spacing values live in code, not this document. Changing a list gutter or row inset must have
+one list-owned source; changing intrinsic message padding must update the content owner's explicit
+geometry contract when list layout depends on it.
+
+## List Behavior
+
+`MessageList` owns its `LegendList` ref, role-based recycling types, keyboard lift, visible-bottom
+geometry, row frames, and the business wiring for the optional CherryUI scroll-to-bottom button.
+Callers provide stable message item references and only the layout insets and callbacks they own.
+
+One list-owned scroll controller owns product-level scroll state. It starts detached while restoring either a saved
+semantic row anchor or the live edge. While following, content and viewport-size changes keep the
+live edge exact. A user drag immediately enters reading mode; streaming, measurement, pagination,
+and virtualizer compensation cannot pull that viewport back. Reaching the bottom or pressing the
+scroll button re-enters following mode. Sending a local message instead positions the new turn once
+in reading mode, so a growing reply does not keep scrolling. This also applies to the first send in
+a draft and a send that waits for initial history. The scroll button means “return to the live edge”
+and explicitly resumes following.
+
+The controller keeps imperative mode reads in a ref for native scroll callbacks and exposes only a
+reactive following boolean to keyboard lift and button rendering. Dataset generations own drag and
+momentum events; callbacks from an outgoing Session cannot transition or save state for the incoming
+Session.
+
+Chat Sessions store `{ message key, offset inside the row }` in the frontend memory cache. Restore
+uses `scrollToIndex`, so prepends and changing row measurements do not invalidate a raw pixel
+offset. Initial reveal waits for LegendList load, history readiness, and the restore promise; it has
+no quiet-time timeout. A drag that commits before restoration settles takes ownership immediately,
+reveals the list, and invalidates the pending restore completion. `maintainVisibleContentPosition`
+remains virtualizer-owned compensation and does not change the controller's following/reading
+state.
+
+Stateless single-turn consumers have no restoration key. They use LegendList's initial-end
+bootstrap once, and the controller adopts following mode without issuing a second initial scroll.
+
+`initialScrollTarget` takes precedence over saved scroll memory for a dataset. Message targets align
+the entire row below the header, with no highlight; an explicit end target returns to the live edge.
+The caller changes `dataKey` for a new navigation request or a replacement history window. A window
+with `hasNewerMessages` remains in reading mode even at its loaded end, requests newer pages through
+`onLoadNewer`, and keeps the return-to-latest control available. `onReturnToLatest` lets the data
+owner replace that window before the controller resumes following; local sends use the same data
+replacement path but retain their one-time positioning behavior.
+
+Keyboard lift uses `persistent` while following and `never` while reading history. Composer
+expansion must not disable following just because the viewport has already resized when keyboard
+motion starts. Native keyboard motion owns scrolling during the transition; application corrections
+for content and composer-size changes resume once it ends, only if still following. The return button
+moves with the keyboard and any floating composer, and checks the visible bottom including the
+keyboard inset. A local send waits for its message to enter the rendered data and for any keyboard
+transition to finish before scrolling to the live edge. A search window first requests the latest
+data through `onReturnToLatest`. A dataset switch or committed drag cancels a waiting send scroll.
+
+User message rows visually separate managed file parts from the text bubble: a right-aligned,
+wrapping attachment group sits above the optional bubble, keeping every card inside the user
+column without clipping or horizontal gestures. This is a presentation
+projection only; files remain parts of the same message for model input, persistence, references,
+and stable render identity.
+
+## Message Interaction Ownership
+
+The chat's whole-message menu uses the platform's default long-press timing and covers the message
+header and whitespace outside text and other child-owned regions, including user-bubble padding.
+Android places the menu near the long-press pointer with screen-edge adjustment; iOS delegates
+placement to UIKit. Child-owned regions use CherryUI's `ContextMenuExclusion`; this disables the
+Android ancestor recognizer or withholds iOS native menu items for that touch without changing the
+child's tap, native selection, or scrolling behavior.
+
+| Region | Interaction owner |
+| --- | --- |
+| User text and main answer | Excluded text region; native text selection and selection menus retain ownership, independently of message actions |
+| Message header and whitespace outside excluded regions | Whole-message copy/share menu |
+| Process, reasoning, tool summaries and inline file-output panes | Excluded process region; disclosures, detail sheets, selection and inner scrolling retain ownership |
+| User attachments and generated artifacts | Excluded attachment region; file/image preview controls retain ownership |
+| Sources and error feedback | Excluded region; source list, external links, error details and local selection retain ownership |
+| Assistant copy/fork/share toolbar and usage details | Excluded toolbar region |
+| Markdown links, checkboxes and spoilers | Native renderer handles the inline target; native cancellation must prevent a second action on release |
+| Fenced code and Markdown tables | Native renderer owns block copy menus and nested scrolling inside the excluded text or process region |
+| Video/source-document/step-start parts | No rendered touch target |
+
+Plugin, Skill and Office selection references stay inline as an icon and name in the input's link
+color, using their recorded UTF-16 text ranges. A selection chip shows only its file and location
+label; its anchor and excerpt reach the model through runtime input. User messages do not show a
+separate Skill selection or revision caption.
+SSH references retain the input's link-colored label without an icon, using a recorded text range.
+Their display snapshot does not select a connection or grant command access.
+An explicit Skill reference supplies instructions without a synthetic tool activity. Automatic
+loading appears as a dedicated **Read Skill** activity with its icon and name. Its detail sheet shows
+the Skill's name and description. Instruction bodies, revision hashes and library navigation belong
+to the Skills library, not the transcript.
+
+Text selection uses React Native `Text` for user messages and the existing Markdown renderer for
+assistant messages. Message text is always selectable; there is no per-message selection toggle,
+because a message whose text cannot be selected has no remaining way to copy part of an answer. The
+system owns the long-press threshold, selection handles, and selection-menu timing; the app adds no
+second hold timer or movement threshold. The text exclusion remains mounted
+during streaming and after completion, so settling does not remount the native text. Streamdown
+retains its upstream selection policy while processing streamed content. Selection is local to each
+native text segment and cannot span independent Markdown blocks or message parts; whole-message
+copy remains available through message actions.
+
+Android code menus explicitly cancel ancestor gesture recognizers before presenting. This also
+covers short, non-scrolling code blocks; moving focus to the native popup alone does not cancel
+the message hold.
+
+The chat keeps message containers non-accessible so native text, attachment controls, and toolbars
+remain separate screen-reader targets. With a screen reader enabled, settled user messages expose
+copy/share buttons through an excluded footer; assistant messages retain their existing toolbar.
+
+This inventory is based on source inspection. Native code-menu versus message-menu precedence,
+inline-link long presses, code/table pans, and excluded-control holds still require iOS/Android
+device acceptance; mocked gesture callbacks cannot establish their timing or native cancellation.
+
+## Organization
+
+- `MessageList.tsx` is the wiring layer. `list/` owns its layout policy, viewport controller, semantic
+  scroll memory, role-level row frame, interaction boundary, and dev-only instrumentation.
+- `rows/` owns the intrinsic user and assistant presentation inside the list-owned row frame.
+- `parts/` owns ordered part composition and adapts Cherry message schema parts into CherryUI
+  primitives. `parts/tools/` owns tool dispatch and tool-specific adapters;
+  `parts/tools/metaTool/` composes explicit search, inspect, invoke, and exec variants.
+- `parts/tools/builtInTool/` owns shared built-in tool labels. Only its `builtInToolIcon/` family is
+  platform-specific.
+
+There are no internal barrels. Rows and adapters import private leaf modules directly; feature
+callers use only this module's root entry.
+
+## Motion
+
+Message rows do not translate independently from the list: send positioning is one controller-owned
+scroll, which avoids a second animation writing geometry during layout. Scroll-button visibility
+uses the shared CherryUI motion vocabulary. Pending assistant and reasoning rows consume
+`PrismSweep` from the Cherry UI loading family. Running tool, tool-group, and reasoning rows sweep
+their label with the shared `ShimmerText` highlight instead of pulsing row opacity.
+File-input generation uses a static title while its adjacent content updates; the title resumes
+the normal running animation during tool execution.
+
+
+`ask_user_question` tool parts render flat in the message body: each question in secondary text
+followed by its answer, skip state, or waiting/closed status. There is no row or detail sheet, and
+history never submits responses. The chat feature owns the active question sheet and Protocol
+correlation; it retains per-question drafts while navigating and submits the complete answer set.
+
+
+Successful `agent_create` and `agent_update` parts render compact saved-Agent capsules in the
+body. Each capsule shows the name and a short status, with a text-only chat action when a model is
+configured. The capsule fits its content up to the message width; beyond that, the name wraps while
+the status and action keep their width. Model metadata is not shown. The capsule uses persisted
+result metadata; navigation opens the current record, so a later-deleted Agent follows the
+destination's ordinary unavailable state. `ContextMenuExclusion` keeps name selection and the chat
+button separate from the message context menu; the shared button retains native press cancellation.
+Agent list/read calls remain in the execution disclosure.

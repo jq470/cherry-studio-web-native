@@ -1,0 +1,56 @@
+import { ContextMenuExclusion, MessagePart } from '@cherrystudio/ui/components';
+import { useTranslation } from 'react-i18next';
+
+import { AiFailureMessage } from '@/frontend/components/AiFailure';
+import type { CherryMessagePart } from '@/shared/data/types/message';
+
+import { useMessageFailureReport } from './MessageFailureReportContext';
+
+export function ErrorPart({
+  messageId,
+  part,
+}: {
+  messageId?: string;
+  part: Extract<CherryMessagePart, { type: 'data-error' }>;
+}) {
+  const { t } = useTranslation();
+  const report = useMessageFailureReport();
+  if (part.data.code === 'MESSAGE_UNREADABLE') {
+    return (
+      <ContextMenuExclusion>
+        <MessagePart.Error
+          message={t('chat.errorPart.unreadable.message')}
+          title={t('chat.errorPart.unreadable.title')}
+        />
+      </ContextMenuExclusion>
+    );
+  }
+  if (part.data.code === 'PERSISTENCE_FAILED') {
+    return (
+      <ContextMenuExclusion>
+        <MessagePart.Error
+          message={t('chat.errorPart.notSaved.message')}
+          title={t('chat.errorPart.notSaved.title')}
+        />
+      </ContextMenuExclusion>
+    );
+  }
+  if (part.data.code === 'INTERRUPTED') {
+    return (
+      <ContextMenuExclusion>
+        <MessagePart.Error
+          message={t('chat.errorPart.interrupted.message')}
+          title={t('chat.errorPart.interrupted.title')}
+        />
+      </ContextMenuExclusion>
+    );
+  }
+  return (
+    <ContextMenuExclusion>
+      <AiFailureMessage
+        data={part.data}
+        onReport={report && messageId ? () => report(messageId) : undefined}
+      />
+    </ContextMenuExclusion>
+  );
+}

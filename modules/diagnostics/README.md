@@ -1,0 +1,23 @@
+# Native Diagnostics
+
+Local Expo module for Cherry Mobile diagnostics. Workflow ownership and the Desktop compatibility
+contract are documented in [Diagnostics](../../src/backend/services/diagnostics/README.md).
+
+The native boundary also emits foreground accelerometer samples for [shake feedback](../../src/frontend/appShell/feedback/README.md), normalized to g on both platforms. Observation is opt-in through the event subscription and stops in the background.
+
+The native boundary owns file identity, the provisioned HMAC credential, and bounded file-backed
+HTTP transfer. Archive hashing uses the app's shared native file hash.
+The module never decides which logs or chat records to collect. There are no package downloads
+or new native SDK dependencies.
+
+Native crash reporting belongs to the app's existing Sentry integration. This module does not
+capture or inventory crash reports.
+
+Rebuild the development client after adding or changing this module. Configure the Cherry client
+credential through `CHERRYAI_CLIENT_SECRET` (or Desktop's `MAIN_VITE_CHERRYAI_CLIENT_SECRET`) in
+the native build environment. Missing credentials affect upload only. Do not put the credential
+in JavaScript or Expo `extra` configuration.
+
+The diagnostics config plugin also retains Android's `cherry_ai_client_secret` string during
+resource shrinking. The library resolves this app-owned resource by name, so production builds
+need the explicit keep rule even when the build environment supplies the credential.

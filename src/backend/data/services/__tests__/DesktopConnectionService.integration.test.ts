@@ -1,0 +1,981 @@
+import { randomUUID as mockRandomUUID } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
+
+import { eq } from 'drizzle-orm';
+
+import { subscribeDataApiChanges } from '@/backend/data/dataApiChanges';
+import {
+  desktopConnectionTable,
+  userModelTable,
+  userProviderTable,
+} from '@/backend/data/db/schemas';
+import { installProviderRegistryTestSnapshot } from '@/backend/data/services/providerRegistryTestSnapshot';
+import {
+  DesktopProvidersSnapshotSchema,
+  type DesktopProvidersSnapshot,
+} from '@/shared/data/api/schemas/desktopConnections';
+import { ENDPOINT_TYPE, REASONING_EFFORT } from '@/shared/data/types/model';
+
+import { DesktopConnectionService } from '../DesktopConnectionService';
+import { createTestDb, type TestDb } from './_testDb';
+
+jest.mock('uuid', () => ({ v4: mockRandomUUID, v7: mockRandomUUID }));
+
+const connectionId = 'f676e1d5-24c6-4150-a3fa-0f4427964465';
+const signal = () => new AbortController().signal;
+const reasoning = { supportedEfforts: [REASONING_EFFORT.LOW] };
+
+function provider(id = 'relay', modelIds = ['existing']) {
+  return {
+    id,
+    name: 'Desktop provider',
+    apiHost: 'https://desktop.example.com/v1',
+    apiKeys: [{ id: 'desktop-key', key: 'desktop-secret', isEnabled: true }],
+    defaultChatEndpoint: ENDPOINT_TYPE.OPENAI_CHAT_COMPLETIONS,
+    models: modelIds.map((modelId) => ({
+      id: modelId,
+      apiModelId: modelId,
+      providerId: id,
+      name: 'Desktop model',
+      reasoning,
+    })),
+  };
+}
+
+function snapshot(...providers: ReturnType<typeof provider>[]) {
+  return DesktopProvidersSnapshotSchema.parse({ version: 1, providers });
+}
+
+beforeEach(installProviderRegistryTestSnapshot);
+
+describe('DesktopConnectionService provider synchronization', () => {
+  let testDb: TestDb;
+  let service: DesktopConnectionService;
+
+  beforeEach(async () => {
+    testDb = createTestDb(new DatabaseSync(':memory:'));
+    service = new DesktopConnectionService(testDb.dbService, (provider) => {
+      const supported = (provider.presetProviderId ?? provider.id) === 'cherryin';
+      return { signIn: supported, apiKeys: supported, balance: supported };
+    });
+    await service.savePair(
+      {
+        id: connectionId,
+        name: 'Desktop',
+        deviceId: 'device-1',
+        desktopIdentity: '12D3KooWDesktop',
+
+        grants: [{ domain: 'configuration', grantId: 'grant-1' }],
+      },
+      false,
+      signal(),
+    );
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+    testDb.sqlite.close();
+  });
+
+  it('notifies connection observers after each committed write', async () => {
+    const changed = jest.fn((_paths: readonly string[]) => testDb.sqlite.isTransaction);
+    const unsubscribe = subscribeDataApiChanges(changed);
+    const original = await service.getRow(connectionId);
+    const endpoint = { host: '100.64.0.2', port: 23333, security: 'ws' as const };
+    try {
+      const operations = [
+        () => service.savePair(original, true, signal()),
+        () => service.update(connectionId, { configuredEndpoints: [endpoint] }),
+        () => service.update(connectionId, { alias: 'Work.mac' }),
+        () => service.updateLearnedEndpoints(connectionId, [endpoint], original, signal()),
+        () =>
+          service.addEndpoint(
+            connectionId,
+            { ...endpoint, host: '100.64.0.3' },
+            original,
+            signal(),
+          ),
+        () => service.updateStatus(connectionId, { lastFetchedAt: 123 }, signal()),
+        () => importSnapshot(snapshot(provider())),
+        () => service.remove(connectionId),
+      ];
+      for (const operation of operations) {
+        changed.mockClear();
+        await operation();
+        expect(changed).toHaveBeenCalledTimes(1);
+        expect(changed).toHaveBeenCalledWith([
+          '/desktop-connections',
+          `/desktop-connections/${connectionId}`,
+        ]);
+        expect(changed.mock.results[0]?.value).toBe(false);
+      }
+      changed.mockClear();
+      await service.remove(connectionId);
+      expect(changed).not.toHaveBeenCalled();
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it('does not notify for duplicate addresses, stale pairing, or cancellation', async () => {
+    const original = await service.getRow(connectionId);
+    const endpoint = { host: '100.64.0.2', port: 23333, security: 'ws' as const };
+    await service.update(connectionId, { configuredEndpoints: [endpoint] });
+    await service.updateLearnedEndpoints(connectionId, [endpoint], original, signal());
+    const changed = jest.fn();
+    const unsubscribe = subscribeDataApiChanges(changed);
+    try {
+      await service.addEndpoint(connectionId, endpoint, original, signal());
+      await service.updateLearnedEndpoints(connectionId, [endpoint], original, signal());
+      await expect(
+        service.updateLearnedEndpoints(
+          connectionId,
+          [],
+          { ...original, deviceId: 'stale' },
+          signal(),
+        ),
+      ).rejects.toBeDefined();
+      const cancelled = new AbortController();
+      cancelled.abort();
+      await expect(
+        service.updateStatus(connectionId, { status: 'paired' }, cancelled.signal),
+      ).rejects.toBeDefined();
+      expect(changed).not.toHaveBeenCalled();
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it.each(['pair', 'endpoints', 'alias', 'learned', 'add', 'status', 'import', 'remove'] as const)(
+    'does not publish a %s write that fails at commit',
+    async (operation) => {
+      const original = await service.getRow(connectionId);
+      const endpoint = { host: '100.64.0.2', port: 23333, security: 'ws' as const };
+      const operations = {
+        pair: () => service.savePair({ ...original, name: 'New name' }, true, signal()),
+        endpoints: () => service.update(connectionId, { configuredEndpoints: [endpoint] }),
+        alias: () => service.update(connectionId, { alias: 'Work.mac' }),
+        learned: () => service.updateLearnedEndpoints(connectionId, [endpoint], original, signal()),
+        add: () => service.addEndpoint(connectionId, endpoint, original, signal()),
+        status: () => service.updateStatus(connectionId, { lastFetchedAt: 123 }, signal()),
+        import: () => importSnapshot(snapshot(provider())),
+        remove: () => service.remove(connectionId),
+      };
+      const changed = jest.fn();
+      const unsubscribe = subscribeDataApiChanges(changed);
+      testDb.failWriteTxCommit(new Error('Commit failed'));
+      try {
+        await expect(operations[operation]()).rejects.toThrow('Commit failed');
+        expect(changed).not.toHaveBeenCalled();
+        expect(await service.getRow(connectionId)).toEqual(original);
+      } finally {
+        unsubscribe();
+      }
+    },
+  );
+
+  it('persists all 32 addresses in a desktop snapshot', async () => {
+    const endpoints = Array.from({ length: 32 }, (_, i) => ({
+      host: `10.0.0.${i + 1}`,
+      port: 23333,
+      security: 'ws' as const,
+    }));
+    const row = await service.getRow(connectionId);
+    await service.updateLearnedEndpoints(connectionId, endpoints, row, signal());
+    expect((await service.getRow(connectionId)).learnedEndpoints).toEqual(endpoints);
+  });
+
+  it('replaces synced routes without changing manual addresses or pairing', async () => {
+    const original = await service.getRow(connectionId);
+    const manual = { host: 'company.example.com', port: 443, security: 'wss' as const };
+    const vpn = { host: '100.64.0.2', port: 23333, security: 'ws' as const };
+    await service.update(connectionId, { configuredEndpoints: [manual] });
+    await service.updateLearnedEndpoints(connectionId, [vpn, vpn], original, signal());
+    expect(await service.getRow(connectionId)).toMatchObject({
+      learnedEndpoints: [vpn],
+      configuredEndpoints: [manual],
+      grants: original.grants,
+    });
+    const updated = { ...vpn, host: 'fd7a:115c:a1e0::2' };
+    await service.updateLearnedEndpoints(connectionId, [updated], original, signal());
+    expect(await service.getRow(connectionId)).toMatchObject({
+      learnedEndpoints: [updated],
+      configuredEndpoints: [manual],
+      deviceId: original.deviceId,
+    });
+    await expect(
+      service.updateLearnedEndpoints(
+        connectionId,
+        [],
+        { ...original, deviceId: 'replaced' },
+        signal(),
+      ),
+    ).rejects.toMatchObject({ details: { reason: 'auth-revoked' } });
+    const cancelled = new AbortController();
+    cancelled.abort();
+    await expect(
+      service.updateLearnedEndpoints(connectionId, [], original, cancelled.signal),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+    expect((await service.getRow(connectionId)).learnedEndpoints).toEqual([updated]);
+    await service.update(connectionId, { configuredEndpoints: [] });
+    expect((await service.getRow(connectionId)).learnedEndpoints).toEqual([updated]);
+  });
+
+  it('clears learned routes on re-pairing and rejects a late response from the previous binding', async () => {
+    const previous = await service.getRow(connectionId);
+    const endpoint = { host: '100.64.0.2', port: 23333, security: 'ws' as const };
+    await service.update(connectionId, { configuredEndpoints: [endpoint] });
+    await service.updateLearnedEndpoints(connectionId, [endpoint], previous, signal());
+    const { id, name, desktopIdentity, grants } = previous;
+    await service.savePair(
+      { id, name, desktopIdentity, grants, deviceId: 'new-device' },
+      true,
+      signal(),
+    );
+    await expect(
+      service.updateLearnedEndpoints(connectionId, [endpoint], previous, signal()),
+    ).rejects.toMatchObject({ details: { reason: 'auth-revoked' } });
+    expect(await service.getRow(connectionId)).toMatchObject({
+      deviceId: 'new-device',
+      learnedEndpoints: [],
+      configuredEndpoints: [endpoint],
+    });
+  });
+
+  it('adds a verified address once while preserving existing addresses and pairing', async () => {
+    const original = await service.getRow(connectionId);
+    const manual = { host: 'company.example.com', port: 443, security: 'wss' as const };
+    const vpn = { host: '100.64.0.2', port: 23333, security: 'ws' as const };
+    await service.update(connectionId, { configuredEndpoints: [manual] });
+    await service.addEndpoint(connectionId, vpn, original, signal());
+    await service.addEndpoint(connectionId, vpn, original, signal());
+    expect(await service.getRow(connectionId)).toMatchObject({
+      deviceId: original.deviceId,
+      desktopIdentity: original.desktopIdentity,
+      grants: original.grants,
+      configuredEndpoints: [manual, vpn],
+    });
+  });
+
+  it('rejects a late verification after re-pairing and does not overwrite a full address list', async () => {
+    const original = await service.getRow(connectionId);
+    const vpn = { host: '100.64.0.2', port: 23333, security: 'ws' as const };
+    await expect(
+      service.addEndpoint(connectionId, vpn, { ...original, deviceId: 'replaced' }, signal()),
+    ).rejects.toMatchObject({ details: { reason: 'auth-revoked' } });
+    const full = Array.from({ length: 8 }, (_, index) => ({
+      host: `host-${index}.example.com`,
+      port: 23333,
+      security: 'ws' as const,
+    }));
+    await service.update(connectionId, { configuredEndpoints: full });
+    await expect(service.addEndpoint(connectionId, vpn, original, signal())).rejects.toMatchObject({
+      details: { reason: 'endpoint-limit' },
+    });
+    expect((await service.getRow(connectionId)).configuredEndpoints).toEqual(full);
+  });
+
+  function importSnapshot(data: DesktopProvidersSnapshot, requestSignal = signal()) {
+    return service.import(
+      connectionId,
+      data,
+      {
+        selections: data.providers.map(({ id }) => ({ providerId: id, mode: 'provider-models' })),
+      },
+      requestSignal,
+    );
+  }
+
+  it('shows a paired hostname without its network domain', async () => {
+    for (const [stored, shown] of [
+      ['jddeMacBook-Pro-3.local', 'jddeMacBook-Pro-3'],
+      ['DESKTOP-4F2K9.corp.example.com', 'DESKTOP-4F2K9'],
+      ['192.168.1.20', '192.168.1.20'],
+      ["J.D.'s Mac", "J.D.'s Mac"],
+    ]) {
+      await testDb.database
+        .update(desktopConnectionTable)
+        .set({ name: stored })
+        .where(eq(desktopConnectionTable.id, connectionId));
+      await expect(service.getById(connectionId)).resolves.toMatchObject({
+        alias: null,
+        defaultName: shown,
+        name: shown,
+      });
+    }
+  });
+
+  it('uses a literal local alias in list and detail reads without changing pairing', async () => {
+    const original = await service.getRow(connectionId);
+    await expect(service.update(connectionId, { alias: '  Work.mac  ' })).resolves.toMatchObject({
+      alias: 'Work.mac',
+      defaultName: original.name,
+      id: connectionId,
+      name: 'Work.mac',
+    });
+    expect((await service.list()).items[0].name).toBe('Work.mac');
+    expect(await service.getRow(connectionId)).toMatchObject({
+      alias: 'Work.mac',
+      name: original.name,
+      deviceId: original.deviceId,
+      desktopIdentity: original.desktopIdentity,
+      grants: original.grants,
+      status: original.status,
+      configuredEndpoints: original.configuredEndpoints,
+      learnedEndpoints: original.learnedEndpoints,
+    });
+  });
+
+  it('preserves a local alias across address updates and re-pairing until it is cleared', async () => {
+    const original = await service.getRow(connectionId);
+    await service.update(connectionId, { alias: 'Work.mac' });
+    await service.update(connectionId, { configuredEndpoints: [] });
+    // A stale pairing snapshot must not overwrite an alias saved while approval was pending.
+    await service.savePair(
+      { ...original, name: 'new-desktop.local', deviceId: 'replacement' },
+      true,
+      signal(),
+    );
+    await expect(service.getById(connectionId)).resolves.toMatchObject({
+      alias: 'Work.mac',
+      defaultName: 'new-desktop',
+      name: 'Work.mac',
+    });
+    expect(await service.getRow(connectionId)).toMatchObject({
+      alias: 'Work.mac',
+      name: 'new-desktop.local',
+      deviceId: 'replacement',
+    });
+    for (const alias of [null, '  ']) {
+      await service.update(connectionId, { alias: 'Work.mac' });
+      await expect(service.update(connectionId, { alias })).resolves.toMatchObject({
+        alias: null,
+        defaultName: 'new-desktop',
+        name: 'new-desktop',
+      });
+      expect((await service.getRow(connectionId)).alias).toBeNull();
+    }
+  });
+
+  it('rejects invalid alias updates without changing the stored connection', async () => {
+    const original = await service.getRow(connectionId);
+    await expect(service.update(connectionId, {})).rejects.toBeDefined();
+    await expect(service.update(connectionId, { alias: 'a'.repeat(129) })).rejects.toBeDefined();
+    expect(await service.getRow(connectionId)).toEqual(original);
+  });
+
+  it('imports the complete API key list and keeps desktop order and labels when resynced', async () => {
+    const keys = ['a', 'b', 'c'].map((id) => ({
+      id,
+      key: `desktop-secret-${id}`,
+      label: `Account ${id}`,
+      isEnabled: true,
+    }));
+    const data = snapshot({ ...provider(), apiKeys: keys });
+    await importSnapshot(data);
+    const [created] = await testDb.database.select().from(userProviderTable);
+    expect(created!.apiKeys).toEqual(keys);
+
+    const updatedKeys = [keys[2]!, keys[0]!];
+    await importSnapshot(snapshot({ ...provider(), apiKeys: updatedKeys }));
+    const [updated] = await testDb.database.select().from(userProviderTable);
+    expect(updated!.apiKeys).toEqual(updatedKeys);
+  });
+
+  it('syncs provider configuration while keeping every existing model column', async () => {
+    await importSnapshot(snapshot(provider()));
+    await testDb.database.update(userProviderTable).set({
+      name: 'Local provider',
+      isEnabled: false,
+      apiKeys: [{ id: 'local-key', key: 'local-secret', isEnabled: true }],
+      endpointConfigs: {
+        [ENDPOINT_TYPE.ANTHROPIC_MESSAGES]: { baseUrl: 'https://local.example.com' },
+      },
+      defaultChatEndpoint: ENDPOINT_TYPE.ANTHROPIC_MESSAGES,
+      providerSettings: { notes: 'Local provider notes' },
+      logoKey: 'icon:local-provider',
+    });
+    await testDb.database.update(userModelTable).set({
+      name: 'Local model',
+      notes: 'Keep my notes',
+      isHidden: true,
+      isEnabled: false,
+      reasoning: { supportedEfforts: [REASONING_EFFORT.HIGH] },
+      endpointTypes: [ENDPOINT_TYPE.ANTHROPIC_MESSAGES],
+    });
+    const [beforeProvider] = await testDb.database.select().from(userProviderTable);
+    const [beforeModel] = await testDb.database.select().from(userModelTable);
+    const data = snapshot(provider('relay', ['existing', 'missing']));
+    data.providers[0]!.authConfig = { type: 'api-key', headerName: 'x-api-key' };
+    data.providers[0]!.providerSettings = { notes: 'Desktop provider notes' };
+    data.providers[0]!.apiFeatures = { reportsActualCost: true };
+
+    expect(await service.preview(data)).toMatchObject({
+      providers: [{ action: 'update', models: [{ action: 'skip' }, { action: 'add' }] }],
+    });
+    await expect(importSnapshot(data)).resolves.toEqual({
+      providersAdded: 0,
+      providersUpdated: 1,
+      modelsAdded: 1,
+      modelsSkipped: 1,
+    });
+    const [syncedProvider] = await testDb.database.select().from(userProviderTable);
+    expect(syncedProvider).toMatchObject({
+      apiFeatures: { reportsActualCost: true },
+      apiKeys: data.providers[0]!.apiKeys,
+      authConfig: { type: 'api-key', headerName: 'x-api-key' },
+      createdAt: beforeProvider!.createdAt,
+      defaultChatEndpoint: ENDPOINT_TYPE.OPENAI_CHAT_COMPLETIONS,
+      endpointConfigs: {
+        [ENDPOINT_TYPE.OPENAI_CHAT_COMPLETIONS]: { baseUrl: 'https://desktop.example.com/v1' },
+        [ENDPOINT_TYPE.ANTHROPIC_MESSAGES]: { baseUrl: 'https://local.example.com' },
+      },
+      isEnabled: true,
+      logoKey: beforeProvider!.logoKey,
+      name: 'Desktop provider',
+      orderKey: beforeProvider!.orderKey,
+      providerSettings: { notes: 'Desktop provider notes' },
+    });
+    expect(
+      await testDb.database
+        .select()
+        .from(userModelTable)
+        .where(eq(userModelTable.id, 'relay::existing')),
+    ).toEqual([beforeModel]);
+    const [added] = await testDb.database
+      .select()
+      .from(userModelTable)
+      .where(eq(userModelTable.id, 'relay::missing'));
+    expect(added).toMatchObject({ modelId: 'missing', reasoning });
+    expect(added!.orderKey > beforeModel!.orderKey).toBe(true);
+
+    const beforeRepeat = await testDb.database.select().from(userModelTable);
+    await expect(importSnapshot(data)).resolves.toEqual({
+      providersAdded: 0,
+      providersUpdated: 1,
+      modelsAdded: 0,
+      modelsSkipped: 2,
+    });
+    expect(await testDb.database.select().from(userModelTable)).toEqual(beforeRepeat);
+  });
+
+  it.each(['cherryin', 'aihubmix'])(
+    'syncs and enables the installed %s provider even when every model already exists',
+    async (providerId) => {
+      const data = snapshot(provider(providerId));
+      await importSnapshot(data);
+      await testDb.database.update(userProviderTable).set({ apiKeys: [], isEnabled: false });
+      const beforeModels = await testDb.database.select().from(userModelTable);
+
+      expect(await service.preview(data)).toMatchObject({
+        providers: [{ id: providerId, action: 'update', models: [{ action: 'skip' }] }],
+      });
+      await expect(importSnapshot(data)).resolves.toEqual({
+        providersAdded: 0,
+        providersUpdated: 1,
+        modelsAdded: 0,
+        modelsSkipped: 1,
+      });
+      expect(await testDb.database.select().from(userProviderTable)).toMatchObject([
+        {
+          providerId,
+          presetProviderId: providerId,
+          isEnabled: true,
+          apiKeys: data.providers[0]!.apiKeys,
+        },
+      ]);
+      expect(await testDb.database.select().from(userModelTable)).toEqual(beforeModels);
+    },
+  );
+
+  it('imports CherryIN model keys without cloning the PC grant or overwriting mobile key identities', async () => {
+    const data = DesktopProvidersSnapshotSchema.parse({
+      version: 1,
+      providers: [
+        {
+          ...provider('cherryin'),
+          authMethods: ['oauth'],
+          authConfig: {
+            type: 'oauth',
+            accessToken: 'desktop-access',
+            refreshToken: 'desktop-refresh',
+          },
+        },
+      ],
+    });
+    expect(await service.preview(data)).toMatchObject({
+      providers: [{ id: 'cherryin', accountNotice: 'sign-in-for-balance' }],
+    });
+    expect((await service.preview(data)).providers[0]?.unavailableReason).toBeUndefined();
+    await importSnapshot(data);
+    const local = [
+      { id: 'mobile-account', key: 'mobile-key', isEnabled: true },
+      { id: 'mobile-copy', key: 'desktop-secret', isEnabled: false },
+    ];
+    await testDb.database.update(userProviderTable).set({ apiKeys: local });
+    data.providers[0]!.apiKeys.push({
+      id: 'mobile-account',
+      key: 'new-desktop-key',
+      isEnabled: true,
+    });
+    await importSnapshot(data);
+    await importSnapshot(data);
+    const [row] = await testDb.database.select().from(userProviderTable);
+    expect(row?.authConfig).toEqual({ type: 'api-key' });
+    expect(row?.apiKeys?.slice(0, 2)).toEqual(local);
+    expect(row?.apiKeys).toHaveLength(3);
+    expect(row?.apiKeys?.[2]).toMatchObject({ key: 'new-desktop-key', isEnabled: true });
+    expect(row?.apiKeys?.[2]?.id).not.toBe('mobile-account');
+    expect(JSON.stringify(row)).not.toContain('desktop-access');
+    expect(JSON.stringify(row)).not.toContain('desktop-refresh');
+  });
+
+  it.each(['cherryin', 'openai-codex'])(
+    'keeps %s OAuth unavailable without an enabled model key',
+    async (id) => {
+      const data = DesktopProvidersSnapshotSchema.parse({
+        version: 1,
+        providers: [
+          {
+            ...provider(id),
+            authType: 'oauth',
+            authMethods: ['oauth'],
+            apiKeys: [{ id: 'disabled', key: 'key', isEnabled: false }],
+          },
+        ],
+      });
+      expect((await service.preview(data)).providers[0]?.unavailableReason).toBe(
+        'unsupported-auth',
+      );
+      await expect(importSnapshot(data)).rejects.toMatchObject({
+        details: { reason: 'unsupported-auth' },
+      });
+      expect(await testDb.database.select().from(userProviderTable)).toHaveLength(0);
+    },
+  );
+
+  it('previews and imports only enabled PC providers and models', async () => {
+    const data = snapshot(
+      provider('enabled', ['enabled', 'disabled', 'legacy']),
+      provider('disabled'),
+    );
+    data.providers[0]!.isEnabled = true;
+    data.providers[0]!.models[0]!.isEnabled = true;
+    data.providers[0]!.models[1]!.isEnabled = false;
+    data.providers[1]!.isEnabled = false;
+    const preview = await service.preview(data);
+    expect(preview.providers).toHaveLength(1);
+    expect(preview.providers[0]!.models.map((model) => model.modelId)).toEqual([
+      'enabled',
+      'legacy',
+    ]);
+
+    await expect(
+      service.import(
+        connectionId,
+        data,
+        { selections: [{ providerId: 'enabled', mode: 'provider-models' }] },
+        signal(),
+      ),
+    ).resolves.toEqual({
+      providersAdded: 1,
+      providersUpdated: 0,
+      modelsAdded: 2,
+      modelsSkipped: 0,
+    });
+    expect(await testDb.database.select().from(userProviderTable)).toMatchObject([
+      { providerId: 'enabled', isEnabled: true },
+    ]);
+    const models = await testDb.database.select().from(userModelTable);
+    expect(new Set(models.map((model) => model.modelId))).toEqual(new Set(['enabled', 'legacy']));
+    expect(models.every((model) => model.isEnabled)).toBe(true);
+  });
+
+  it('rejects a selected provider disabled on PC after preview without changing mobile data', async () => {
+    const data = snapshot(provider());
+    await importSnapshot(data);
+    const beforeProviders = await testDb.database.select().from(userProviderTable);
+    const beforeModels = await testDb.database.select().from(userModelTable);
+    data.providers[0]!.isEnabled = false;
+
+    await expect(importSnapshot(data)).rejects.toMatchObject({
+      details: { reason: 'invalid-selection' },
+    });
+    expect(await testDb.database.select().from(userProviderTable)).toEqual(beforeProviders);
+    expect(await testDb.database.select().from(userModelTable)).toEqual(beforeModels);
+  });
+
+  it('syncs provider configuration without requiring any PC models', async () => {
+    const data = snapshot(provider('relay', []));
+    await expect(importSnapshot(data)).resolves.toEqual({
+      providersAdded: 1,
+      providersUpdated: 0,
+      modelsAdded: 0,
+      modelsSkipped: 0,
+    });
+    data.providers[0]!.apiKeys = [{ id: 'replacement', key: 'new-secret', isEnabled: true }];
+    await expect(importSnapshot(data)).resolves.toEqual({
+      providersAdded: 0,
+      providersUpdated: 1,
+      modelsAdded: 0,
+      modelsSkipped: 0,
+    });
+    expect(await testDb.database.select().from(userProviderTable)).toMatchObject([
+      { apiKeys: data.providers[0]!.apiKeys, isEnabled: true },
+    ]);
+  });
+
+  it.each([{ authOptional: true }, { authConfig: { required: false, type: 'api-key' } }])(
+    'persists optional authentication for a keyless custom gateway: %j',
+    async (authentication) => {
+      const data = DesktopProvidersSnapshotSchema.parse({
+        version: 1,
+        providers: [{ ...provider('gateway'), ...authentication, apiKeys: [] }],
+      });
+
+      expect((await service.preview(data)).providers[0]?.unavailableReason).toBeUndefined();
+      await importSnapshot(data);
+
+      const [row] = await testDb.database.select().from(userProviderTable);
+      expect(row).toMatchObject({
+        apiKeys: [],
+        authConfig: { required: false, type: 'api-key' },
+      });
+    },
+  );
+
+  it.each(['lmstudio', 'gpustack', 'ovms', 'ollama'])(
+    'accepts a keyless %s snapshot without an explicit authentication declaration',
+    async (providerId) => {
+      const data = DesktopProvidersSnapshotSchema.parse({
+        version: 1,
+        providers: [{ ...provider(providerId), apiKeys: [] }],
+      });
+
+      expect((await service.preview(data)).providers[0]?.unavailableReason).toBeUndefined();
+      await expect(importSnapshot(data)).resolves.toMatchObject({ providersAdded: 1 });
+    },
+  );
+
+  it('honors an explicit key requirement over an optional preset default', async () => {
+    const data = DesktopProvidersSnapshotSchema.parse({
+      version: 1,
+      providers: [{ ...provider('lmstudio'), authOptional: false, apiKeys: [] }],
+    });
+
+    expect((await service.preview(data)).providers[0]?.unavailableReason).toBe('missing-api-key');
+    await expect(importSnapshot(data)).rejects.toMatchObject({
+      details: { reason: 'missing-api-key' },
+    });
+  });
+
+  it('imports every selectable provider from a mixed desktop preview and safely repeats the sync', async () => {
+    const data = DesktopProvidersSnapshotSchema.parse({
+      version: 1,
+      providers: [
+        provider('openai', ['gpt-5']),
+        {
+          ...provider('anthropic', ['claude-test']),
+          defaultChatEndpoint: ENDPOINT_TYPE.ANTHROPIC_MESSAGES,
+        },
+        {
+          ...provider('gemini', ['gemini-test']),
+          defaultChatEndpoint: ENDPOINT_TYPE.GOOGLE_GENERATE_CONTENT,
+        },
+        ...['lmstudio', 'gpustack', 'ovms', 'ollama'].map((id) => ({
+          ...provider(id, ['local-model']),
+          apiHost: 'http://localhost:11434',
+          apiKeys: [],
+          authOptional: true,
+        })),
+        {
+          ...provider('studio-copy', ['custom-model']),
+          apiKeys: [],
+          presetProviderId: 'lmstudio',
+        },
+        { ...provider('keyless-custom', []), apiKeys: [], authOptional: true },
+        { ...provider('missing-key'), apiKeys: [] },
+        { ...provider('disabled'), isEnabled: false },
+        {
+          ...provider('invalid-custom-endpoint'),
+          apiHost: undefined,
+          defaultChatEndpoint: undefined,
+        },
+      ],
+    });
+    const preview = await service.preview(data);
+    const input = {
+      selections: preview.providers
+        .filter((provider) => !provider.unavailableReason)
+        .map((provider) => ({ providerId: provider.id, mode: 'provider-models' as const })),
+    };
+    expect(input.selections).toHaveLength(9);
+
+    await expect(service.import(connectionId, data, input, signal())).resolves.toEqual({
+      providersAdded: 9,
+      providersUpdated: 0,
+      modelsAdded: 8,
+      modelsSkipped: 0,
+    });
+    await expect(service.import(connectionId, data, input, signal())).resolves.toEqual({
+      providersAdded: 0,
+      providersUpdated: 9,
+      modelsAdded: 0,
+      modelsSkipped: 8,
+    });
+    const providers = await testDb.database.select().from(userProviderTable);
+    expect(providers).toHaveLength(9);
+    expect(await testDb.database.select().from(userModelTable)).toHaveLength(8);
+    expect(providers.find((provider) => provider.providerId === 'ollama')?.endpointConfigs).toEqual(
+      {
+        [ENDPOINT_TYPE.OPENAI_CHAT_COMPLETIONS]: {
+          adapterFamily: 'openai-compatible',
+          baseUrl: 'http://localhost:11434',
+        },
+      },
+    );
+  });
+
+  it('does not delete models absent from the desktop snapshot', async () => {
+    await importSnapshot(snapshot(provider('relay', ['mobile-only', 'shared'])));
+    const before = await testDb.database.select().from(userModelTable);
+    await importSnapshot(snapshot(provider('relay', ['shared'])));
+    expect(await testDb.database.select().from(userModelTable)).toEqual(before);
+  });
+
+  it('validates custom endpoints inside the import and rolls back the whole import', async () => {
+    await importSnapshot(snapshot(provider()));
+    const data = snapshot(
+      provider('relay', ['missing']),
+      provider('new-provider', ['unsupported']),
+    );
+    data.providers[1]!.apiHost = undefined;
+    data.providers[0]!.apiKeys = [{ id: 'replacement', key: 'new-secret', isEnabled: true }];
+    const beforeProviders = await testDb.database.select().from(userProviderTable);
+    const beforeModels = await testDb.database.select().from(userModelTable);
+
+    await expect(importSnapshot(data)).rejects.toThrow(
+      'Custom provider endpoint configuration is invalid',
+    );
+    expect(await testDb.database.select().from(userProviderTable)).toEqual(beforeProviders);
+    expect(await testDb.database.select().from(userModelTable)).toEqual(beforeModels);
+  });
+
+  it('uses the PC endpoint configuration when adding models to an existing provider', async () => {
+    await importSnapshot(snapshot(provider()));
+    const data = snapshot(provider('relay', ['missing']));
+    data.providers[0]!.models[0]!.endpointTypes = [ENDPOINT_TYPE.ANTHROPIC_MESSAGES];
+    data.providers[0]!.defaultChatEndpoint = ENDPOINT_TYPE.ANTHROPIC_MESSAGES;
+    data.providers[0]!.endpointConfigs = {
+      [ENDPOINT_TYPE.ANTHROPIC_MESSAGES]: { baseUrl: 'https://desktop.example.com' },
+    };
+
+    await expect(importSnapshot(data)).resolves.toMatchObject({
+      providersUpdated: 1,
+      modelsAdded: 1,
+    });
+    expect(await testDb.database.select().from(userProviderTable)).toMatchObject([
+      {
+        defaultChatEndpoint: ENDPOINT_TYPE.ANTHROPIC_MESSAGES,
+        endpointConfigs: {
+          [ENDPOINT_TYPE.ANTHROPIC_MESSAGES]: { baseUrl: 'https://desktop.example.com' },
+          [ENDPOINT_TYPE.OPENAI_CHAT_COMPLETIONS]: { baseUrl: 'https://desktop.example.com/v1' },
+        },
+      },
+    ]);
+  });
+
+  it('rejects invalid new custom provider configuration without writing rows', async () => {
+    const data = snapshot(provider());
+    data.providers[0]!.apiHost = undefined;
+    await expect(importSnapshot(data)).rejects.toThrow(
+      'Custom provider endpoint configuration is invalid',
+    );
+    expect(await testDb.database.select().from(userProviderTable)).toEqual([]);
+  });
+
+  it('preserves reasoning on newly imported preset-backed models', async () => {
+    await importSnapshot(snapshot(provider('openai', ['gpt-5'])));
+    const [model] = await testDb.database.select().from(userModelTable);
+    expect(model).toMatchObject({ presetModelId: 'gpt-5', reasoning });
+  });
+
+  it('rechecks existing IDs inside serialized transactions for concurrent imports', async () => {
+    const data = snapshot(provider());
+    const results = await Promise.all([importSnapshot(data), importSnapshot(data)]);
+    expect(results.map((result) => result.modelsAdded)).toEqual([1, 0]);
+    expect(results.map((result) => result.providersAdded)).toEqual([1, 0]);
+    expect(await testDb.database.select().from(userModelTable)).toHaveLength(1);
+  });
+
+  it('does not write for an aborted import or a removed connection', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await expect(importSnapshot(snapshot(provider()), controller.signal)).rejects.toMatchObject({
+      name: 'AbortError',
+    });
+    await service.remove(connectionId);
+    await expect(importSnapshot(snapshot(provider()))).rejects.toThrow();
+    expect(await testDb.database.select().from(userProviderTable)).toEqual([]);
+    expect(await testDb.database.select().from(desktopConnectionTable)).toEqual([]);
+  });
+
+  describe('providers this build cannot import', () => {
+    const loose = (...providers: unknown[]) =>
+      DesktopProvidersSnapshotSchema.parse({ version: 1, providers });
+
+    it('keeps an unreadable provider listed and disabled without losing the readable ones', async () => {
+      const data = loose({ ...provider('broken'), models: 'not-an-array' }, provider('relay'));
+      expect(data.providers.map(({ id }) => id)).toEqual(['broken', 'relay']);
+
+      const { providers } = await service.preview(data);
+      expect(providers[0]).toMatchObject({
+        id: 'broken',
+        models: [],
+        name: 'Desktop provider',
+        unavailableReason: 'unreadable',
+      });
+      expect(providers[1]).toMatchObject({ id: 'relay' });
+      expect(providers[1]!.unavailableReason).toBeUndefined();
+    });
+
+    it('drops only the models it cannot read and still offers the provider', async () => {
+      const data = loose({
+        ...provider('relay'),
+        models: [
+          { id: 'good', apiModelId: 'good', providerId: 'relay', name: 'Good' },
+          { id: 'bad', apiModelId: 'bad', providerId: 'relay', capabilities: ['telepathy'] },
+        ],
+      });
+      expect(data.providers[0]!.models.map(({ modelId }) => modelId)).toEqual(['good']);
+
+      const { providers } = await service.preview(data);
+      expect(providers[0]!.unavailableReason).toBeUndefined();
+      expect(providers[0]!.models).toHaveLength(1);
+    });
+
+    it('disables a provider that signs in on the desktop instead of holding a key', async () => {
+      const data = loose({ ...provider('openai-codex', []), apiKeys: [], authMethods: ['oauth'] });
+      const { providers } = await service.preview(data);
+      expect(providers[0]).toMatchObject({ unavailableReason: 'unsupported-auth' });
+    });
+
+    it('disables a provider the desktop exports without a usable key', async () => {
+      const data = loose({ ...provider('relay'), apiKeys: [] });
+      const { providers } = await service.preview(data);
+      expect(providers[0]).toMatchObject({ unavailableReason: 'missing-api-key' });
+      await expect(importSnapshot(data)).rejects.toMatchObject({
+        details: { reason: 'missing-api-key' },
+      });
+    });
+
+    it('keeps the first of duplicate desktop keys rather than failing the import', async () => {
+      const data = loose({
+        ...provider('relay'),
+        apiKeys: [
+          { id: 'a', isEnabled: true, key: 'secret' },
+          { id: 'a', isEnabled: true, key: 'other' },
+        ],
+      });
+      expect((await service.preview(data)).providers[0]!.unavailableReason).toBeUndefined();
+      await importSnapshot(data);
+      const [row] = await testDb.database
+        .select()
+        .from(userProviderTable)
+        .where(eq(userProviderTable.providerId, 'relay'));
+      expect(row!.apiKeys).toEqual([{ id: 'a', isEnabled: true, key: 'secret' }]);
+    });
+
+    it.each([
+      { duplicate: 'id', id: 'disabled', key: 'other-secret' },
+      { duplicate: 'value', id: 'enabled', key: 'shared-secret' },
+    ])(
+      'rejects unusable keys after deduplicating by $duplicate without overwriting local keys',
+      async ({ id, key }) => {
+        await importSnapshot(snapshot(provider('relay')));
+        const data = loose({
+          ...provider('relay'),
+          apiKeys: [
+            { id: 'disabled', isEnabled: false, key: 'shared-secret' },
+            { id, isEnabled: true, key },
+          ],
+        });
+        expect((await service.preview(data)).providers[0]).toMatchObject({
+          action: 'update',
+          unavailableReason: 'missing-api-key',
+        });
+        await expect(importSnapshot(data)).rejects.toMatchObject({
+          details: { reason: 'missing-api-key' },
+        });
+        const [row] = await testDb.database
+          .select()
+          .from(userProviderTable)
+          .where(eq(userProviderTable.providerId, 'relay'));
+        expect(row!.apiKeys).toEqual(provider('relay').apiKeys);
+      },
+    );
+
+    it('routes a model to the first endpoint its custom provider configures', async () => {
+      const data = loose({
+        ...provider('relay', []),
+        models: [
+          {
+            id: 'gemini',
+            apiModelId: 'gemini',
+            providerId: 'relay',
+            name: 'Gemini',
+            endpointTypes: [
+              ENDPOINT_TYPE.GOOGLE_GENERATE_CONTENT,
+              ENDPOINT_TYPE.OPENAI_CHAT_COMPLETIONS,
+            ],
+          },
+        ],
+      });
+      const { providers } = await service.preview(data);
+      expect(providers[0]!.unavailableReason).toBeUndefined();
+      expect(providers[0]!.models.map(({ modelId }) => modelId)).toEqual(['gemini']);
+
+      await importSnapshot(data);
+      const [model] = await testDb.database.select().from(userModelTable);
+      expect(model!.endpointTypes).toEqual([
+        ENDPOINT_TYPE.OPENAI_CHAT_COMPLETIONS,
+        ENDPOINT_TYPE.GOOGLE_GENERATE_CONTENT,
+      ]);
+    });
+
+    it('leaves behind only the models none of its endpoints can serve', async () => {
+      const data = loose({
+        ...provider('relay', ['chat']),
+        models: [
+          ...provider('relay', ['chat']).models,
+          {
+            id: 'responses',
+            apiModelId: 'responses',
+            providerId: 'relay',
+            name: 'Responses',
+            endpointTypes: [ENDPOINT_TYPE.OPENAI_RESPONSES],
+          },
+        ],
+      });
+      const { providers } = await service.preview(data);
+      expect(providers[0]!.unavailableReason).toBeUndefined();
+      expect(providers[0]!.models.map(({ modelId }) => modelId)).toEqual(['chat']);
+
+      await expect(importSnapshot(data)).resolves.toMatchObject({ modelsAdded: 1 });
+      const models = await testDb.database.select().from(userModelTable);
+      expect(models.map(({ modelId }) => modelId)).toEqual(['chat']);
+    });
+
+    it('disables a custom provider whose chat endpoint has no address with its own reason', async () => {
+      const data = loose({
+        ...provider('relay'),
+        defaultChatEndpoint: ENDPOINT_TYPE.OPENAI_RESPONSES,
+        endpointConfigs: {
+          [ENDPOINT_TYPE.OPENAI_CHAT_COMPLETIONS]: { baseUrl: 'https://desktop.example.com/v1' },
+        },
+      });
+      const { providers } = await service.preview(data);
+      expect(providers[0]).toMatchObject({ unavailableReason: 'unsupported-endpoint' });
+    });
+  });
+});

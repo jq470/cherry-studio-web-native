@@ -1,0 +1,123 @@
+import { act, create, type ReactTestRenderer } from 'react-test-renderer';
+
+import type { CherryMessagePart } from '@/shared/data/types/message';
+
+import { ToolPartRenderer } from '../ToolPartRenderer';
+import type { ToolMessagePart } from '../toolPartState';
+
+jest.mock('../AgentManagementToolPart', () => mockCreateToolPart('AgentManagementToolPart'));
+jest.mock('../GenericToolPart', () => mockCreateToolPart('GenericToolPart'));
+jest.mock('../FileToolContent', () => mockCreateToolPart('FileToolContent'));
+jest.mock('../EditFileToolPart', () => ({
+  ...mockCreateToolPart('EditFileToolPart'),
+  isEditFileToolPart: (part: ToolMessagePart) => mockGetToolName(part) === 'edit_file',
+}));
+jest.mock('../McpToolPart', () => ({
+  ...mockCreateToolPart('McpToolPart'),
+  isMcpToolPart: (part: ToolMessagePart) => mockGetToolName(part) === 'mcp',
+}));
+jest.mock('../metaTool/MetaToolPartRenderer', () => ({
+  ...mockCreateToolPart('MetaToolPartRenderer'),
+  isMetaToolPart: (part: ToolMessagePart) => mockGetToolName(part) === 'meta',
+}));
+jest.mock('../ReadFileToolPart', () => ({
+  ...mockCreateToolPart('ReadFileToolPart'),
+  isReadFileToolPart: (part: ToolMessagePart) => mockGetToolName(part) === 'read_file',
+}));
+jest.mock('../RunJsToolPart', () => ({
+  ...mockCreateToolPart('RunJsToolPart'),
+  isRunJsToolPart: (part: ToolMessagePart) => mockGetToolName(part) === 'run_js',
+}));
+jest.mock('../SkillToolPart', () => mockCreateToolPart('SkillToolPart'));
+jest.mock('../SshToolPart', () => mockCreateToolPart('SshToolPart'));
+jest.mock('../TranscribeAudioToolPart', () => mockCreateToolPart('TranscribeAudioToolPart'));
+jest.mock('../../PendingImagePart', () => mockCreateToolPart('PendingImagePart'));
+jest.mock('../UserQuestionPart', () => mockCreateToolPart('UserQuestionPart'));
+jest.mock('../WebSearchToolPart', () => mockCreateToolPart('WebSearchToolPart'));
+jest.mock('../WriteFileToolPart', () => ({
+  ...mockCreateToolPart('WriteFileToolPart'),
+  isWriteFileToolPart: (part: ToolMessagePart) => mockGetToolName(part) === 'write_file',
+}));
+
+describe('ToolPartRenderer', () => {
+  it.each([
+    ['web_search', 'WebSearchToolPart'],
+    ['web_fetch', 'WebSearchToolPart'],
+    ['meta', 'MetaToolPartRenderer'],
+    ['mcp', 'McpToolPart'],
+    ['edit_file', 'EditFileToolPart'],
+    ['read_file', 'ReadFileToolPart'],
+    ['write_file', 'WriteFileToolPart'],
+    ['run_js', 'RunJsToolPart'],
+    ['ssh_execute', 'SshToolPart'],
+    ['transcribe_audio', 'TranscribeAudioToolPart'],
+    ['ask_user_question', 'UserQuestionPart'],
+    ['agent_create', 'AgentManagementToolPart'],
+    ['agent_update', 'AgentManagementToolPart'],
+    ['load_skill', 'SkillToolPart'],
+    ['find_skills', 'SkillToolPart'],
+    ['install_skill', 'SkillToolPart'],
+    ['other', 'GenericToolPart'],
+  ])('routes %s tools to %s', (toolName, expectedType) => {
+    const part = makeToolPart(toolName);
+    let renderer: ReactTestRenderer | undefined;
+    act(() => {
+      renderer = create(<ToolPartRenderer part={part} />);
+    });
+
+    expect(renderer?.root.findByType(expectedType).props.part).toBe(part);
+  });
+
+  it('holds a running image generation at the requested shape', () => {
+    const part = {
+      ...makeToolPart('generate_image'),
+      input: { aspectRatio: '16:9', prompt: 'A cherry orchard' },
+      state: 'input-available',
+    } as ToolMessagePart;
+    let renderer: ReactTestRenderer | undefined;
+    act(() => {
+      renderer = create(<ToolPartRenderer part={part} />);
+    });
+
+    expect(renderer?.root.findByType('PendingImagePart').props.aspectRatio).toBeCloseTo(16 / 9);
+    // Once it settles, the call is an ordinary tool row again.
+    act(() => {
+      renderer?.update(<ToolPartRenderer part={makeToolPart('generate_image')} />);
+    });
+    expect(renderer?.root.findAllByType('PendingImagePart')).toHaveLength(0);
+    expect(renderer?.root.findAllByType('GenericToolPart')).toHaveLength(1);
+  });
+
+  it('suppresses provider-owned web search parts before general web-search routing', () => {
+    const part = {
+      ...makeToolPart('web_search'),
+      toolMetadata: { cherry: { tool: { type: 'provider' } } },
+    } as ToolMessagePart;
+    let renderer: ReactTestRenderer | undefined;
+    act(() => {
+      renderer = create(<ToolPartRenderer part={part} />);
+    });
+
+    expect(renderer?.toJSON()).toBeNull();
+  });
+});
+
+function mockCreateToolPart(name: string) {
+  const { createElement } = jest.requireActual('react');
+  return { [name]: (props: object) => createElement(name, props) };
+}
+
+function mockGetToolName(part: ToolMessagePart) {
+  return part.type === 'dynamic-tool' ? part.toolName : part.type.slice('tool-'.length);
+}
+
+function makeToolPart(toolName: string): ToolMessagePart {
+  return {
+    input: {},
+    output: {},
+    state: 'output-available',
+    toolCallId: 'call-1',
+    toolName,
+    type: 'dynamic-tool',
+  } as Extract<CherryMessagePart, { type: 'dynamic-tool' }>;
+}
