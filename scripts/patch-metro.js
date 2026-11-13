@@ -124,6 +124,18 @@ ${ANCHOR}
         filePath: path.join(__dirname, 'src/web-shims', 'legend-list-react-native.web.js'),
       };
     }
+    // Native bottom-sheet specs import react-native from inside the package;
+    // force the augmented web module even when the package resolves via its
+    // compiled entry path rather than the bare package name.
+    if (
+      moduleName === 'react-native' &&
+      context.originModulePath.includes('@swmansion/react-native-bottom-sheet')
+    ) {
+      return {
+        type: 'sourceFile',
+        filePath: path.join(__dirname, 'src/web-shims', 'react-native.web.js'),
+      };
+    }
     const shimFile = webShimMap[moduleName];
     if (shimFile) {
       return {
