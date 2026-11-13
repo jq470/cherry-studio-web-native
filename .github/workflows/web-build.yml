@@ -95,6 +95,12 @@ jobs:
           for i in $(seq 1 30); do curl -sf http://127.0.0.1:8100/api.deepseek.com/v1/models && break; sleep 1; done
           node scripts/chat-e2e.mjs || true
 
+      - name: Package bundle
+        if: always()
+        run: |
+          (cd dist-web && zip -qr ../cherry-studio-web.zip .) || true
+          ls -lh cherry-studio-web.zip CHAT-E2E.md 2>/dev/null || true
+
       - name: Upload artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -103,6 +109,18 @@ jobs:
           path: dist-web
           if-no-files-found: warn
 
+      - name: Publish release
+        if: always()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: web-${{ github.run_id }}
+          name: Cherry Studio Web ${{ github.run_id }}
+          make_latest: true
+          files: |
+            cherry-studio-web.zip
+            CHAT-E2E.md
+            RUNTIME-SMOKE.md
+
       - name: Commit reports
         if: always()
         run: |
@@ -110,4 +128,4 @@ jobs:
           git config user.email 'web-ci@users.noreply.github.com'
           git add CHAT-E2E.md RUNTIME-SMOKE.md CHAT-E2E-FAILURE.png 2>/dev/null || true
           git commit -m 'ci: web build report [skip ci]' || echo 'no report changes'
-          git push || echo 'report push skipped'
+          git push origin HEAD:main || echo 'report push skipped'
