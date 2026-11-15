@@ -93,6 +93,7 @@ jobs:
 
       - name: Commit source fixes
         if: always()
+        continue-on-error: true
         run: |
           git config user.name 'web-pages'
           git config user.email 'web-pages@users.noreply.github.com'
