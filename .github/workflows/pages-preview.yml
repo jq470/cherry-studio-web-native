@@ -4,8 +4,6 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths:
-      - '.github/workflows/pages-preview.yml'
 
 permissions:
   contents: write
@@ -20,7 +18,7 @@ env:
   SQLITE_WASM_VERSION: 3.54.1-build1
   EXPO_NO_TELEMETRY: '1'
   CI: '1'
-  PATCH_URL: 'https://aka.doubaocdn.com/s/XQ3A3P0dax'
+  SOURCE_ARCHIVE_URL: 'https://aka.doubaocdn.com/s/gC0gQAS7PA'
 
 jobs:
   build:
@@ -29,11 +27,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Apply source fixes
+      - name: Apply desktop source archive
         run: |
-          curl -fsSL "$PATCH_URL" | gzip -d > /tmp/web-fixes.patch
-          git apply /tmp/web-fixes.patch
-          git status --short
+          curl -fsSL "$SOURCE_ARCHIVE_URL" -o /tmp/cherry-source.zip
+          unzip -oq /tmp/cherry-source.zip -d .
 
       - uses: pnpm/action-setup@v4
         with:
@@ -90,18 +87,6 @@ jobs:
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist-web
-
-      - name: Commit source fixes
-        if: always()
-        continue-on-error: true
-        run: |
-          git config user.name 'web-pages'
-          git config user.email 'web-pages@users.noreply.github.com'
-          git add .github README.md packages/ui/src/components/menu/context-menu/context-menu.tsx scripts src/web-shims
-          if ! git diff --cached --quiet; then
-            git commit -m 'feat(web): markdown, deployment files and native web menu [skip ci]'
-            git push origin HEAD:main || true
-          fi
 
   deploy:
     needs: build
