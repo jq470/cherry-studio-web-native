@@ -1,0 +1,116 @@
+name: pages-preview
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/pages-preview.yml'
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+env:
+  SQLITE_WASM_VERSION: 3.54.1-build1
+  EXPO_NO_TELEMETRY: '1'
+  CI: '1'
+  PATCH_URL: 'https://aka.doubaocdn.com/s/XQ3A3P0dax'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply source fixes
+        run: |
+          curl -fsSL "$PATCH_URL" | gzip -d > /tmp/web-fixes.patch
+          git apply /tmp/web-fixes.patch
+          git status --short
+
+      - uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: Patch web and Pages configuration
+        run: |
+          node scripts/patch-app-config.js app.json
+          node scripts/patch-metro.js metro.config.js
+          node scripts/patch-pages-config.js app.json /cherry-studio-web-native
+
+      - name: Export web bundle
+        run: npx expo export --platform web --output-dir dist-web
+
+      - name: Add deployment files
+        run: node scripts/patch-deploy-files.js dist-web
+
+      - name: Inject boot gate
+        run: node scripts/patch-index-html.js dist-web
+
+      - name: Vendor SQLite WASM runtime
+        run: |
+          mkdir -p dist-web/sqlite3
+          base="https://cdn.jsdelivr.net/npm/@sqlite.org/sqlite-wasm@${SQLITE_WASM_VERSION}/dist"
+          for f in index.mjs sqlite3.wasm; do
+            curl -fsSL -o "dist-web/sqlite3/$f" "$base/$f" \
+              || curl -fsSL -o "dist-web/sqlite3/$f" "https://unpkg.com/@sqlite.org/sqlite-wasm@${SQLITE_WASM_VERSION}/dist/$f"
+            test -s "dist-web/sqlite3/$f"
+          done
+
+      - name: Prepare GitHub Pages preview
+        run: node scripts/patch-pages-preview.js dist-web /cherry-studio-web-native
+
+      - name: Assert Pages bundle
+        run: |
+          test -f dist-web/_headers
+          test -f dist-web/_redirects
+          test -f dist-web/404.html
+          test -s dist-web/sqlite3/index.mjs
+          test -s dist-web/sqlite3/sqlite3.wasm
+          test -f dist-web/coi-serviceworker.js
+          grep -q 'coi-serviceworker.js' dist-web/index.html
+          grep -q 'cherry-studio-web-native/sqlite3/' dist-web/index.html
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist-web
+
+      - name: Commit source fixes
+        if: always()
+        run: |
+          git config user.name 'web-pages'
+          git config user.email 'web-pages@users.noreply.github.com'
+          git add .github README.md packages/ui/src/components/menu/context-menu/context-menu.tsx scripts src/web-shims
+          if ! git diff --cached --quiet; then
+            git commit -m 'feat(web): markdown, deployment files and native web menu [skip ci]'
+            git push origin HEAD:main || true
+          fi
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+      - id: deployment
+        uses: actions/deploy-pages@v4
