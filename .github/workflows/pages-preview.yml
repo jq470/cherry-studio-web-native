@@ -18,7 +18,7 @@ env:
   SQLITE_WASM_VERSION: 3.54.1-build1
   EXPO_NO_TELEMETRY: '1'
   CI: '1'
-  SOURCE_ARCHIVE_URL: 'https://aka.doubaocdn.com/s/20LUohhLYz'
+  SOURCE_ARCHIVE_URL: 'https://aka.doubaocdn.com/s/yIrNS9tRWI'
 
 jobs:
   build:
