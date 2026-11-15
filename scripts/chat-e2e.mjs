@@ -30,6 +30,9 @@ const browser = await puppeteer.launch({
 let replySeen = false;
 let pageText = '';
 let pickerText = '';
+let rowsSeen = [];
+let replyRows = [];
+let composerValue = '';
 let failureShot = null;
 let failureShotBase64 = null;
 const consoleErrors = [];
@@ -84,6 +87,20 @@ try {
       node.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
       return true;
     }, id);
+  const readRows = () =>
+    page.evaluate(() =>
+      Array.from(document.querySelectorAll('[data-testid^="chat-message-"]'))
+        .filter((node) => node.getAttribute('data-testid') !== 'chat-message-time')
+        .map((node) => {
+          const rect = node.getBoundingClientRect();
+          return {
+            testId: node.getAttribute('data-testid'),
+            text: (node.innerText || '').replace(/\s+/g, ' ').trim(),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height),
+          };
+        }),
+    );
 
   await page.goto(URL_TO_OPEN, { waitUntil: 'networkidle2', timeout: 60000 });
   const boot = await waitFor(/(Welcome to Cherry|欢迎使用 Cherry)/i, 45000);
@@ -233,12 +250,32 @@ try {
     `api ${before} -> ${apiRequests.length} :: ${apiRequests.slice(-2).join(' | ')} :: ${summary(await text(), 300)}`,
   );
 
-  const reply = await waitFor(/pong/i, 40000);
-  replySeen = Boolean(reply);
-  log('reply received', replySeen, summary(reply || '(no reply)'));
+  const replyDeadline = Date.now() + 40000;
+  while (Date.now() < replyDeadline) {
+    rowsSeen = await readRows();
+    replyRows = rowsSeen.filter((row) => /pong/i.test(row.text));
+    if (replyRows.length > 0) break;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  replySeen = replyRows.length > 0;
+  log(
+    'message rows',
+    rowsSeen.length >= 2,
+    `${rowsSeen.length} rows :: ${summary(rowsSeen.map((row) => row.text).join(' | '), 300)}`,
+  );
+  log(
+    'reply received',
+    replySeen,
+    summary(replyRows.map((row) => `${row.testId}: ${row.text}`).join(' | ') || '(no reply)'),
+  );
+  composerValue = await page.evaluate(() => {
+    const field = document.querySelector('[data-testid="chat-composer"] textarea');
+    return field ? field.value : null;
+  });
   pageText = await text();
 
   if (!replySeen) {
+    rowsSeen = await readRows();
     failureShot = 'CHAT-E2E-FAILURE.png';
     const shot = await page
       .screenshot({ path: failureShot, fullPage: false, encoding: 'base64' })
@@ -279,6 +316,14 @@ const report = [
   '```',
   summary(pickerText, 600),
   '```',
+  '',
+  '## chat rows',
+  '```json',
+  JSON.stringify(rowsSeen, null, 2),
+  '```',
+  '',
+  `- composer value after send: ${JSON.stringify(composerValue)}`,
+  `- reply rows: ${replyRows.length}`,
   '',
   '## page text (last)',
   '```',
